@@ -2,14 +2,16 @@
 set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
-export WINEPREFIX=${WINEPREFIX:-/opt/wineprefix}
-# Prevent Render/old deployments from putting the Wine prefix under non-persistent or restricted dirs.
-if [[ "${WINEPREFIX}" == /tmp/.wine || "${WINEPREFIX}" == /tmp/.wine/* || "${WINEPREFIX}" == /root/.wine || "${WINEPREFIX}" == /root/.wine/* || "${WINEPREFIX}" == /bridge/.wine || "${WINEPREFIX}" == /bridge/.wine/* ]]; then
-  export WINEPREFIX="/opt/wineprefix"
-fi
+export WINEPREFIX="/opt/wineprefix"
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
-export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe}
+export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe}
+
+# Keep large downloads and temp files out of /tmp (Render eviction limit).
+export MT5_WORKDIR=${MT5_WORKDIR:-/opt/mt5-work}
+export LOGDIR=${LOGDIR:-/opt/mt5-bridge-logs}
+export TMPDIR=${TMPDIR:-${MT5_WORKDIR}/tmp}
+mkdir -p "${MT5_WORKDIR}/dl" "${TMPDIR}" "${LOGDIR}"
 
 # If Render (or an old deploy) provides the wrong prefix path,
 # force the executable path to match WINEPREFIX (/opt/wineprefix).
@@ -17,7 +19,7 @@ if [[ ( "${MT_TERMINAL_EXE}" == /root/.wine/* || "${MT_TERMINAL_EXE}" == /tmp/.w
   export MT_TERMINAL_EXE="$DERIVED_TERMINAL_EXE"
 fi
 
-mkdir -p "${WINEPREFIX}" /tmp/mt5
+mkdir -p "${WINEPREFIX}"
 
 echo "Bootstrap: preparing Wine prefix..."
 WINEBOOT_CMD=""
@@ -48,91 +50,67 @@ if [[ -z "$WINE_CMD" ]]; then
   exit 1
 fi
 
-resolve_windows_python() {
-  shopt -s nullglob
-  local hits=()
-
-  # Most common layouts in Wine.
-  hits+=("${WINEPREFIX}"/drive_c/users/*/AppData/Local/Programs/Python/Python*/python.exe)
-  hits+=("${WINEPREFIX}"/drive_c/Program\ Files/Python*/python.exe)
-  hits+=("${WINEPREFIX}"/drive_c/Python*/python.exe)
-
-  local c
-  for c in "${hits[@]}"; do
-    if [[ -f "$c" ]]; then
-      echo "$c"
-      return 0
-    fi
-  done
-  return 1
-}
-
-PYTHON_WIN_EXE="$(resolve_windows_python || true)"
 python_ok=false
 
-if [[ -n "${PYTHON_WIN_EXE}" ]]; then
-  # Validate that stdlib is usable (encodings must exist).
-  "$WINE_CMD" "${PYTHON_WIN_EXE}" -c "import encodings; print('encodings_ok')" >/tmp/python-encodings-check.log 2>&1 || true
-  if [[ $? -eq 0 ]]; then
-    python_ok=true
-  fi
+# Validate that Wine's stdlib is usable (encodings must exist).
+if "$WINE_CMD" python --version >/dev/null 2>&1; then
+  "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1 && python_ok=true || true
 fi
 
 if [[ "${python_ok}" != "true" ]]; then
-  echo "Bootstrap: Windows Python missing or broken (encodings check failed); installing to C:\\Python312..."
-  curl -L "${PYTHON_WIN_INSTALLER_URL}" -o /tmp/mt5/python-installer.exe
-  if [[ ! -f /tmp/mt5/python-installer.exe ]]; then
+  echo "Bootstrap: Wine Python missing or broken; installing Python..."
+
+  # Remove likely broken python installs (best-effort).
+  rm -rf "${WINEPREFIX}/drive_c/Python"* >/dev/null 2>&1 || true
+  rm -rf "${WINEPREFIX}/drive_c/Program Files/Python"* >/dev/null 2>&1 || true
+  rm -rf "${WINEPREFIX}/drive_c/users/"*/AppData/Local/Programs/Python* >/dev/null 2>&1 || true
+
+  curl -L "${PYTHON_WIN_INSTALLER_URL}" -o "${MT5_WORKDIR}/dl/python-installer.exe"
+  if [[ ! -f "${MT5_WORKDIR}/dl/python-installer.exe" ]]; then
     echo "Bootstrap: python-installer.exe download failed (missing file)" >&2
     exit 1
   fi
 
-  # Remove any partial python installs to avoid the broken state you saw.
-  rm -rf "${WINEPREFIX}/drive_c/Python312" >/dev/null 2>&1 || true
-  rm -rf "${WINEPREFIX}/drive_c/users" >/dev/null 2>&1 || true
+  # Use the same kind of flags as known-good Wine setups:
+  # - install for all users
+  # - prepend Python to PATH inside Wine so `wine python` works
+  "$WINE_CMD" "${MT5_WORKDIR}/dl/python-installer.exe" /quiet InstallAllUsers=1 PrependPath=1 > "${LOGDIR}/python-installer.log" 2>&1 || true
 
-  # Recreate the Wine user dir structure (the python installer sometimes expects it).
-  mkdir -p "${WINEPREFIX}/drive_c/users" >/dev/null 2>&1 || true
-
-  # Install Python into a deterministic location.
-  "$WINE_CMD" /tmp/mt5/python-installer.exe /quiet InstallAllUsers=0 TargetDir=C:\\Python312 Include_pip=1 Include_launcher=1 PrependPath=0 > /tmp/python-installer.log 2>&1 || true
-
-  # Wait for python.exe to appear.
+  # Wait for Python to become usable.
   for _ in $(seq 1 90); do
-    PYTHON_WIN_EXE="$(resolve_windows_python || true)"
-    if [[ -n "${PYTHON_WIN_EXE}" ]]; then
+    if "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1; then
+      python_ok=true
       break
     fi
     sleep 2
   done
-
-  if [[ -n "${PYTHON_WIN_EXE}" ]]; then
-    echo "Bootstrap: Windows Python detected at ${PYTHON_WIN_EXE}"
-    # Re-run encodings check.
-    "$WINE_CMD" "${PYTHON_WIN_EXE}" -c "import encodings; print('encodings_ok')" >/tmp/python-encodings-check.log 2>&1 || true
-    if [[ $? -eq 0 ]]; then
-      python_ok=true
-    fi
-  fi
 fi
 
 if [[ "${python_ok}" != "true" ]]; then
-  echo "Bootstrap: Windows Python still broken after install attempt." >&2
+  echo "Bootstrap: Wine Python still broken after install attempt." >&2
   echo "Bootstrap: python-installer log tail:" >&2
-  tail -n 200 /tmp/python-installer.log >&2 || true
+  tail -n 200 "${LOGDIR}/python-installer.log" >&2 || true
   echo "Bootstrap: encodings-check log tail:" >&2
-  tail -n 200 /tmp/python-encodings-check.log >&2 || true
+  tail -n 200 "${LOGDIR}/python-encodings-check.log" >&2 || true
   exit 1
 fi
 
+# Install required Wine-side Python libraries.
+echo "Bootstrap: Installing Wine Python packages (mt5linux + MetaTrader5)..."
+"$WINE_CMD" python -m pip install --upgrade --no-cache-dir pip >"${LOGDIR}/wine-pip-upgrade.log" 2>&1 || true
+"$WINE_CMD" python -m pip install --no-cache-dir MetaTrader5 >"${LOGDIR}/wine-metatrader5-pip-install.log" 2>&1 || true
+"$WINE_CMD" python -m pip install --no-cache-dir "mt5linux>=0.1.9" >"${LOGDIR}/wine-mt5linux-pip-install.log" 2>&1 || true
+"$WINE_CMD" python -m pip install --no-cache-dir python-dateutil >"${LOGDIR}/wine-python-dateutil-pip-install.log" 2>&1 || true
+
 # Cleanup downloaded installers to keep /tmp small on Render.
-rm -f /tmp/mt5/python-installer.exe >/dev/null 2>&1 || true
+rm -f "${MT5_WORKDIR}/dl/python-installer.exe" >/dev/null 2>&1 || true
 
 if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
   echo "Bootstrap: downloading MT5 installer..."
-  curl -L "$MT5_INSTALLER_URL" -o /tmp/mt5/mt5setup.exe
+  curl -L "$MT5_INSTALLER_URL" -o "${MT5_WORKDIR}/dl/mt5setup.exe"
 
   echo "Bootstrap: running MT5 installer..."
-  "$WINE_CMD" /tmp/mt5/mt5setup.exe /silent || true
+  "$WINE_CMD" "${MT5_WORKDIR}/dl/mt5setup.exe" /silent || true
 fi
 
 if [[ -f "$MT_TERMINAL_EXE" ]]; then
@@ -142,5 +120,5 @@ else
 fi
 
 # Cleanup downloaded MT5 installer to keep /tmp small on Render.
-rm -f /tmp/mt5/mt5setup.exe >/dev/null 2>&1 || true
+rm -f "${MT5_WORKDIR}/dl/mt5setup.exe" >/dev/null 2>&1 || true
 

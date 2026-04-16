@@ -28,4 +28,4 @@ services:
       - key: MT5LINUX_PORT
         value: "18812"
       - key: PYTHON_WIN_INSTALLER_URL
-        value: "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+        value: "https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe"
