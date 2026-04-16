@@ -2,12 +2,13 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
     wget \
     curl \
     xvfb \
     supervisor \
     wine64 \
+    wine32 \
     ca-certificates \
     python3 \
     python3-pip \

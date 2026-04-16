@@ -22,6 +22,11 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+def root():
+    return {"service": "adaptive-mt5-bridge", "status": "ok"}
+
+
 @app.get("/ready")
 def ready():
     try:

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
-export BRIDGE_PORT=${BRIDGE_PORT:-5555}
+export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
 export MT_TERMINAL_EXE=${MT_TERMINAL_EXE:-/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe}
 export WINEPREFIX=${WINEPREFIX:-/root/.wine}
 
@@ -13,6 +13,16 @@ for key in "${required_vars[@]}"; do
     exit 1
   fi
 done
+
+# Start virtual display first so Wine can initialize safely.
+echo "Starting Xvfb display server on ${DISPLAY}..."
+Xvfb "${DISPLAY}" -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+XVFB_PID=$!
+sleep 2
+if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
+  echo "Failed to start Xvfb. Check /tmp/xvfb.log" >&2
+  exit 1
+fi
 
 echo "Preparing Wine prefix..."
 wineboot --init || true
@@ -30,5 +40,5 @@ if [[ ! -f "$MT_TERMINAL_EXE" ]]; then
   echo "Set MT_TERMINAL_EXE or MT5_INSTALLER_URL correctly."
 fi
 
-echo "Starting supervisord (xvfb + mt5 + bridge api)..."
+echo "Starting supervisord (mt5 + bridge api)..."
 exec /usr/bin/supervisord -c /bridge/supervisord.conf
