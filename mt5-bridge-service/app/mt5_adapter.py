@@ -99,23 +99,38 @@ class MT5Adapter:
         # 2) Try mt5linux (Wine + RPyC). This is the expected path for Linux containers.
         if mt5linux_cls is not None:
             try:
-                client = mt5linux_cls(host=settings.mt5linux_host, port=settings.mt5linux_port, timeout=300)
-                # mt5linux forwards parameters to the Windows-side MetaTrader5 integration.
-                client.initialize(
-                    path=terminal_exe,
-                    login=settings.mt_login,
-                    password=settings.mt_password,
-                    server=settings.mt_server,
-                )
-                info = client.account_info()
-                if info is None:
-                    raise RuntimeError("mt5linux account_info returned None")
+                host_candidates: list[str] = [settings.mt5linux_host]
+                if settings.mt5linux_host.strip().lower() == "localhost":
+                    # Some environments resolve `localhost` to IPv6 (`::1`) first, while mt5linux
+                    # typically binds to IPv4 (`127.0.0.1`).
+                    host_candidates.append("127.0.0.1")
 
-                self._mt = client
-                self._backend = "mt5linux"
-                self.connected = True
-                self.last_error = None
-                return
+                last_exc: Exception | None = None
+                client = None
+                for h in host_candidates:
+                    try:
+                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=300)
+                        # mt5linux forwards parameters to the Windows-side MetaTrader5 integration.
+                        client.initialize(
+                            path=terminal_exe,
+                            login=settings.mt_login,
+                            password=settings.mt_password,
+                            server=settings.mt_server,
+                        )
+                        info = client.account_info()
+                        if info is None:
+                            raise RuntimeError("mt5linux account_info returned None")
+
+                        self._mt = client
+                        self._backend = "mt5linux"
+                        self.connected = True
+                        self.last_error = None
+                        return
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+
+                raise RuntimeError(f"mt5linux init failed (all hosts): {last_exc}")
             except Exception as exc:
                 self.last_error = f"mt5linux init failed: {exc}"
 

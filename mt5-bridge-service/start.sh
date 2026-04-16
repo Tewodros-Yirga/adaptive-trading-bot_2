@@ -56,9 +56,26 @@ if command -v wine >/dev/null 2>&1; then
       echo "mt5linux already present in Wine python."
     fi
 
-    # Start the RPyC server (it listens on localhost:18812 by default).
-    wine python -m mt5linux >/tmp/mt5linux.log 2>&1 &
-  ) >/tmp/mt5linux-bootstrap-wrapper.log 2>&1 &
+    # Start the RPyC server.
+    # Force IPv4 binding/port to avoid `localhost` => `::1` issues.
+    # Stream logs to stdout (Render will capture them) and also save to /tmp/mt5linux.log.
+    wine python -m mt5linux --host 127.0.0.1 --port 18812 2>&1 | tee /tmp/mt5linux.log >/dev/null &
+    # Wait a moment and verify the port is actually listening from the Linux side.
+    # This helps us distinguish "wine/python missing" from "mt5linux installed but MT5 not connected".
+    MT5LINUX_PORT_OPEN=false
+    for _ in $(seq 1 20); do
+      if (echo > /dev/tcp/127.0.0.1/18812) >/dev/null 2>&1; then
+        MT5LINUX_PORT_OPEN=true
+        break
+      fi
+      sleep 0.5
+    done
+    if [[ "$MT5LINUX_PORT_OPEN" == "true" ]]; then
+      echo "mt5linux RPyC port is open on 127.0.0.1:18812"
+    else
+      echo "mt5linux RPyC port is NOT open on 127.0.0.1:18812 (check /tmp/mt5linux.log)" >&2
+    fi
+  ) &
 fi
 
 # Best-effort MT5 terminal launch in background.

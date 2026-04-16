@@ -15,7 +15,9 @@ class Settings(BaseSettings):
     mt_terminal_exe: str = Field(default="/tmp/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe", alias="MT_TERMINAL_EXE")
 
     # mt5linux (Wine + RPyC) defaults are localhost:18812
-    mt5linux_host: str = Field(default="localhost", alias="MT5LINUX_HOST")
+    # IMPORTANT: do not use `localhost` here. Some environments resolve it to IPv6
+    # (`::1`) first, while mt5linux typically binds to IPv4 (`127.0.0.1`).
+    mt5linux_host: str = Field(default="127.0.0.1", alias="MT5LINUX_HOST")
     mt5linux_port: int = Field(default=18812, alias="MT5LINUX_PORT")
 
     # If true, mock responses are returned when MetaTrader5 package/session is unavailable.

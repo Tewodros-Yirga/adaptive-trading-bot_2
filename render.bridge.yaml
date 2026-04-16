@@ -21,3 +21,7 @@ services:
         value: "/tmp/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
       - key: MT_FALLBACK_MODE
         value: "true"
+      - key: MT5LINUX_HOST
+        value: "127.0.0.1"
+      - key: MT5LINUX_PORT
+        value: "18812"
