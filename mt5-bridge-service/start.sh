@@ -17,14 +17,15 @@ fi
 mkdir -p "${WINEPREFIX}" /tmp/mt5 /tmp/supervisor
 
 resolve_windows_python() {
-  local candidates=(
-    "${WINEPREFIX}/drive_c/users/root/AppData/Local/Programs/Python/Python312/python.exe"
-    "${WINEPREFIX}/drive_c/users/wineuser/AppData/Local/Programs/Python/Python312/python.exe"
-    "${WINEPREFIX}/drive_c/Program Files/Python312/python.exe"
-    "${WINEPREFIX}/drive_c/Python312/python.exe"
-  )
+  shopt -s nullglob
+  local hits=()
+
+  hits+=("${WINEPREFIX}"/drive_c/users/*/AppData/Local/Programs/Python/Python*/python.exe)
+  hits+=("${WINEPREFIX}"/drive_c/Program\ Files/Python*/python.exe)
+  hits+=("${WINEPREFIX}"/drive_c/Python*/python.exe)
+
   local c
-  for c in "${candidates[@]}"; do
+  for c in "${hits[@]}"; do
     if [[ -f "$c" ]]; then
       echo "$c"
       return 0
@@ -65,7 +66,7 @@ if command -v wine >/dev/null 2>&1; then
     set +e
     echo "Bootstrapping mt5linux inside Wine python (best-effort)..."
     PYTHON_WIN_EXE=""
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 180); do
       PYTHON_WIN_EXE="$(resolve_windows_python || true)"
       if [[ -n "${PYTHON_WIN_EXE}" ]]; then
         break
@@ -75,6 +76,13 @@ if command -v wine >/dev/null 2>&1; then
 
     if [[ -z "${PYTHON_WIN_EXE}" ]]; then
       echo "Windows Python executable not found in Wine prefix after waiting." >&2
+      echo "=== /tmp/bootstrap-mt5.log (tail) ===" >&2
+      tail -n 250 /tmp/bootstrap-mt5.log >&2 || true
+      echo "=== /tmp/python-installer.log (tail) ===" >&2
+      tail -n 250 /tmp/python-installer.log >&2 || true
+      echo "=== candidate search (tail) ===" >&2
+      ls -la "${WINEPREFIX}/drive_c/users" >/tmp/wineusers-ls.log 2>&1 || true
+      tail -n 80 /tmp/wineusers-ls.log >&2 || true
     else
       echo "Using Windows Python at ${PYTHON_WIN_EXE}"
       wine "${PYTHON_WIN_EXE}" -c "import mt5linux" >/tmp/mt5linux-import.log 2>&1
@@ -105,6 +113,8 @@ if command -v wine >/dev/null 2>&1; then
       echo "mt5linux RPyC port is open on 127.0.0.1:18812"
     else
       echo "mt5linux RPyC port is NOT open on 127.0.0.1:18812" >&2
+      echo "=== /tmp/bootstrap-mt5.log (tail) ===" >&2
+      tail -n 250 /tmp/bootstrap-mt5.log >&2 || true
       echo "mt5linux log (last 200 lines):" >&2
       tail -n 200 /tmp/mt5linux.log >&2 || true
     fi

@@ -45,14 +45,16 @@ if [[ -z "$WINE_CMD" ]]; then
 fi
 
 resolve_windows_python() {
-  local candidates=(
-    "${WINEPREFIX}/drive_c/users/root/AppData/Local/Programs/Python/Python312/python.exe"
-    "${WINEPREFIX}/drive_c/users/wineuser/AppData/Local/Programs/Python/Python312/python.exe"
-    "${WINEPREFIX}/drive_c/Program Files/Python312/python.exe"
-    "${WINEPREFIX}/drive_c/Python312/python.exe"
-  )
+  shopt -s nullglob
+  local hits=()
+
+  # Most common layouts in Wine.
+  hits+=("${WINEPREFIX}"/drive_c/users/*/AppData/Local/Programs/Python/Python*/python.exe)
+  hits+=("${WINEPREFIX}"/drive_c/Program\ Files/Python*/python.exe)
+  hits+=("${WINEPREFIX}"/drive_c/Python*/python.exe)
+
   local c
-  for c in "${candidates[@]}"; do
+  for c in "${hits[@]}"; do
     if [[ -f "$c" ]]; then
       echo "$c"
       return 0
@@ -65,8 +67,14 @@ PYTHON_WIN_EXE="$(resolve_windows_python || true)"
 if [[ -z "${PYTHON_WIN_EXE}" ]]; then
   echo "Bootstrap: Windows Python not found in Wine prefix; installing..."
   curl -L "${PYTHON_WIN_INSTALLER_URL}" -o /tmp/mt5/python-installer.exe
-  "$WINE_CMD" /tmp/mt5/python-installer.exe /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 SimpleInstall=1 || true
-  for _ in $(seq 1 60); do
+  if [[ ! -f /tmp/mt5/python-installer.exe ]]; then
+    echo "Bootstrap: python-installer.exe download failed (missing file)" >&2
+    exit 1
+  fi
+  # Use common MSI-like flags for the Python Windows installer.
+  # (Wine sometimes ignores some options, but this avoids unsupported ones like SimpleInstall=1.)
+  "$WINE_CMD" /tmp/mt5/python-installer.exe /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1 > /tmp/python-installer.log 2>&1 || true
+  for _ in $(seq 1 90); do
     PYTHON_WIN_EXE="$(resolve_windows_python || true)"
     if [[ -n "${PYTHON_WIN_EXE}" ]]; then
       break
@@ -79,6 +87,8 @@ if [[ -n "${PYTHON_WIN_EXE}" ]]; then
   echo "Bootstrap: Windows Python detected at ${PYTHON_WIN_EXE}"
 else
   echo "Bootstrap: Windows Python still not found after install attempt." >&2
+  echo "Bootstrap: python-installer log tail:" >&2
+  tail -n 200 /tmp/python-installer.log >&2 || true
 fi
 
 if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
