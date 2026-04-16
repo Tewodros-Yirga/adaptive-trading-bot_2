@@ -1,6 +1,8 @@
 FROM scottyhardy/docker-wine:devel-11.6-20260412
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 # Base image already includes Wine (wine32/wine64), xvfb, and wineboot.
 # We only install the runtime helpers we need for the bridge container.
@@ -10,6 +12,7 @@ RUN set -eux; \
       supervisor \
       python3 \
       python3-pip \
+      python3-venv \
       ca-certificates \
       curl \
       wget; \
@@ -18,7 +21,9 @@ RUN set -eux; \
 WORKDIR /bridge
 
 COPY requirements.txt /bridge/requirements.txt
-RUN pip3 install --no-cache-dir -r /bridge/requirements.txt
+RUN python3 -m venv "${VIRTUAL_ENV}" \
+    && "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir --upgrade pip \
+    && "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir -r /bridge/requirements.txt
 
 COPY app /bridge/app
 COPY supervisord.conf /bridge/supervisord.conf
