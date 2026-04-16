@@ -3,8 +3,10 @@ set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
 export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
-export MT_TERMINAL_EXE=${MT_TERMINAL_EXE:-/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe}
-export WINEPREFIX=${WINEPREFIX:-/root/.wine}
+export WINEPREFIX=${WINEPREFIX:-/tmp/.wine}
+export MT_TERMINAL_EXE=${MT_TERMINAL_EXE:-${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe}
+
+mkdir -p "${WINEPREFIX}" /tmp/mt5 /tmp/supervisor
 
 required_vars=("MT_LOGIN" "MT_PASSWORD" "MT_SERVER" "MT_BRIDGE_SECRET")
 for key in "${required_vars[@]}"; do

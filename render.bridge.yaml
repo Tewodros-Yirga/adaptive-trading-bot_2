@@ -18,6 +18,6 @@ services:
       - key: MT5_INSTALLER_URL
         sync: false
       - key: MT_TERMINAL_EXE
-        value: "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+        value: "/tmp/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
       - key: MT_FALLBACK_MODE
         value: "true"
