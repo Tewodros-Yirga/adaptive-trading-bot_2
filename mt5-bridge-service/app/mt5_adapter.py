@@ -69,7 +69,7 @@ class MT5Adapter:
 
     # MT5 (Wine) startup can take a while. Allow enough retries for the first connect
     # so /ready can transition to LIVE without requiring manual re-calls.
-    @retry(wait=wait_fixed(2), stop=stop_after_attempt(5), reraise=True)
+    @retry(wait=wait_fixed(2), stop=stop_after_attempt(10), reraise=True)
     def ensure_connection(self) -> None:
         # Avoid repeated reconnect attempts when already connected.
         if self.connected and self._mt is not None:
