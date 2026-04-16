@@ -6,6 +6,7 @@ export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
 export WINEPREFIX=${WINEPREFIX:-/tmp/.wine}
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
+export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe}
 
 # If Render (or an old deploy) still provides the wrong prefix path (e.g. /root/.wine),
 # force the executable path to match the actual runtime WINEPREFIX (/tmp/.wine).
@@ -14,6 +15,23 @@ if [[ "${MT_TERMINAL_EXE}" == /root/.wine/* && "${WINEPREFIX}" != /root/.wine* ]
 fi
 
 mkdir -p "${WINEPREFIX}" /tmp/mt5 /tmp/supervisor
+
+resolve_windows_python() {
+  local candidates=(
+    "${WINEPREFIX}/drive_c/users/root/AppData/Local/Programs/Python/Python312/python.exe"
+    "${WINEPREFIX}/drive_c/users/wineuser/AppData/Local/Programs/Python/Python312/python.exe"
+    "${WINEPREFIX}/drive_c/Program Files/Python312/python.exe"
+    "${WINEPREFIX}/drive_c/Python312/python.exe"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -f "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
 
 required_vars=("MT_LOGIN" "MT_PASSWORD" "MT_SERVER" "MT_BRIDGE_SECRET")
 for key in "${required_vars[@]}"; do
@@ -46,20 +64,33 @@ if command -v wine >/dev/null 2>&1; then
   (
     set +e
     echo "Bootstrapping mt5linux inside Wine python (best-effort)..."
-    # If Wine has no Windows-Python installed, these commands will fail but we continue.
-    wine python -c "import mt5linux" 
-    if [[ $? -ne 0 ]]; then
-      echo "mt5linux missing in Wine python; attempting pip install..." >&2
-      wine python -m pip install --no-cache-dir --upgrade pip >/tmp/mt5linux-pip-upgrade.log 2>&1 || true
-      wine python -m pip install --no-cache-dir mt5linux MetaTrader5 >/tmp/mt5linux-pip-install.log 2>&1 || true
+    PYTHON_WIN_EXE=""
+    for _ in $(seq 1 60); do
+      PYTHON_WIN_EXE="$(resolve_windows_python || true)"
+      if [[ -n "${PYTHON_WIN_EXE}" ]]; then
+        break
+      fi
+      sleep 2
+    done
+
+    if [[ -z "${PYTHON_WIN_EXE}" ]]; then
+      echo "Windows Python executable not found in Wine prefix after waiting." >&2
     else
-      echo "mt5linux already present in Wine python."
+      echo "Using Windows Python at ${PYTHON_WIN_EXE}"
+      wine "${PYTHON_WIN_EXE}" -c "import mt5linux" >/tmp/mt5linux-import.log 2>&1
+      if [[ $? -ne 0 ]]; then
+        echo "mt5linux missing in Wine python; attempting pip install..." >&2
+        wine "${PYTHON_WIN_EXE}" -m pip install --upgrade pip >/tmp/mt5linux-pip-upgrade.log 2>&1 || true
+        wine "${PYTHON_WIN_EXE}" -m pip install mt5linux MetaTrader5 >/tmp/mt5linux-pip-install.log 2>&1 || true
+      else
+        echo "mt5linux already present in Wine python."
+      fi
+
+      # Start the RPyC server.
+      # Force IPv4 binding/port to avoid `localhost` => `::1` issues.
+      wine "${PYTHON_WIN_EXE}" -m mt5linux --host 127.0.0.1 --port 18812 2>&1 | tee /tmp/mt5linux.log &
     fi
 
-    # Start the RPyC server.
-    # Force IPv4 binding/port to avoid `localhost` => `::1` issues.
-    # Stream logs to stdout (Render will capture them) and also save to /tmp/mt5linux.log.
-    wine python -m mt5linux --host 127.0.0.1 --port 18812 2>&1 | tee /tmp/mt5linux.log &
     # Wait a moment and verify the port is actually listening from the Linux side.
     # This helps us distinguish "wine/python missing" from "mt5linux installed but MT5 not connected".
     MT5LINUX_PORT_OPEN=false
