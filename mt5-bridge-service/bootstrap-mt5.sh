@@ -3,6 +3,10 @@ set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
 export WINEPREFIX=${WINEPREFIX:-/bridge/.wine}
+# Prevent Render/old deployments from putting the Wine prefix under /tmp (can be evicted).
+if [[ "${WINEPREFIX}" == /tmp/.wine || "${WINEPREFIX}" == /tmp/.wine/* || "${WINEPREFIX}" == /root/.wine || "${WINEPREFIX}" == /root/.wine/* ]]; then
+  export WINEPREFIX="/bridge/.wine"
+fi
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
 export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe}
@@ -64,16 +68,35 @@ resolve_windows_python() {
 }
 
 PYTHON_WIN_EXE="$(resolve_windows_python || true)"
-if [[ -z "${PYTHON_WIN_EXE}" ]]; then
-  echo "Bootstrap: Windows Python not found in Wine prefix; installing..."
+python_ok=false
+
+if [[ -n "${PYTHON_WIN_EXE}" ]]; then
+  # Validate that stdlib is usable (encodings must exist).
+  "$WINE_CMD" "${PYTHON_WIN_EXE}" -c "import encodings; print('encodings_ok')" >/tmp/python-encodings-check.log 2>&1 || true
+  if [[ $? -eq 0 ]]; then
+    python_ok=true
+  fi
+fi
+
+if [[ "${python_ok}" != "true" ]]; then
+  echo "Bootstrap: Windows Python missing or broken (encodings check failed); installing to C:\\Python312..."
   curl -L "${PYTHON_WIN_INSTALLER_URL}" -o /tmp/mt5/python-installer.exe
   if [[ ! -f /tmp/mt5/python-installer.exe ]]; then
     echo "Bootstrap: python-installer.exe download failed (missing file)" >&2
     exit 1
   fi
-  # Use common MSI-like flags for the Python Windows installer.
-  # (Wine sometimes ignores some options, but this avoids unsupported ones like SimpleInstall=1.)
-  "$WINE_CMD" /tmp/mt5/python-installer.exe /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1 > /tmp/python-installer.log 2>&1 || true
+
+  # Remove any partial python installs to avoid the broken state you saw.
+  rm -rf "${WINEPREFIX}/drive_c/Python312" >/dev/null 2>&1 || true
+  rm -rf "${WINEPREFIX}/drive_c/users" >/dev/null 2>&1 || true
+
+  # Recreate the Wine user dir structure (the python installer sometimes expects it).
+  mkdir -p "${WINEPREFIX}/drive_c/users" >/dev/null 2>&1 || true
+
+  # Install Python into a deterministic location.
+  "$WINE_CMD" /tmp/mt5/python-installer.exe /quiet InstallAllUsers=0 TargetDir=C:\\Python312 Include_pip=1 Include_launcher=1 PrependPath=0 > /tmp/python-installer.log 2>&1 || true
+
+  # Wait for python.exe to appear.
   for _ in $(seq 1 90); do
     PYTHON_WIN_EXE="$(resolve_windows_python || true)"
     if [[ -n "${PYTHON_WIN_EXE}" ]]; then
@@ -81,14 +104,24 @@ if [[ -z "${PYTHON_WIN_EXE}" ]]; then
     fi
     sleep 2
   done
+
+  if [[ -n "${PYTHON_WIN_EXE}" ]]; then
+    echo "Bootstrap: Windows Python detected at ${PYTHON_WIN_EXE}"
+    # Re-run encodings check.
+    "$WINE_CMD" "${PYTHON_WIN_EXE}" -c "import encodings; print('encodings_ok')" >/tmp/python-encodings-check.log 2>&1 || true
+    if [[ $? -eq 0 ]]; then
+      python_ok=true
+    fi
+  fi
 fi
 
-if [[ -n "${PYTHON_WIN_EXE}" ]]; then
-  echo "Bootstrap: Windows Python detected at ${PYTHON_WIN_EXE}"
-else
-  echo "Bootstrap: Windows Python still not found after install attempt." >&2
+if [[ "${python_ok}" != "true" ]]; then
+  echo "Bootstrap: Windows Python still broken after install attempt." >&2
   echo "Bootstrap: python-installer log tail:" >&2
   tail -n 200 /tmp/python-installer.log >&2 || true
+  echo "Bootstrap: encodings-check log tail:" >&2
+  tail -n 200 /tmp/python-encodings-check.log >&2 || true
+  exit 1
 fi
 
 # Cleanup downloaded installers to keep /tmp small on Render.

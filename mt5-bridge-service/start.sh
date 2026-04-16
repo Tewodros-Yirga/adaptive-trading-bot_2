@@ -4,6 +4,10 @@ set -euo pipefail
 export DISPLAY=${DISPLAY:-:99}
 export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
 export WINEPREFIX=${WINEPREFIX:-/bridge/.wine}
+# Prevent Render/old deployments from putting the Wine prefix under /tmp (can be evicted).
+if [[ "${WINEPREFIX}" == /tmp/.wine || "${WINEPREFIX}" == /tmp/.wine/* || "${WINEPREFIX}" == /root/.wine || "${WINEPREFIX}" == /root/.wine/* ]]; then
+  export WINEPREFIX="/bridge/.wine"
+fi
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
 export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe}
@@ -85,18 +89,31 @@ if command -v wine >/dev/null 2>&1; then
       tail -n 80 /tmp/wineusers-ls.log >&2 || true
     else
       echo "Using Windows Python at ${PYTHON_WIN_EXE}"
-      wine "${PYTHON_WIN_EXE}" -c "import mt5linux" >/tmp/mt5linux-import.log 2>&1
-      if [[ $? -ne 0 ]]; then
-        echo "mt5linux missing in Wine python; attempting pip install..." >&2
-        wine "${PYTHON_WIN_EXE}" -m pip install --upgrade pip >/tmp/mt5linux-pip-upgrade.log 2>&1 || true
-        wine "${PYTHON_WIN_EXE}" -m pip install mt5linux MetaTrader5 >/tmp/mt5linux-pip-install.log 2>&1 || true
-      else
-        echo "mt5linux already present in Wine python."
-      fi
+      # Ensure Python stdlib is usable (fixes the "No module named encodings" failure).
+      for _ in $(seq 1 60); do
+        wine "${PYTHON_WIN_EXE}" -c "import encodings" >/dev/null 2>&1 && break
+        sleep 2
+        PYTHON_WIN_EXE="$(resolve_windows_python || true)"
+      done
 
-      # Start the RPyC server.
-      # Force IPv4 binding/port to avoid `localhost` => `::1` issues.
-      wine "${PYTHON_WIN_EXE}" -m mt5linux --host 127.0.0.1 --port 18812 2>&1 | tee /tmp/mt5linux.log &
+      wine "${PYTHON_WIN_EXE}" -c "import encodings" >/tmp/python-encodings-check-start.log 2>&1
+      if [[ $? -ne 0 ]]; then
+        echo "Windows Python encodings check failed; skipping mt5linux start." >&2
+        tail -n 120 /tmp/python-encodings-check-start.log >&2 || true
+      else
+        wine "${PYTHON_WIN_EXE}" -c "import mt5linux" >/tmp/mt5linux-import.log 2>&1
+        if [[ $? -ne 0 ]]; then
+          echo "mt5linux missing in Wine python; attempting pip install..." >&2
+          wine "${PYTHON_WIN_EXE}" -m pip install --upgrade pip >/tmp/mt5linux-pip-upgrade.log 2>&1 || true
+          wine "${PYTHON_WIN_EXE}" -m pip install mt5linux MetaTrader5 >/tmp/mt5linux-pip-install.log 2>&1 || true
+        else
+          echo "mt5linux already present in Wine python."
+        fi
+
+        # Start the RPyC server.
+        # Force IPv4 binding/port to avoid `localhost` => `::1` issues.
+        wine "${PYTHON_WIN_EXE}" -m mt5linux --host 127.0.0.1 --port 18812 2>&1 | tee /tmp/mt5linux.log &
+      fi
     fi
 
     # Wait a moment and verify the port is actually listening from the Linux side.
@@ -116,7 +133,11 @@ if command -v wine >/dev/null 2>&1; then
       echo "=== /tmp/bootstrap-mt5.log (tail) ===" >&2
       tail -n 250 /tmp/bootstrap-mt5.log >&2 || true
       echo "mt5linux log (last 200 lines):" >&2
-      tail -n 200 /tmp/mt5linux.log >&2 || true
+      if [[ -f /tmp/mt5linux.log ]]; then
+        tail -n 200 /tmp/mt5linux.log >&2 || true
+      else
+        echo "(missing /tmp/mt5linux.log)" >&2
+      fi
     fi
   ) &
 fi
