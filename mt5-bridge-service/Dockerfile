@@ -33,4 +33,6 @@ RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
 
 EXPOSE 5555
 
+USER root
+
 CMD ["/bridge/start.sh"]
