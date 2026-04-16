@@ -27,8 +27,9 @@ RUN python3 -m venv "${VIRTUAL_ENV}" \
 
 COPY app /bridge/app
 COPY supervisord.conf /bridge/supervisord.conf
+COPY bootstrap-mt5.sh /bridge/bootstrap-mt5.sh
 COPY start.sh /bridge/start.sh
-RUN chmod +x /bridge/start.sh
+RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
 
 EXPOSE 5555
 
