@@ -12,7 +12,8 @@ class Settings(BaseSettings):
     mt_password: str = Field(default="", alias="MT_PASSWORD")
     mt_server: str = Field(default="", alias="MT_SERVER")
     mt_bridge_secret: str = Field(default="", alias="MT_BRIDGE_SECRET")
-    mt_terminal_exe: str = Field(default="/tmp/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe", alias="MT_TERMINAL_EXE")
+    # Keep Wine prefix off /tmp to avoid Render "temporary storage volume /tmp exceeded" evictions.
+    mt_terminal_exe: str = Field(default="/bridge/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe", alias="MT_TERMINAL_EXE")
 
     # mt5linux (Wine + RPyC) defaults are localhost:18812
     # IMPORTANT: do not use `localhost` here. Some environments resolve it to IPv6

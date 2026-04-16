@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
-export WINEPREFIX=${WINEPREFIX:-/tmp/.wine}
+export WINEPREFIX=${WINEPREFIX:-/bridge/.wine}
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
 export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe}
@@ -91,6 +91,9 @@ else
   tail -n 200 /tmp/python-installer.log >&2 || true
 fi
 
+# Cleanup downloaded installers to keep /tmp small on Render.
+rm -f /tmp/mt5/python-installer.exe >/dev/null 2>&1 || true
+
 if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
   echo "Bootstrap: downloading MT5 installer..."
   curl -L "$MT5_INSTALLER_URL" -o /tmp/mt5/mt5setup.exe
@@ -104,4 +107,7 @@ if [[ -f "$MT_TERMINAL_EXE" ]]; then
 else
   echo "Bootstrap: MT5 terminal not found at $MT_TERMINAL_EXE"
 fi
+
+# Cleanup downloaded MT5 installer to keep /tmp small on Render.
+rm -f /tmp/mt5/mt5setup.exe >/dev/null 2>&1 || true
 
