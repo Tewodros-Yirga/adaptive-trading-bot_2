@@ -22,7 +22,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"service": "adaptive-mt5-bridge", "status": "ok"}
 

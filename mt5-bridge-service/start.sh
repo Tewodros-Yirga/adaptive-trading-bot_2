@@ -25,14 +25,40 @@ if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
 fi
 
 echo "Preparing Wine prefix..."
-wineboot --init || true
+WINEBOOT_CMD=""
+if command -v wineboot >/dev/null 2>&1; then
+  WINEBOOT_CMD="wineboot"
+elif command -v wine64boot >/dev/null 2>&1; then
+  WINEBOOT_CMD="wine64boot"
+elif command -v wineboot64 >/dev/null 2>&1; then
+  WINEBOOT_CMD="wineboot64"
+fi
+
+if [[ -z "$WINEBOOT_CMD" ]]; then
+  echo "wineboot command not found inside container; ensure Wine is installed in Docker image." >&2
+  exit 1
+fi
+
+"$WINEBOOT_CMD" --init || true
 
 if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
   echo "Downloading MT5 installer from MT5_INSTALLER_URL..."
   mkdir -p /tmp/mt5
   curl -L "$MT5_INSTALLER_URL" -o /tmp/mt5/mt5setup.exe
   echo "Running MT5 installer via Wine..."
-  wine /tmp/mt5/mt5setup.exe /silent || true
+  WINE_CMD=""
+  if command -v wine >/dev/null 2>&1; then
+    WINE_CMD="wine"
+  elif command -v wine64 >/dev/null 2>&1; then
+    WINE_CMD="wine64"
+  fi
+
+  if [[ -z "$WINE_CMD" ]]; then
+    echo "wine command not found inside container; ensure Wine is installed in Docker image." >&2
+    exit 1
+  fi
+
+  "$WINE_CMD" /tmp/mt5/mt5setup.exe /silent || true
 fi
 
 if [[ ! -f "$MT_TERMINAL_EXE" ]]; then

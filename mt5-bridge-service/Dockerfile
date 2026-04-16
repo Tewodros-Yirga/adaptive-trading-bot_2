@@ -14,6 +14,7 @@ RUN set -eux; \
       curl \
       xvfb \
       supervisor \
+      wine \
       wine64 \
       wine32 \
       ca-certificates \
