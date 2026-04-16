@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: adaptive-trading-mt5-bridge
+    env: docker
+    rootDir: mt5-bridge-service
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "5555"
+      - key: BRIDGE_PORT
+        value: "5555"
+      - key: MT_LOGIN
+        sync: false
+      - key: MT_PASSWORD
+        sync: false
+      - key: MT_SERVER
+        sync: false
+      - key: MT_BRIDGE_SECRET
+        sync: false
+      - key: MT5_INSTALLER_URL
+        sync: false
+      - key: MT_TERMINAL_EXE
+        value: "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+      - key: MT_FALLBACK_MODE
+        value: "true"

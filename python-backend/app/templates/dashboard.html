@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Adaptive Trading Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>Adaptive Trading Dashboard</h1>
+    <p>Mode: <strong>{{ status.mode }}</strong> | Symbol: <strong>{{ status.symbol }}</strong></p>
+
+    <section class="card-grid">
+      <article class="card">
+        <h2>Performance</h2>
+        <p>Total Trades: {{ stats.total_trades }}</p>
+        <p>Win Rate: {{ stats.win_rate }}%</p>
+        <p>Profit Factor: {{ stats.profit_factor }}</p>
+        <p>Total PnL: {{ stats.total_pnl }}</p>
+        <p>Max Drawdown: {{ stats.max_drawdown }}</p>
+      </article>
+      <article class="card">
+        <h2>Account</h2>
+        {% if account_error %}
+          <p class="error">Bridge error: {{ account_error }}</p>
+        {% else %}
+          <p>Balance: {{ account.balance }}</p>
+          <p>Equity: {{ account.equity }}</p>
+          <p>Margin: {{ account.margin }}</p>
+          <p>Free Margin: {{ account.freeMargin }}</p>
+        {% endif %}
+      </article>
+      <article class="card">
+        <h2>Open Positions</h2>
+        {% if positions_error %}
+          <p class="error">Bridge error: {{ positions_error }}</p>
+        {% elif positions|length == 0 %}
+          <p>No open positions.</p>
+        {% else %}
+          <ul>
+            {% for p in positions %}
+              <li>{{ p.symbol or "-" }} | {{ p.type or p.direction or "-" }} | vol {{ p.volume or "-" }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </article>
+    </section>
+
+    <section class="card">
+      <h2>Strategy Parameters</h2>
+      <form method="post" action="/dashboard/params" class="form-grid">
+        <label>EMA1 <input type="number" name="ema_1" value="{{ params.ema_1 }}" required /></label>
+        <label>EMA2 <input type="number" name="ema_2" value="{{ params.ema_2 }}" required /></label>
+        <label>EMA3 <input type="number" name="ema_3" value="{{ params.ema_3 }}" required /></label>
+        <label>EMA4 <input type="number" name="ema_4" value="{{ params.ema_4 }}" required /></label>
+        <label>EMA5 <input type="number" name="ema_5" value="{{ params.ema_5 }}" required /></label>
+        <label>EMA6 <input type="number" name="ema_6" value="{{ params.ema_6 }}" required /></label>
+        <label>Stop Loss % <input step="0.0001" type="number" name="stop_loss_pct" value="{{ params.stop_loss_pct }}" required /></label>
+        <label>TP1 Mult <input step="0.0001" type="number" name="tp1_multiplier" value="{{ params.tp1_multiplier }}" required /></label>
+        <label>TP2 Mult <input step="0.0001" type="number" name="tp2_multiplier" value="{{ params.tp2_multiplier }}" required /></label>
+        <label>TP3 Mult <input step="0.0001" type="number" name="tp3_multiplier" value="{{ params.tp3_multiplier }}" required /></label>
+        <label>TP4 Mult <input step="0.0001" type="number" name="tp4_multiplier" value="{{ params.tp4_multiplier }}" required /></label>
+        <label>Lot Size <input step="0.0001" type="number" name="lot_size" value="{{ params.lot_size }}" required /></label>
+        <button type="submit">Save Strategy Parameters</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Learning Controls</h2>
+      <form method="post" action="/dashboard/learning" class="form-grid">
+        <label>Adaptation Interval <input type="number" name="adaptation_interval" value="{{ learning.adaptation_interval }}" required /></label>
+        <label>Min Closed Trades <input type="number" name="adaptation_min_closed_trades" value="{{ learning.adaptation_min_closed_trades }}" required /></label>
+        <label>Cooldown Trades <input type="number" name="adaptation_cooldown_trades" value="{{ learning.adaptation_cooldown_trades }}" required /></label>
+        <label>Learning Rate <input step="0.00001" type="number" name="adaptation_lr" value="{{ learning.adaptation_lr }}" required /></label>
+        <label>Max Change % <input step="0.0001" type="number" name="adaptation_max_change_pct" value="{{ learning.adaptation_max_change_pct }}" required /></label>
+        <label>Confidence Threshold <input step="0.0001" type="number" name="adaptation_confidence_threshold" value="{{ learning.adaptation_confidence_threshold }}" required /></label>
+        <button type="submit">Save Learning Controls</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Recent Trades</h2>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Symbol</th><th>Direction</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          {% for t in trades %}
+          <tr>
+            <td>{{ t.id }}</td>
+            <td>{{ t.symbol }}</td>
+            <td>{{ t.direction }}</td>
+            <td>{{ t.entry_price }}</td>
+            <td>{{ t.exit_price or "-" }}</td>
+            <td>{{ t.pnl or "-" }}</td>
+            <td>{{ t.result }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

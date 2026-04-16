@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DISPLAY=${DISPLAY:-:99}
+export BRIDGE_PORT=${BRIDGE_PORT:-5555}
+export MT_TERMINAL_EXE=${MT_TERMINAL_EXE:-/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe}
+export WINEPREFIX=${WINEPREFIX:-/root/.wine}
+
+required_vars=("MT_LOGIN" "MT_PASSWORD" "MT_SERVER" "MT_BRIDGE_SECRET")
+for key in "${required_vars[@]}"; do
+  if [[ -z "${!key:-}" ]]; then
+    echo "Missing required env var: ${key}" >&2
+    exit 1
+  fi
+done
+
+echo "Preparing Wine prefix..."
+wineboot --init || true
+
+if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
+  echo "Downloading MT5 installer from MT5_INSTALLER_URL..."
+  mkdir -p /tmp/mt5
+  curl -L "$MT5_INSTALLER_URL" -o /tmp/mt5/mt5setup.exe
+  echo "Running MT5 installer via Wine..."
+  wine /tmp/mt5/mt5setup.exe /silent || true
+fi
+
+if [[ ! -f "$MT_TERMINAL_EXE" ]]; then
+  echo "Warning: MT terminal executable not found at: $MT_TERMINAL_EXE"
+  echo "Set MT_TERMINAL_EXE or MT5_INSTALLER_URL correctly."
+fi
+
+echo "Starting supervisord (xvfb + mt5 + bridge api)..."
+exec /usr/bin/supervisord -c /bridge/supervisord.conf

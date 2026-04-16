@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: adaptive-trading-python-api
+    env: docker
+    rootDir: python-backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: SIMULATION_MODE
+        value: "false"
+      - key: DATABASE_URL
+        sync: false
+      - key: MT_BRIDGE_URL
+        sync: false
+      - key: MT_BRIDGE_SECRET
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ADAPTATION_MAX_CHANGE_PCT
+        value: "0.3"
+      - key: ADAPTATION_LR
+        value: "0.002"
+      - key: ADAPTATION_CONFIDENCE_THRESHOLD
+        value: "0.05"
