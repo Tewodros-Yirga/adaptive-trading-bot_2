@@ -8,7 +8,7 @@ services:
     autoDeploy: true
     envVars:
       - key: WINEPREFIX
-        value: "/bridge/.wine"
+        value: "/opt/wineprefix"
       - key: MT_LOGIN
         sync: false
       - key: MT_PASSWORD
@@ -20,7 +20,7 @@ services:
       - key: MT5_INSTALLER_URL
         sync: false
       - key: MT_TERMINAL_EXE
-        value: "/bridge/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+        value: "/opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe"
       - key: MT_FALLBACK_MODE
         value: "true"
       - key: MT5LINUX_HOST

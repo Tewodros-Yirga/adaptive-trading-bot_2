@@ -2,18 +2,18 @@
 set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
-export WINEPREFIX=${WINEPREFIX:-/bridge/.wine}
-# Prevent Render/old deployments from putting the Wine prefix under /tmp (can be evicted).
-if [[ "${WINEPREFIX}" == /tmp/.wine || "${WINEPREFIX}" == /tmp/.wine/* || "${WINEPREFIX}" == /root/.wine || "${WINEPREFIX}" == /root/.wine/* ]]; then
-  export WINEPREFIX="/bridge/.wine"
+export WINEPREFIX=${WINEPREFIX:-/opt/wineprefix}
+# Prevent Render/old deployments from putting the Wine prefix under non-persistent or restricted dirs.
+if [[ "${WINEPREFIX}" == /tmp/.wine || "${WINEPREFIX}" == /tmp/.wine/* || "${WINEPREFIX}" == /root/.wine || "${WINEPREFIX}" == /root/.wine/* || "${WINEPREFIX}" == /bridge/.wine || "${WINEPREFIX}" == /bridge/.wine/* ]]; then
+  export WINEPREFIX="/opt/wineprefix"
 fi
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
 export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe}
 
-# If Render (or an old deploy) provides the wrong prefix path (e.g. /root/.wine),
-# force the executable path to match WINEPREFIX (/tmp/.wine).
-if [[ "${MT_TERMINAL_EXE}" == /root/.wine/* && "${WINEPREFIX}" != /root/.wine* ]]; then
+# If Render (or an old deploy) provides the wrong prefix path,
+# force the executable path to match WINEPREFIX (/opt/wineprefix).
+if [[ ( "${MT_TERMINAL_EXE}" == /root/.wine/* || "${MT_TERMINAL_EXE}" == /tmp/.wine/* || "${MT_TERMINAL_EXE}" == /bridge/.wine/* ) && "${WINEPREFIX}" != /root/.wine* && "${WINEPREFIX}" != /tmp/.wine* && "${WINEPREFIX}" != /bridge/.wine* ]]; then
   export MT_TERMINAL_EXE="$DERIVED_TERMINAL_EXE"
 fi
 

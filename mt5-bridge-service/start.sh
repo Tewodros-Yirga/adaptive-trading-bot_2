@@ -3,10 +3,10 @@ set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
 export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
-export WINEPREFIX=${WINEPREFIX:-/bridge/.wine}
+export WINEPREFIX=${WINEPREFIX:-/opt/wineprefix}
 # Prevent Render/old deployments from putting the Wine prefix under /tmp (can be evicted).
 if [[ "${WINEPREFIX}" == /tmp/.wine || "${WINEPREFIX}" == /tmp/.wine/* || "${WINEPREFIX}" == /root/.wine || "${WINEPREFIX}" == /root/.wine/* ]]; then
-  export WINEPREFIX="/bridge/.wine"
+  export WINEPREFIX="/opt/wineprefix"
 fi
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
@@ -14,7 +14,7 @@ export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.o
 
 # If Render (or an old deploy) still provides the wrong prefix path,
 # force the executable path to match the actual runtime WINEPREFIX.
-if [[ ("${MT_TERMINAL_EXE}" == /root/.wine/* || "${MT_TERMINAL_EXE}" == /tmp/.wine/*) && "${WINEPREFIX}" != /root/.wine* && "${WINEPREFIX}" != /tmp/.wine* ]]; then
+if [[ ("${MT_TERMINAL_EXE}" == /root/.wine/* || "${MT_TERMINAL_EXE}" == /tmp/.wine/* || "${MT_TERMINAL_EXE}" == /bridge/.wine/*) && "${WINEPREFIX}" != /root/.wine* && "${WINEPREFIX}" != /tmp/.wine* && "${WINEPREFIX}" != /bridge/.wine* ]]; then
   export MT_TERMINAL_EXE="$DERIVED_TERMINAL_EXE"
 fi
 

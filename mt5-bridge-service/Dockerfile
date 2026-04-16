@@ -20,6 +20,9 @@ RUN set -eux; \
 
 WORKDIR /bridge
 
+# Render sometimes restricts writing under /bridge, so keep Wine prefix elsewhere.
+RUN mkdir -p /opt/wineprefix && chmod -R 777 /opt/wineprefix
+
 COPY requirements.txt /bridge/requirements.txt
 RUN python3 -m venv "${VIRTUAL_ENV}" \
     && "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir --upgrade pip \
