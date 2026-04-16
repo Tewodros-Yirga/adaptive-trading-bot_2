@@ -3,7 +3,14 @@ set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
 export WINEPREFIX=${WINEPREFIX:-/tmp/.wine}
-export MT_TERMINAL_EXE=${MT_TERMINAL_EXE:-${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe}
+DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
+
+# If Render (or an old deploy) provides the wrong prefix path (e.g. /root/.wine),
+# force the executable path to match WINEPREFIX (/tmp/.wine).
+if [[ "${MT_TERMINAL_EXE}" == /root/.wine/* && "${WINEPREFIX}" != /root/.wine* ]]; then
+  export MT_TERMINAL_EXE="$DERIVED_TERMINAL_EXE"
+fi
 
 mkdir -p "${WINEPREFIX}" /tmp/mt5
 

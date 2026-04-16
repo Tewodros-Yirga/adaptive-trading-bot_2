@@ -12,7 +12,11 @@ class Settings(BaseSettings):
     mt_password: str = Field(default="", alias="MT_PASSWORD")
     mt_server: str = Field(default="", alias="MT_SERVER")
     mt_bridge_secret: str = Field(default="", alias="MT_BRIDGE_SECRET")
-    mt_terminal_exe: str = Field(default="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe", alias="MT_TERMINAL_EXE")
+    mt_terminal_exe: str = Field(default="/tmp/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe", alias="MT_TERMINAL_EXE")
+
+    # mt5linux (Wine + RPyC) defaults are localhost:18812
+    mt5linux_host: str = Field(default="localhost", alias="MT5LINUX_HOST")
+    mt5linux_port: int = Field(default=18812, alias="MT5LINUX_PORT")
 
     # If true, mock responses are returned when MetaTrader5 package/session is unavailable.
     mt_fallback_mode: bool = Field(default=True, alias="MT_FALLBACK_MODE")

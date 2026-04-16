@@ -13,8 +13,10 @@ def startup_validation() -> None:
 
 
 def require_secret(x_bridge_secret: str = Header(default="")) -> None:
+    if not x_bridge_secret:
+        raise HTTPException(status_code=403, detail="Missing X-Bridge-Secret header")
     if x_bridge_secret != settings.mt_bridge_secret:
-        raise HTTPException(status_code=403, detail="Invalid bridge secret")
+        raise HTTPException(status_code=403, detail="Invalid bridge secret (check X-Bridge-Secret)")
 
 
 @app.get("/health")
@@ -31,7 +33,10 @@ def root():
 def ready():
     try:
         data = adapter.account()
-        return {"ready": True, "account_mode": data.get("mode", "UNKNOWN")}
+        account_mode = data.get("mode", "UNKNOWN")
+        # If MT5 is not actually connected, adapter returns FALLBACK.
+        # Treat that as "not ready" so operators can distinguish endpoint availability vs MT5 connectivity.
+        return {"ready": account_mode == "LIVE", "account_mode": account_mode, "warning": data.get("warning")}
     except Exception as exc:
         return {"ready": False, "error": str(exc)}
 

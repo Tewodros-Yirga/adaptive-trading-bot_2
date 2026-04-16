@@ -4,7 +4,14 @@ set -euo pipefail
 export DISPLAY=${DISPLAY:-:99}
 export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
 export WINEPREFIX=${WINEPREFIX:-/tmp/.wine}
-export MT_TERMINAL_EXE=${MT_TERMINAL_EXE:-${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe}
+DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
+
+# If Render (or an old deploy) still provides the wrong prefix path (e.g. /root/.wine),
+# force the executable path to match the actual runtime WINEPREFIX (/tmp/.wine).
+if [[ "${MT_TERMINAL_EXE}" == /root/.wine/* && "${WINEPREFIX}" != /root/.wine* ]]; then
+  export MT_TERMINAL_EXE="$DERIVED_TERMINAL_EXE"
+fi
 
 mkdir -p "${WINEPREFIX}" /tmp/mt5 /tmp/supervisor
 
@@ -32,6 +39,27 @@ PORT="${PORT:-${BRIDGE_PORT:-5555}}"
 
 # Bootstrap Wine/MT5 in the background so Render detects the open port quickly.
 /bridge/bootstrap-mt5.sh >/tmp/bootstrap-mt5.log 2>&1 &
+
+# Start mt5linux server under Wine (best-effort).
+# This is required for the Linux adapter to talk to MT5 via RPyC.
+if command -v wine >/dev/null 2>&1; then
+  (
+    set +e
+    echo "Bootstrapping mt5linux inside Wine python (best-effort)..."
+    # If Wine has no Windows-Python installed, these commands will fail but we continue.
+    wine python -c "import mt5linux" >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+      echo "mt5linux missing in Wine python; attempting pip install..." >&2
+      wine python -m pip install --no-cache-dir --upgrade pip >/tmp/mt5linux-pip-upgrade.log 2>&1 || true
+      wine python -m pip install --no-cache-dir mt5linux MetaTrader5 >/tmp/mt5linux-pip-install.log 2>&1 || true
+    else
+      echo "mt5linux already present in Wine python."
+    fi
+
+    # Start the RPyC server (it listens on localhost:18812 by default).
+    wine python -m mt5linux >/tmp/mt5linux.log 2>&1 &
+  ) >/tmp/mt5linux-bootstrap-wrapper.log 2>&1 &
+fi
 
 # Best-effort MT5 terminal launch in background.
 WINE_CMD=""
