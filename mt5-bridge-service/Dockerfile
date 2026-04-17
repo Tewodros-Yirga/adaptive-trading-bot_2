@@ -15,7 +15,11 @@
 #   FROM scottyhardy/docker-wine:devel-11.6-20260412
 # ============================================================
 
-ARG BASE_IMAGE=ghcr.io/loriloha/mt5-bridge-base:latest
+# Default: scottyhardy/docker-wine (works immediately, installs Python/MT5 at runtime).
+# To use the pre-built base image (fast deploys), set this build arg in Render:
+#   BASE_IMAGE=ghcr.io/loriloha/mt5-bridge-base:latest
+# See mt5-bridge-base/SETUP.md for how to build and push the base image first.
+ARG BASE_IMAGE=scottyhardy/docker-wine:devel-11.6-20260412
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
