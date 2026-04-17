@@ -40,20 +40,35 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     dpkg --add-architecture i386; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      ca-certificates \
-      curl \
-      wget \
-      winbind \
-      wine \
-      wine64 \
-      wine32 \
-      xvfb \
-      supervisor \
-      python3 \
-      python3-pip \
-      python3-venv; \
+    # Configure apt to retry on network failures. \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    echo 'Acquire::http::Timeout "60";' >> /etc/apt/apt.conf.d/80-retries; \
+    echo 'Acquire::ftp::Timeout "60";' >> /etc/apt/apt.conf.d/80-retries; \
+    # Retry apt-get update up to 5 times. \
+    for i in 1 2 3 4 5; do \
+      apt-get update && break || { echo "apt-get update failed (attempt $i)"; sleep $((i * 10)); }; \
+    done; \
+    # Retry apt-get install up to 3 times in case of transient network drops. \
+    for i in 1 2 3; do \
+      apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        wget \
+        winbind \
+        wine \
+        wine64 \
+        wine32 \
+        xvfb \
+        supervisor \
+        python3 \
+        python3-pip \
+        python3-venv \
+      && break \
+      || { echo "apt-get install failed (attempt $i), retrying..."; \
+           apt-get clean; \
+           for j in 1 2 3 4 5; do apt-get update && break || sleep $((j * 10)); done; \
+         }; \
+    done; \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
