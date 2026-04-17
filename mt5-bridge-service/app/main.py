@@ -261,6 +261,68 @@ def debug_mt5_ipc_test():
         return {"error": str(exc)}
 
 
+@app.get("/debug/pipes", dependencies=[Depends(require_secret)])
+def debug_pipes():
+    """List named pipes in Wine to see if terminal64.exe has registered its IPC pipe."""
+    import subprocess
+    python_path = Path("/opt/wine_python_exe.path")
+    wine_python = python_path.read_text().strip() if python_path.exists() else None
+    env = {**os.environ, "DISPLAY": ":99", "WINEPREFIX": "/opt/wineprefix",
+           "WINEDEBUG": "-all"}
+    results = {}
+
+    # 1. List \\.\pipe\ via Wine cmd
+    try:
+        r = subprocess.run(
+            ["wine", "cmd", "/c", r"dir \\.\pipe\"],
+            env=env, capture_output=True, text=True, timeout=15
+        )
+        results["cmd_dir_pipe"] = (r.stdout + r.stderr).strip()[-3000:]
+    except Exception as exc:
+        results["cmd_dir_pipe"] = f"error: {exc}"
+
+    # 2. Enumerate pipes from Python inside Wine
+    if wine_python:
+        script = r"""
+import os, ctypes, ctypes.wintypes
+FindFirstFile = ctypes.windll.kernel32.FindFirstFileW
+FindNextFile = ctypes.windll.kernel32.FindNextFileW
+FindClose = ctypes.windll.kernel32.FindClose
+INVALID = ctypes.c_void_p(-1).value
+class WIN32_FIND_DATA(ctypes.Structure):
+    _fields_ = [('dwFileAttributes',ctypes.wintypes.DWORD),
+                ('ftCreationTime', ctypes.c_ulonglong),
+                ('ftLastAccessTime', ctypes.c_ulonglong),
+                ('ftLastWriteTime', ctypes.c_ulonglong),
+                ('nFileSizeHigh', ctypes.wintypes.DWORD),
+                ('nFileSizeLow', ctypes.wintypes.DWORD),
+                ('dwReserved0', ctypes.wintypes.DWORD),
+                ('dwReserved1', ctypes.wintypes.DWORD),
+                ('cFileName', ctypes.c_wchar * 260),
+                ('cAlternateFileName', ctypes.c_wchar * 14)]
+fd = WIN32_FIND_DATA()
+h = FindFirstFile(r'\\.\pipe\*', ctypes.byref(fd))
+pipes = []
+if h != INVALID:
+    while True:
+        pipes.append(fd.cFileName)
+        if not FindNextFile(h, ctypes.byref(fd)): break
+    FindClose(h)
+print('\n'.join(p for p in pipes if 'meta' in p.lower() or 'mt5' in p.lower() or 'metatrader' in p.lower()) or 'no_mt5_pipes_found')
+print('TOTAL_PIPES=' + str(len(pipes)))
+"""
+        try:
+            r2 = subprocess.run(
+                ["wine", wine_python, "-c", script],
+                env=env, capture_output=True, text=True, timeout=20
+            )
+            results["wine_python_pipes"] = (r2.stdout + r2.stderr).strip()[-2000:]
+        except Exception as exc:
+            results["wine_python_pipes"] = f"error: {exc}"
+
+    return results
+
+
 @app.get("/debug/screenshot", dependencies=[Depends(require_secret)])
 def debug_screenshot():
     """Take a screenshot of the Xvfb display and return as base64 PNG."""
