@@ -48,6 +48,29 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
 
+      # Pre-download installers on the runner (fast internet) so Dockerfile can
+      # COPY them in — avoids slow/broken apt mirrors inside Docker on GHA runners.
+      - name: Download installers to build context
+        run: |
+          set -eux
+          PYTHON_URL="https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe"
+          MT5_URL="${{ github.event.inputs.mt5_url || secrets.MT5_INSTALLER_URL || '' }}"
+
+          echo "Downloading Windows Python installer..."
+          curl -fsSL --retry 5 --retry-delay 5 --max-time 300 \
+            "${PYTHON_URL}" -o ./mt5-bridge-base/python-installer.exe
+          echo "Python installer: $(du -sh ./mt5-bridge-base/python-installer.exe)"
+
+          if [ -n "${MT5_URL}" ]; then
+            echo "Downloading MT5 setup..."
+            curl -fsSL --retry 5 --retry-delay 5 --max-time 600 \
+              "${MT5_URL}" -o ./mt5-bridge-base/mt5setup.exe
+            echo "MT5 setup: $(du -sh ./mt5-bridge-base/mt5setup.exe)"
+          else
+            echo "MT5_URL not set — creating empty placeholder"
+            touch ./mt5-bridge-base/mt5setup.exe
+          fi
+
       - name: Build and push base image
         uses: docker/build-push-action@v5
         with:
@@ -55,9 +78,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Pass MT5_URL build arg if provided (from workflow_dispatch or secret).
           build-args: |
-            MT5_URL=${{ github.event.inputs.mt5_url || secrets.MT5_INSTALLER_URL || '' }}
+            HAS_MT5=${{ github.event.inputs.mt5_url != '' || 'false' }}
           # Cache layers in GitHub's cache for faster rebuilds.
           cache-from: type=gha
           cache-to: type=gha,mode=max
