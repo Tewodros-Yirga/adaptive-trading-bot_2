@@ -2,5 +2,4 @@ fastapi
 uvicorn[standard]
 python-dotenv
 pydantic-settings
-tenacity
 mt5linux

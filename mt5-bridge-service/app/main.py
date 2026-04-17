@@ -76,18 +76,35 @@ def debug_mt5():
     ready_file = logdir / "bootstrap.ready"
     failed_file = logdir / "bootstrap.failed"
     status_file = logdir / "bootstrap.status"
+    terminal_ready_file = logdir / "mt5_terminal.ready"
+    terminal_path_file = logdir / "mt5_terminal_exe.path"
+
+    terminal_exe_from_sentinel: str | None = None
+    if terminal_path_file.exists():
+        try:
+            terminal_exe_from_sentinel = terminal_path_file.read_text().strip() or None
+        except Exception:
+            pass
 
     return {
         "wineprefix": os.environ.get("WINEPREFIX"),
         "mt_terminal_exe": settings.mt_terminal_exe,
+        "mt_terminal_exe_discovered": terminal_exe_from_sentinel,
         "mt5linux_host": settings.mt5linux_host,
         "mt5linux_port": settings.mt5linux_port,
         "mt5linux_port_open": _tcp_open(settings.mt5linux_host, settings.mt5linux_port),
         "logdir": str(logdir),
+        "adapter": {
+            "connected": adapter.connected,
+            "backend": adapter._backend,
+            "last_error": adapter.last_error,
+            "connect_attempts": adapter._connect_attempts,
+        },
         "bootstrap": {
             "ready": ready_file.exists(),
             "failed": failed_file.exists(),
             "status": _tail_file(status_file, max_bytes=4_000),
+            "terminal_ready": terminal_ready_file.exists(),
         },
         "logs": {
             "bootstrap-mt5": _tail_file(logdir / "bootstrap-mt5.log"),
@@ -96,6 +113,8 @@ def debug_mt5():
             "mt5linux-import-check": _tail_file(logdir / "mt5linux-import-check.log"),
             "python-download": _tail_file(logdir / "python-download.log"),
             "python-installer": _tail_file(logdir / "python-installer.log"),
+            "mt5-download": _tail_file(logdir / "mt5-download.log"),
+            "mt5-install": _tail_file(logdir / "mt5-install.log"),
             "wine-pip-upgrade": _tail_file(logdir / "wine-pip-upgrade.log"),
             "wine-metatrader5-pip-install": _tail_file(logdir / "wine-metatrader5-pip-install.log"),
             "wine-mt5linux-pip-install": _tail_file(logdir / "wine-mt5linux-pip-install.log"),
@@ -108,6 +127,13 @@ def debug_mt5():
 @app.get("/account", dependencies=[Depends(require_secret)])
 def account():
     return adapter.account()
+
+
+@app.post("/reset", dependencies=[Depends(require_secret)])
+def reset_connection():
+    """Force the adapter to reconnect to MT5 on the next request."""
+    adapter.reset_connection()
+    return {"reset": True, "message": "Adapter connection reset. Next request will reconnect."}
 
 
 @app.get("/positions", dependencies=[Depends(require_secret)])

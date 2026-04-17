@@ -320,25 +320,59 @@ rm -f "${MT5_WORKDIR}/dl/python-installer.exe" > /dev/null 2>&1 || true
 # ---------------------------------------------------------------------------
 # MT5 terminal installer (optional, only if MT5_INSTALLER_URL is set)
 # ---------------------------------------------------------------------------
-if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
-  log "Bootstrap: downloading MT5 installer..."
-  curl -fsSL --retry 3 --max-time 600 "$MT5_INSTALLER_URL" \
-    -o "${MT5_WORKDIR}/dl/mt5setup.exe" 2>&1 | tee -a "${LOGDIR}/mt5-download.log" || true
+MT5_TERMINAL_READY_FILE="${LOGDIR}/mt5_terminal.ready"
+rm -f "${MT5_TERMINAL_READY_FILE}" > /dev/null 2>&1 || true
 
-  if [[ -f "${MT5_WORKDIR}/dl/mt5setup.exe" ]]; then
-    log "Bootstrap: running MT5 installer..."
-    run_with_timeout 900 "$WINE_CMD" "${MT5_WORKDIR}/dl/mt5setup.exe" /silent \
-      > "${LOGDIR}/mt5-install.log" 2>&1 || true
-    rm -f "${MT5_WORKDIR}/dl/mt5setup.exe" > /dev/null 2>&1 || true
+if [[ -n "${MT5_INSTALLER_URL:-}" && ! -f "$MT_TERMINAL_EXE" ]]; then
+  log "Bootstrap: downloading MT5 installer from ${MT5_INSTALLER_URL}..."
+  echo "mt5_install starting" > "${BOOTSTRAP_STATUS_FILE}" 2>/dev/null || true
+
+  curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 \
+    "${MT5_INSTALLER_URL}" -o "${MT5_WORKDIR}/dl/mt5setup.exe" \
+    > "${LOGDIR}/mt5-download.log" 2>&1 || true
+
+  if [[ ! -f "${MT5_WORKDIR}/dl/mt5setup.exe" ]] || [[ ! -s "${MT5_WORKDIR}/dl/mt5setup.exe" ]]; then
+    log "Bootstrap: WARNING: mt5setup.exe download failed or empty. Check ${LOGDIR}/mt5-download.log"
   else
-    log "Bootstrap: WARNING: mt5setup.exe download failed."
+    MT5_SIZE=$(du -sh "${MT5_WORKDIR}/dl/mt5setup.exe" 2>/dev/null | cut -f1)
+    log "Bootstrap: MT5 installer downloaded (${MT5_SIZE}). Running installer..."
+    # MetaTrader 5 uses its own installer format — /auto is the correct silent flag.
+    # /silent is an NSIS flag and causes the installer to exit immediately without installing.
+    run_with_timeout 900 "$WINE_CMD" "${MT5_WORKDIR}/dl/mt5setup.exe" /auto \
+      > "${LOGDIR}/mt5-install.log" 2>&1 || true
+    log "Bootstrap: MT5 installer finished (exit ignored). Searching for terminal64.exe..."
+    rm -f "${MT5_WORKDIR}/dl/mt5setup.exe" > /dev/null 2>&1 || true
+
+    # /auto installs to C:\Program Files\MetaTrader 5\ by default, but scan broadly.
+    FOUND_TERMINAL=$(find "${WINEPREFIX}/drive_c" -maxdepth 6 -name "terminal64.exe" 2>/dev/null | head -1) || true
+    if [[ -n "$FOUND_TERMINAL" ]]; then
+      log "Bootstrap: terminal64.exe found at: $FOUND_TERMINAL"
+      # Update the MT_TERMINAL_EXE env to the discovered path for this process tree.
+      export MT_TERMINAL_EXE="$FOUND_TERMINAL"
+      # Write the discovered path to a file so start.sh can read it.
+      echo "$FOUND_TERMINAL" > "${LOGDIR}/mt5_terminal_exe.path" 2>/dev/null || true
+      touch "${MT5_TERMINAL_READY_FILE}" > /dev/null 2>&1 || true
+      echo "mt5_terminal ready" > "${BOOTSTRAP_STATUS_FILE}" 2>/dev/null || true
+    else
+      log "Bootstrap: WARNING: terminal64.exe NOT found after install."
+      log "  mt5-install.log tail:"
+      tail -n 50 "${LOGDIR}/mt5-install.log" 2>/dev/null || true
+    fi
   fi
+elif [[ -f "$MT_TERMINAL_EXE" ]]; then
+  log "Bootstrap: MT5 terminal already present at $MT_TERMINAL_EXE"
+  echo "$MT_TERMINAL_EXE" > "${LOGDIR}/mt5_terminal_exe.path" 2>/dev/null || true
+  touch "${MT5_TERMINAL_READY_FILE}" > /dev/null 2>&1 || true
+else
+  log "Bootstrap: MT5_INSTALLER_URL not set and terminal not found — skipping MT5 install."
+  log "  Set MT5_INSTALLER_URL env var to auto-install MetaTrader 5."
 fi
 
 if [[ -f "$MT_TERMINAL_EXE" ]]; then
-  log "Bootstrap: MT5 terminal detected at $MT_TERMINAL_EXE"
+  log "Bootstrap: MT5 terminal confirmed at $MT_TERMINAL_EXE"
 else
   log "Bootstrap: MT5 terminal NOT found at $MT_TERMINAL_EXE"
 fi
 
 log "Bootstrap: complete."
+echo "complete" > "${BOOTSTRAP_STATUS_FILE}" 2>/dev/null || true

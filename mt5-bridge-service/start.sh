@@ -64,9 +64,9 @@ PORT="${PORT:-${BRIDGE_PORT:-5555}}"
 if command -v wine > /dev/null 2>&1; then
   (
     set +euo pipefail
-    echo "[mt5linux-launcher] Waiting for bootstrap to complete..."
+    echo "[mt5linux-launcher] Waiting for bootstrap.ready sentinel..."
 
-    # Wait up to 20 minutes (600 x 2s) — Python download + install can take ~10 min.
+    # Wait up to 20 minutes (600 x 2s). Python download+install can take ~10 min.
     WAITED=0
     for _ in $(seq 1 600); do
       if [[ -f "${LOGDIR}/bootstrap.ready" ]]; then
@@ -74,14 +74,14 @@ if command -v wine > /dev/null 2>&1; then
         break
       fi
       if [[ -f "${LOGDIR}/bootstrap.failed" ]]; then
-        echo "[mt5linux-launcher] Bootstrap FAILED. Dumping bootstrap log:" >&2
+        echo "[mt5linux-launcher] Bootstrap FAILED. Dumping log:" >&2
         tail -n 100 "${LOGDIR}/bootstrap-mt5.log" >&2 || true
         exit 1
       fi
       WAITED=$((WAITED + 2))
       if (( WAITED % 60 == 0 )); then
         echo "[mt5linux-launcher] Still waiting for bootstrap... (${WAITED}s elapsed)"
-        echo "[mt5linux-launcher] Current status: $(cat "${LOGDIR}/bootstrap.status" 2>/dev/null || echo '(no status)')"
+        echo "[mt5linux-launcher]   status: $(cat "${LOGDIR}/bootstrap.status" 2>/dev/null || echo '(none)')"
       fi
       sleep 2
     done
@@ -93,7 +93,7 @@ if command -v wine > /dev/null 2>&1; then
     fi
 
     # Locate the Wine python.exe installed by bootstrap.
-    # We do NOT use `wine python` here — that hangs if python.exe isn't on Wine's PATH.
+    # We do NOT use `wine python` globally — that hangs if python.exe isn't on Wine PATH.
     FOUND_PYTHON=$(find "${WINEPREFIX}/drive_c" -maxdepth 5 -name "python.exe" 2>/dev/null | head -1) || true
     if [[ -z "$FOUND_PYTHON" ]]; then
       echo "[mt5linux-launcher] Wine python.exe not found under ${WINEPREFIX}/drive_c" >&2
@@ -103,7 +103,7 @@ if command -v wine > /dev/null 2>&1; then
 
     WINE_PYTHON_PATH=$(winepath -w "$FOUND_PYTHON" 2>/dev/null || echo "")
     if [[ -z "$WINE_PYTHON_PATH" ]]; then
-      echo "[mt5linux-launcher] winepath conversion failed; trying linux path directly" >&2
+      echo "[mt5linux-launcher] winepath conversion failed; using linux path directly" >&2
       WINE_PYTHON_PATH="$FOUND_PYTHON"
     fi
 
@@ -115,7 +115,7 @@ if command -v wine > /dev/null 2>&1; then
     fi
 
     if ! wine "$WINE_PYTHON_PATH" -c "import encodings; import mt5linux" > /dev/null 2>&1; then
-      echo "[mt5linux-launcher] Wine python / mt5linux still not working. Check ${LOGDIR}/bootstrap-mt5.log" >&2
+      echo "[mt5linux-launcher] mt5linux still not importable. Check ${LOGDIR}/bootstrap-mt5.log" >&2
       exit 1
     fi
 
@@ -146,33 +146,65 @@ if command -v wine > /dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Best-effort MT5 terminal launch in background.
+# MT5 terminal launcher (background subshell)
+# Waits for bootstrap to write mt5_terminal_exe.path, then launches the terminal.
+# bootstrap.sh sets bootstrap.ready BEFORE the MT5 installer runs, so we must
+# wait for the separate mt5_terminal.ready sentinel here.
 # ---------------------------------------------------------------------------
-WINE_CMD=""
-if command -v wine > /dev/null 2>&1; then
-  WINE_CMD="wine"
-elif command -v wine64 > /dev/null 2>&1; then
-  WINE_CMD="wine64"
-fi
-
 (
+  set +euo pipefail
+
+  WINE_CMD=""
+  if command -v wine > /dev/null 2>&1; then
+    WINE_CMD="wine"
+  elif command -v wine64 > /dev/null 2>&1; then
+    WINE_CMD="wine64"
+  fi
+
   if [[ -z "$WINE_CMD" ]]; then
-    echo "Wine command not found (wine/wine64); skipping MT5 terminal launch." >&2
+    echo "[mt5-terminal] Wine command not found; skipping MT5 terminal launch." >&2
     exit 0
   fi
 
-  for _ in $(seq 1 60); do
-    if [[ -f "$MT_TERMINAL_EXE" ]]; then
+  echo "[mt5-terminal] Waiting for MT5 terminal to be installed..."
+
+  # Wait up to 30 minutes for the terminal installer to finish.
+  WAITED=0
+  TERMINAL_EXE=""
+  for _ in $(seq 1 900); do
+    # Check sentinel file written by bootstrap after terminal install.
+    if [[ -f "${LOGDIR}/mt5_terminal.ready" ]]; then
+      # Read the actual path bootstrap discovered (may differ from the env default).
+      if [[ -f "${LOGDIR}/mt5_terminal_exe.path" ]]; then
+        TERMINAL_EXE=$(cat "${LOGDIR}/mt5_terminal_exe.path" 2>/dev/null | tr -d '\n') || true
+      fi
+      TERMINAL_EXE="${TERMINAL_EXE:-$MT_TERMINAL_EXE}"
+      echo "[mt5-terminal] Terminal ready after ~${WAITED}s. Path: $TERMINAL_EXE"
       break
     fi
-    sleep 5
+    # Also check if the exe appeared at the default path (e.g. pre-installed image).
+    if [[ -f "$MT_TERMINAL_EXE" ]]; then
+      TERMINAL_EXE="$MT_TERMINAL_EXE"
+      echo "[mt5-terminal] terminal64.exe found at default path after ~${WAITED}s."
+      break
+    fi
+    WAITED=$((WAITED + 2))
+    if (( WAITED % 120 == 0 )); then
+      echo "[mt5-terminal] Still waiting for MT5 terminal install... (${WAITED}s elapsed)"
+      echo "[mt5-terminal]   status: $(cat "${LOGDIR}/bootstrap.status" 2>/dev/null || echo '(none)')"
+    fi
+    sleep 2
   done
 
-  if [[ -f "$MT_TERMINAL_EXE" ]]; then
-    "$WINE_CMD" "$MT_TERMINAL_EXE" > "${LOGDIR}/mt5-terminal.log" 2>&1 || true
-  else
-    echo "MT terminal executable not found at: $MT_TERMINAL_EXE" >&2
+  if [[ -z "$TERMINAL_EXE" ]] || [[ ! -f "$TERMINAL_EXE" ]]; then
+    echo "[mt5-terminal] MT5 terminal executable not found after waiting. Skipping launch." >&2
+    echo "[mt5-terminal]   Expected: $MT_TERMINAL_EXE" >&2
+    echo "[mt5-terminal]   From sentinel: $(cat "${LOGDIR}/mt5_terminal_exe.path" 2>/dev/null || echo '(none)')" >&2
+    exit 0
   fi
+
+  echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
+  "$WINE_CMD" "$TERMINAL_EXE" > "${LOGDIR}/mt5-terminal.log" 2>&1 || true
 ) > /tmp/mt5-launch-wrapper.log 2>&1 &
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"

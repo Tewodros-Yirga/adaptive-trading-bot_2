@@ -1,8 +1,7 @@
 import os
 import random
+import time
 from typing import Any
-
-from tenacity import retry, stop_after_attempt, wait_fixed
 
 from .config import settings
 
@@ -17,6 +16,15 @@ except Exception:
     mt5linux_cls = None
 
 
+# ---------------------------------------------------------------------------
+# How long to wait before retrying after a failed connection attempt.
+# MT5 terminal installation can take 10-15 minutes on cold Render instances,
+# so we use a generous backoff ceiling.
+# ---------------------------------------------------------------------------
+_RETRY_BACKOFF_SECONDS = [5, 10, 20, 30, 60, 120, 180, 300]  # per attempt
+_MAX_RETRY_INTERVAL = 300  # cap: retry at most every 5 minutes
+
+
 class MT5Adapter:
     def __init__(self) -> None:
         self.connected = False
@@ -24,23 +32,39 @@ class MT5Adapter:
         self._mt: Any | None = None
         self._backend: str | None = None
         self._resolved_terminal_exe: str | None = None
+        # Time-based retry tracking.
+        self._connect_attempts: int = 0
+        self._next_connect_at: float = 0.0  # epoch seconds
 
     def _resolve_terminal_exe(self) -> str:
         """
         Resolve the MetaTrader 5 terminal executable inside the active Wine prefix.
-        The terminal install path can vary by prefix/config, so we fall back to a search.
+        Checks the sentinel file written by bootstrap first (most reliable), then
+        falls back to the configured path and a bounded filesystem search.
         """
-
-        if self._resolved_terminal_exe:
+        if self._resolved_terminal_exe and os.path.isfile(self._resolved_terminal_exe):
             return self._resolved_terminal_exe
 
+        # 1) Check sentinel file written by bootstrap after install.
+        logdir = os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs")
+        sentinel_path = os.path.join(logdir, "mt5_terminal_exe.path")
+        if os.path.isfile(sentinel_path):
+            try:
+                sentinel_exe = open(sentinel_path).read().strip()
+                if sentinel_exe and os.path.isfile(sentinel_exe):
+                    self._resolved_terminal_exe = sentinel_exe
+                    return sentinel_exe
+            except Exception:
+                pass
+
+        # 2) Configured env var.
         configured = settings.mt_terminal_exe
         if configured and os.path.isfile(configured):
             self._resolved_terminal_exe = configured
             return configured
 
+        # 3) Derived candidates from WINEPREFIX.
         wineprefix = (os.environ.get("WINEPREFIX") or "/home/wineuser/.wineprefix").rstrip("/")
-
         derived_candidates = [
             os.path.join(wineprefix, "drive_c", "Program Files", "MetaTrader 5", "terminal64.exe"),
             os.path.join(wineprefix, "drive_c", "Program Files (x86)", "MetaTrader 5", "terminal64.exe"),
@@ -50,7 +74,7 @@ class MT5Adapter:
                 self._resolved_terminal_exe = c
                 return c
 
-        # If installation path differs, do a bounded search.
+        # 4) Bounded filesystem search.
         drive_c = os.path.join(wineprefix, "drive_c")
         if os.path.isdir(drive_c):
             for root, _dirs, files in os.walk(drive_c):
@@ -59,25 +83,46 @@ class MT5Adapter:
                     self._resolved_terminal_exe = resolved
                     return resolved
 
+        # Return the configured/default even if it doesn't exist yet.
         self._resolved_terminal_exe = configured or derived_candidates[0]
         return self._resolved_terminal_exe
 
     def _last_error_repr(self) -> str:
-        if self.last_error:
-            return self.last_error
-        return "unknown error"
+        return self.last_error or "unknown error"
 
-    # MT5 (Wine) startup can take a while. Allow enough retries for the first connect
-    # so /ready can transition to LIVE without requiring manual re-calls.
-    @retry(wait=wait_fixed(2), stop=stop_after_attempt(10), reraise=True)
+    def _retry_backoff(self) -> float:
+        """Return how many seconds to wait before the next connection attempt."""
+        idx = min(self._connect_attempts, len(_RETRY_BACKOFF_SECONDS) - 1)
+        return _RETRY_BACKOFF_SECONDS[idx]
+
     def ensure_connection(self) -> None:
-        # Avoid repeated reconnect attempts when already connected.
+        """
+        Attempt to connect to MT5 (native or via mt5linux RPyC).
+
+        Uses time-based cooldown instead of a fixed attempt counter so that:
+        - A terminal that is still installing will be retried after each cooldown.
+        - Already-connected adapters skip the check entirely.
+        - A permanently broken setup retries at most every _MAX_RETRY_INTERVAL seconds.
+        """
         if self.connected and self._mt is not None:
             return
 
+        now = time.monotonic()
+        if now < self._next_connect_at:
+            # Still in cooldown — return whatever state we have.
+            return
+
+        # Reset per-attempt resolution cache so we re-check the sentinel file
+        # (bootstrap may have installed the terminal since the last attempt).
+        self._resolved_terminal_exe = None
         terminal_exe = self._resolve_terminal_exe()
 
-        # 1) Try native MetaTrader5 (only works when the python bindings are actually usable in-container)
+        self._connect_attempts += 1
+        backoff = min(self._retry_backoff(), _MAX_RETRY_INTERVAL)
+        self._next_connect_at = now + backoff
+
+        # 1) Try native MetaTrader5 (only works when the python bindings are
+        #    actually usable in-container, which is rare on Linux).
         if mt5_native is not None:
             try:
                 ok = mt5_native.initialize(
@@ -91,43 +136,58 @@ class MT5Adapter:
                     self._backend = "native"
                     self.connected = True
                     self.last_error = None
+                    self._connect_attempts = 0
+                    self._next_connect_at = 0.0
                     return
                 self.last_error = f"mt5 native initialize failed: {mt5_native.last_error()}"
             except Exception as exc:
                 self.last_error = f"mt5 native initialize exception: {exc}"
 
-        # 2) Try mt5linux (Wine + RPyC). This is the expected path for Linux containers.
+        # 2) Try mt5linux (Wine + RPyC). Expected path for Linux containers.
         if mt5linux_cls is not None:
             try:
                 host_candidates: list[str] = [settings.mt5linux_host]
                 if settings.mt5linux_host.strip().lower() == "localhost":
-                    # Some environments resolve `localhost` to IPv6 (`::1`) first, while mt5linux
-                    # typically binds to IPv4 (`127.0.0.1`).
+                    # Some environments resolve `localhost` to IPv6 (`::1`) first,
+                    # while mt5linux typically binds to IPv4 (`127.0.0.1`).
                     host_candidates.append("127.0.0.1")
 
                 last_exc: Exception | None = None
                 client = None
                 for h in host_candidates:
                     try:
-                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=300)
-                        # mt5linux forwards parameters to the Windows-side MetaTrader5 integration.
-                        client.initialize(
+                        # Use a short timeout for the RPC call itself so we don't
+                        # block the request for 300s when the terminal isn't ready.
+                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=30)
+                        ok = client.initialize(
                             path=terminal_exe,
                             login=settings.mt_login,
                             password=settings.mt_password,
                             server=settings.mt_server,
                         )
+                        if not ok:
+                            err = client.last_error() if hasattr(client, "last_error") else "unknown"
+                            raise RuntimeError(f"initialize() returned False: {err}")
                         info = client.account_info()
                         if info is None:
-                            raise RuntimeError("mt5linux account_info returned None")
+                            raise RuntimeError("account_info() returned None — terminal may not be logged in yet")
 
                         self._mt = client
                         self._backend = "mt5linux"
                         self.connected = True
                         self.last_error = None
+                        self._connect_attempts = 0
+                        self._next_connect_at = 0.0
                         return
                     except Exception as exc:
                         last_exc = exc
+                        # Clean up the failed client so next attempt starts fresh.
+                        try:
+                            if client is not None:
+                                client.shutdown()
+                        except Exception:
+                            pass
+                        client = None
                         continue
 
                 raise RuntimeError(f"mt5linux init failed (all hosts): {last_exc}")
@@ -137,7 +197,14 @@ class MT5Adapter:
         self.connected = False
         if not settings.mt_fallback_mode:
             raise RuntimeError(self.last_error or "MT5 backend not available")
-        return
+
+    def reset_connection(self) -> None:
+        """Force the adapter to reconnect on the next request (called externally if needed)."""
+        self.connected = False
+        self._mt = None
+        self._connect_attempts = 0
+        self._next_connect_at = 0.0
+        self._resolved_terminal_exe = None
 
     def account(self) -> dict[str, Any]:
         self.ensure_connection()
@@ -149,17 +216,29 @@ class MT5Adapter:
                 "freeMargin": 0.0,
                 "mode": "FALLBACK",
                 "warning": self.last_error,
+                "nextRetryIn": max(0, self._next_connect_at - time.monotonic()),
             }
 
-        info = self._mt.account_info()
+        try:
+            info = self._mt.account_info()
+        except Exception as exc:
+            # Connection dropped — force reconnect on next call.
+            self.connected = False
+            self._mt = None
+            raise RuntimeError(f"mt5 account_info exception: {exc}") from exc
+
         if info is None:
+            self.connected = False
+            self._mt = None
             raise RuntimeError(f"mt5 account_info failed: {self._last_error_repr()}")
+
         return {
             "balance": info.balance,
             "equity": info.equity,
             "margin": info.margin,
             "freeMargin": info.margin_free,
             "mode": "LIVE",
+            "backend": self._backend,
         }
 
     def positions(self) -> list[dict[str, Any]]:
@@ -167,7 +246,13 @@ class MT5Adapter:
         if self._mt is None or not self.connected:
             return []
 
-        rows = self._mt.positions_get()
+        try:
+            rows = self._mt.positions_get()
+        except Exception as exc:
+            self.connected = False
+            self._mt = None
+            raise RuntimeError(f"mt5 positions_get exception: {exc}") from exc
+
         if rows is None:
             return []
         out = []
