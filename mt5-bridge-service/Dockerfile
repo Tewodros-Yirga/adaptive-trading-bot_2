@@ -12,9 +12,10 @@
 
 FROM ghcr.io/loriloha/mt5-bridge-base:latest
 
-# Force root for all BUILD steps so we can install packages and chown freely.
-# We switch back to wineuser at the end so Wine's IPC user profile matches
-# what was created during the base image build (wineuser, not root).
+# Build and run as root. The wine prefix was also created by root (docker
+# builds always run as root unless a USER instruction changes them — the
+# scottyhardy base does NOT have a USER instruction so build is root).
+# At runtime we stay root so Wine's ownership check passes.
 USER root
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -24,9 +25,7 @@ ENV WINEDEBUG=-all
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
-# Match the base image's home directory (wineuser) so Wine resolves the
-# user profile correctly at runtime.
-ENV HOME=/home/wineuser
+ENV HOME=/root
 
 # Install supervisor + python3-venv (Linux-side, for the FastAPI bridge).
 RUN set -eux; \
@@ -34,14 +33,11 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends --fix-missing supervisor python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
-# Fix wineprefix ownership to UID 1000 (the user that built the base image).
-# We use the numeric UID because the wineuser entry may not be in /etc/passwd
-# in all build environments.
-RUN chown -R 1000:1000 /opt/wineprefix
+# Ensure /opt/wineprefix is owned by root (matching runtime user).
+RUN chown -R root:root /opt/wineprefix 2>/dev/null || true
 
-# Create the Linux-side Python venv and make it accessible to UID 1000.
-RUN python3 -m venv "${VIRTUAL_ENV}" && \
-    chown -R 1000:1000 "${VIRTUAL_ENV}"
+# Create the Linux-side Python venv for the FastAPI bridge.
+RUN python3 -m venv "${VIRTUAL_ENV}"
 
 WORKDIR /bridge
 
@@ -54,13 +50,10 @@ COPY app /bridge/app
 COPY supervisord.conf /bridge/supervisord.conf
 COPY bootstrap-mt5.sh /bridge/bootstrap-mt5.sh
 COPY start.sh /bridge/start.sh
-RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh && \
-    chown -R 1000:1000 /bridge
+RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
 
 EXPOSE 5555
 
-# Clear scottyhardy's gosu entrypoint and run as UID 1000 (the base image's
-# build user) so Wine's IPC user profile (C:\users\<username>) matches.
+# Clear scottyhardy's gosu entrypoint so start.sh runs directly as root.
 ENTRYPOINT []
-USER 1000
 CMD ["/bridge/start.sh"]
