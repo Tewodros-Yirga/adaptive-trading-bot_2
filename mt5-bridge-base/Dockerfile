@@ -40,10 +40,13 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     dpkg --add-architecture i386; \
-    # Configure apt to retry on network failures. \
+    # Switch apt sources from http to https — port 80 is flaky on GitHub runners. \
+    sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' /etc/apt/sources.list; \
+    sed -i 's|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list; \
+    # Configure apt retries and timeouts. \
     echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
     echo 'Acquire::http::Timeout "60";' >> /etc/apt/apt.conf.d/80-retries; \
-    echo 'Acquire::ftp::Timeout "60";' >> /etc/apt/apt.conf.d/80-retries; \
+    echo 'Acquire::https::Timeout "60";' >> /etc/apt/apt.conf.d/80-retries; \
     # Retry apt-get update up to 5 times. \
     for i in 1 2 3 4 5; do \
       apt-get update && break || { echo "apt-get update failed (attempt $i)"; sleep $((i * 10)); }; \
@@ -70,6 +73,7 @@ RUN set -eux; \
          }; \
     done; \
     rm -rf /var/lib/apt/lists/*
+
 
 # ---------------------------------------------------------------------------
 # 2. Create Wine prefix (with a running Xvfb)
