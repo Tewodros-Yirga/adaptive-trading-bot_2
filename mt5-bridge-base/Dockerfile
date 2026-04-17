@@ -37,8 +37,10 @@ ENV WINEDLLOVERRIDES="mscoree,mshtml="
 #    (scottyhardy base already has curl, ca-certificates, python3, pip)
 # ---------------------------------------------------------------------------
 RUN set -eux; \
-    apt-get update -qq; \
-    apt-get install -y --no-install-recommends curl python3-venv; \
+    # apt-get update may fail on noble-updates due to mirror sync races — that's OK. \
+    # curl and python3-venv are in the base noble repo which downloads reliably. \
+    apt-get update -qq || true; \
+    apt-get install -y --no-install-recommends --fix-missing curl python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
