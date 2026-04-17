@@ -29,6 +29,7 @@ class MT5Adapter:
     def __init__(self) -> None:
         self.connected = False
         self.last_error: str | None = None
+        self.last_error_class: str | None = None
         self._mt: Any | None = None
         self._backend: str | None = None
         self._resolved_terminal_exe: str | None = None
@@ -89,6 +90,21 @@ class MT5Adapter:
 
     def _last_error_repr(self) -> str:
         return self.last_error or "unknown error"
+
+    @staticmethod
+    def _classify_error_text(error_text: str) -> str:
+        low = (error_text or "").lower()
+        if "-10005" in low or "ipc timeout" in low:
+            return "ipc_timeout"
+        if "account_info() returned none" in low or "not be logged in yet" in low:
+            return "account_not_ready"
+        if "connection refused" in low or "timed out" in low or "host" in low:
+            return "rpc_unreachable"
+        if "invalid account" in low or "authorization" in low or "login" in low:
+            return "auth_failure"
+        if "initialize() returned false" in low:
+            return "initialize_failed"
+        return "unknown"
 
     @staticmethod
     def _to_wine_path(linux_path: str) -> str | None:
@@ -158,12 +174,15 @@ class MT5Adapter:
                     self._backend = "native"
                     self.connected = True
                     self.last_error = None
+                    self.last_error_class = None
                     self._connect_attempts = 0
                     self._next_connect_at = 0.0
                     return
                 self.last_error = f"mt5 native initialize failed: {mt5_native.last_error()}"
+                self.last_error_class = self._classify_error_text(self.last_error)
             except Exception as exc:
                 self.last_error = f"mt5 native initialize exception: {exc}"
+                self.last_error_class = self._classify_error_text(self.last_error)
 
         # 2) Try mt5linux (Wine + RPyC). Expected path for Linux containers.
         if mt5linux_cls is not None:
@@ -193,18 +212,47 @@ class MT5Adapter:
                             "password": settings.mt_password,
                             "server": settings.mt_server,
                         }
-                        ok = client.initialize(**creds)
+                        ok = False
+                        last_init_error = "unknown"
+                        # Reliability-first: retry no-path initialize several times
+                        # because the MT5 terminal GUI can be up before IPC is attachable.
+                        for init_attempt in range(1, 4):
+                            ok = client.initialize(**creds)
+                            if ok:
+                                break
 
-                        if not ok:
-                            # Strategy 2: pass the Windows path so MetaTrader5 can launch
-                            # the terminal itself if it isn't running yet.
-                            wine_path = self._to_wine_path(terminal_exe)
-                            if wine_path:
-                                ok = client.initialize(path=wine_path, **creds)
-
-                        if not ok:
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
-                            raise RuntimeError(f"initialize() returned False: {err}")
+                            last_init_error = str(err)
+                            err_class = self._classify_error_text(last_init_error)
+                            if err_class == "ipc_timeout" and init_attempt < 3:
+                                time.sleep(2 + random.random())
+                                continue
+                            break
+
+                        if not ok:
+                            launch_terminal_enabled = os.environ.get("MT5_LAUNCH_TERMINAL", "false").lower() == "true"
+                            ipc_ready_file = os.path.join(
+                                os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"),
+                                "mt5_ipc.ready",
+                            )
+                            should_skip_path_fallback = launch_terminal_enabled or os.path.isfile(ipc_ready_file)
+
+                            # Strategy 2: pass the Windows path only when we're not in
+                            # pre-launched terminal mode. This avoids creating a second
+                            # attach path during active IPC warm-up.
+                            if not should_skip_path_fallback:
+                                wine_path = self._to_wine_path(terminal_exe)
+                                if wine_path:
+                                    ok = client.initialize(path=wine_path, **creds)
+                                    if not ok:
+                                        err = client.last_error() if hasattr(client, "last_error") else "unknown"
+                                        last_init_error = str(err)
+
+                        if not ok:
+                            self.last_error_class = self._classify_error_text(last_init_error)
+                            raise RuntimeError(
+                                f"initialize() returned False [{self.last_error_class}]: {last_init_error}"
+                            )
 
                         info = client.account_info()
                         if info is None:
@@ -214,6 +262,7 @@ class MT5Adapter:
                         self._backend = "mt5linux"
                         self.connected = True
                         self.last_error = None
+                        self.last_error_class = None
                         self._connect_attempts = 0
                         self._next_connect_at = 0.0
                         return
@@ -231,6 +280,7 @@ class MT5Adapter:
                 raise RuntimeError(f"mt5linux init failed (all hosts): {last_exc}")
             except Exception as exc:
                 self.last_error = f"mt5linux init failed: {exc}"
+                self.last_error_class = self._classify_error_text(self.last_error)
 
         self.connected = False
         if not settings.mt_fallback_mode:
@@ -240,6 +290,7 @@ class MT5Adapter:
         """Force the adapter to reconnect on the next request (called externally if needed)."""
         self.connected = False
         self._mt = None
+        self.last_error_class = None
         self._connect_attempts = 0
         self._next_connect_at = 0.0
         self._resolved_terminal_exe = None

@@ -216,8 +216,75 @@ fi
     exit 0
   fi
 
+  IPC_READY_FILE="${LOGDIR}/mt5_ipc.ready"
+  IPC_FAILED_FILE="${LOGDIR}/mt5_ipc.failed"
+  IPC_STATUS_FILE="${LOGDIR}/mt5_ipc.status"
+  IPC_PROBE_LOG="${LOGDIR}/mt5-ipc-probe.log"
+  rm -f "${IPC_READY_FILE}" "${IPC_FAILED_FILE}" "${IPC_STATUS_FILE}" "${IPC_PROBE_LOG}" 2>/dev/null || true
+  echo "pending" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+
   echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
-  "$WINE_CMD" "$TERMINAL_EXE" > "${LOGDIR}/mt5-terminal.log" 2>&1 || true
+  "$WINE_CMD" "$TERMINAL_EXE" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
+  TERMINAL_PID=$!
+
+  # Resolve Wine Python for IPC probe.
+  FOUND_PYTHON=""
+  if [[ -f "/opt/wine_python_exe.path" ]]; then
+    PREBAKED=$(cat /opt/wine_python_exe.path 2>/dev/null | tr -d '\n') || true
+    if [[ -n "$PREBAKED" ]] && [[ -f "$PREBAKED" ]]; then
+      FOUND_PYTHON="$PREBAKED"
+    fi
+  fi
+  if [[ -z "$FOUND_PYTHON" ]]; then
+    FOUND_PYTHON=$(find "${WINEPREFIX}/drive_c" -maxdepth 5 -name "python.exe" 2>/dev/null | head -1) || true
+  fi
+
+  if [[ -z "$FOUND_PYTHON" ]] || [[ ! -f "$FOUND_PYTHON" ]]; then
+    echo "[mt5-terminal] Could not find Wine python.exe for IPC probe." >&2
+    echo "failed: python_not_found" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+    touch "${IPC_FAILED_FILE}" 2>/dev/null || true
+  else
+    # Probe MT5 IPC readiness using direct Wine Python initialize() calls.
+    MAX_ATTEMPTS=40
+    SLEEP_SECONDS=5
+    ATTEMPT=0
+    while (( ATTEMPT < MAX_ATTEMPTS )); do
+      ATTEMPT=$((ATTEMPT + 1))
+      if ! kill -0 "${TERMINAL_PID}" 2>/dev/null; then
+        echo "failed: terminal_exited_before_ipc_ready" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+        touch "${IPC_FAILED_FILE}" 2>/dev/null || true
+        break
+      fi
+
+      PROBE_OUT=$(
+        timeout 90 "$WINE_CMD" "$FOUND_PYTHON" -c \
+          "import MetaTrader5 as mt5; ok = mt5.initialize(); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')" \
+          2>&1
+      )
+      PROBE_EXIT=$?
+
+      {
+        echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] exit=${PROBE_EXIT} output=${PROBE_OUT}"
+      } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+
+      if [[ "$PROBE_OUT" == *"ok=True"* ]]; then
+        echo "ready: attempt=${ATTEMPT} output=${PROBE_OUT}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+        touch "${IPC_READY_FILE}" 2>/dev/null || true
+        break
+      fi
+
+      echo "waiting: attempt=${ATTEMPT} exit=${PROBE_EXIT} output=${PROBE_OUT}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      sleep "${SLEEP_SECONDS}"
+    done
+
+    if [[ ! -f "${IPC_READY_FILE}" ]]; then
+      echo "failed: attempts_exhausted output=$(tail -n 1 "${IPC_PROBE_LOG}" 2>/dev/null || echo none)" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      touch "${IPC_FAILED_FILE}" 2>/dev/null || true
+    fi
+  fi
+
+  # Keep wrapper attached to terminal lifecycle.
+  wait "${TERMINAL_PID}" || true
 ) > /tmp/mt5-launch-wrapper.log 2>&1 &
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"

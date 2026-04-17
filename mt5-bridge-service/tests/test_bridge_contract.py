@@ -23,3 +23,58 @@ def test_secret_protected_endpoint():
     assert denied.status_code == 403
     allowed = client.get("/account", headers={"X-Bridge-Secret": "bridge_secret_token"})
     assert allowed.status_code == 200
+
+
+def test_parse_ipc_probe_stdout():
+    from app.main import _parse_ipc_probe_stdout
+
+    parsed = _parse_ipc_probe_stdout("ok=False err=(-10005, 'IPC timeout')")
+    assert parsed["ok"] is False
+    assert parsed["err_code"] == -10005
+    assert parsed["err_message"] == "IPC timeout"
+
+
+def test_ready_reports_ipc_fields(monkeypatch, tmp_path):
+    from app import main
+
+    (tmp_path / "mt5_ipc.ready").write_text("", encoding="utf-8")
+    (tmp_path / "mt5_ipc.status").write_text("ready", encoding="utf-8")
+    monkeypatch.setenv("LOGDIR", str(tmp_path))
+    monkeypatch.setattr(
+        main.adapter,
+        "account",
+        lambda: {"mode": "FALLBACK", "warning": "mt5linux init failed"},
+    )
+    monkeypatch.setattr(main.adapter, "last_error_class", "ipc_timeout")
+
+    client = TestClient(app)
+    res = client.get("/ready")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ready"] is False
+    assert data["account_mode"] == "FALLBACK"
+    assert data["ipc_ready"] is True
+    assert data["ipc_failed"] is False
+    assert "ready" in (data["ipc_status"] or "")
+    assert data["error_class"] == "ipc_timeout"
+
+
+def test_debug_mt5_includes_ipc_diagnostics(monkeypatch, tmp_path):
+    from app import main
+
+    monkeypatch.setenv("LOGDIR", str(tmp_path))
+    (tmp_path / "bootstrap.ready").write_text("", encoding="utf-8")
+    (tmp_path / "mt5_terminal.ready").write_text("", encoding="utf-8")
+    (tmp_path / "mt5_ipc.failed").write_text("", encoding="utf-8")
+    (tmp_path / "mt5_ipc.status").write_text("failed: attempts_exhausted", encoding="utf-8")
+    (tmp_path / "mt5-ipc-probe.log").write_text("[attempt 1] ...", encoding="utf-8")
+
+    client = TestClient(app)
+    res = client.get("/debug/mt5", headers={"X-Bridge-Secret": "bridge_secret_token"})
+    assert res.status_code == 200
+    data = res.json()
+    assert "bootstrap" in data
+    assert data["bootstrap"]["ipc_ready"] is False
+    assert data["bootstrap"]["ipc_failed"] is True
+    assert "attempts_exhausted" in (data["bootstrap"]["ipc_status"] or "")
+    assert "mt5-ipc-probe" in data["logs"]

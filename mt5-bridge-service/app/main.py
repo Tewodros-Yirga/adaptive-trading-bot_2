@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import socket
 from pathlib import Path
 
@@ -55,14 +56,33 @@ def root():
 
 @app.get("/ready")
 def ready():
+    logdir = Path(os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"))
+    ipc_ready_file = logdir / "mt5_ipc.ready"
+    ipc_failed_file = logdir / "mt5_ipc.failed"
+    ipc_status_file = logdir / "mt5_ipc.status"
     try:
         data = adapter.account()
         account_mode = data.get("mode", "UNKNOWN")
         # If MT5 is not actually connected, adapter returns FALLBACK.
         # Treat that as "not ready" so operators can distinguish endpoint availability vs MT5 connectivity.
-        return {"ready": account_mode == "LIVE", "account_mode": account_mode, "warning": data.get("warning")}
+        return {
+            "ready": account_mode == "LIVE",
+            "account_mode": account_mode,
+            "warning": data.get("warning"),
+            "error_class": adapter.last_error_class,
+            "ipc_ready": ipc_ready_file.exists(),
+            "ipc_failed": ipc_failed_file.exists(),
+            "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
+        }
     except Exception as exc:
-        return {"ready": False, "error": str(exc)}
+        return {
+            "ready": False,
+            "error": str(exc),
+            "error_class": adapter.last_error_class,
+            "ipc_ready": ipc_ready_file.exists(),
+            "ipc_failed": ipc_failed_file.exists(),
+            "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
+        }
 
 
 def _tail_file(path: Path, max_bytes: int = 40_000) -> str | None:
@@ -85,6 +105,20 @@ def _tcp_open(host: str, port: int, timeout_s: float = 0.5) -> bool:
         return False
 
 
+def _parse_ipc_probe_stdout(stdout: str) -> dict[str, object]:
+    parsed: dict[str, object] = {"ok": None, "err_code": None, "err_message": None}
+    if not stdout:
+        return parsed
+    ok_match = re.search(r"ok=(True|False)", stdout)
+    if ok_match:
+        parsed["ok"] = ok_match.group(1) == "True"
+    err_match = re.search(r"err=\(([-0-9]+),\s*'([^']*)'\)", stdout)
+    if err_match:
+        parsed["err_code"] = int(err_match.group(1))
+        parsed["err_message"] = err_match.group(2)
+    return parsed
+
+
 @app.get("/debug/mt5", dependencies=[Depends(require_secret)])
 def debug_mt5():
     """
@@ -98,6 +132,9 @@ def debug_mt5():
     status_file = logdir / "bootstrap.status"
     terminal_ready_file = logdir / "mt5_terminal.ready"
     terminal_path_file = logdir / "mt5_terminal_exe.path"
+    ipc_ready_file = logdir / "mt5_ipc.ready"
+    ipc_failed_file = logdir / "mt5_ipc.failed"
+    ipc_status_file = logdir / "mt5_ipc.status"
 
     terminal_exe_from_sentinel: str | None = None
     if terminal_path_file.exists():
@@ -118,6 +155,7 @@ def debug_mt5():
             "connected": adapter.connected,
             "backend": adapter._backend,
             "last_error": adapter.last_error,
+            "last_error_class": adapter.last_error_class,
             "connect_attempts": adapter._connect_attempts,
         },
         "bootstrap": {
@@ -125,6 +163,9 @@ def debug_mt5():
             "failed": failed_file.exists(),
             "status": _tail_file(status_file, max_bytes=4_000),
             "terminal_ready": terminal_ready_file.exists(),
+            "ipc_ready": ipc_ready_file.exists(),
+            "ipc_failed": ipc_failed_file.exists(),
+            "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
         },
         "logs": {
             "bootstrap-mt5": _tail_file(logdir / "bootstrap-mt5.log"),
@@ -140,6 +181,7 @@ def debug_mt5():
             "wine-mt5linux-pip-install": _tail_file(logdir / "wine-mt5linux-pip-install.log"),
             "mt5-terminal": _tail_file(logdir / "mt5-terminal.log"),
             "mt5-launch-wrapper": _tail_file(logdir / "mt5-launch-wrapper.log"),
+            "mt5-ipc-probe": _tail_file(logdir / "mt5-ipc-probe.log"),
         },
     }
 
@@ -181,17 +223,25 @@ def debug_mt5_ipc_test():
         "mt5.shutdown(); "
         "print(f'ok={ok} err={err}')"
     )
-    env = {**os.environ, "DISPLAY": ":99", "WINEPREFIX": "/opt/wineprefix",
-           "WINEDEBUG": "-all"}
+    env = {
+        **os.environ,
+        "DISPLAY": os.environ.get("DISPLAY", ":99"),
+        "WINEPREFIX": os.environ.get("WINEPREFIX", "/opt/wineprefix"),
+        "WINEDEBUG": "-all",
+    }
     try:
         r = subprocess.run(
             ["wine", wine_python, "-c", script],
             env=env, capture_output=True, text=True, timeout=90
         )
+        parsed = _parse_ipc_probe_stdout(r.stdout.strip())
         return {
             "returncode": r.returncode,
             "stdout": r.stdout.strip(),
             "stderr": r.stderr.strip()[-2000:],
+            "ok": parsed["ok"],
+            "err_code": parsed["err_code"],
+            "err_message": parsed["err_message"],
         }
     except subprocess.TimeoutExpired:
         return {"error": "subprocess timed out after 90s"}
