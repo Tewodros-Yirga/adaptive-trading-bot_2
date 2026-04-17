@@ -92,7 +92,7 @@ class MT5Adapter:
 
     @staticmethod
     def _to_wine_path(linux_path: str) -> str | None:
-        """
+        r"""
         Convert a Linux-side WINEPREFIX path to a Windows-style path.
 
         MetaTrader5.initialize(path=...) runs inside Wine Python, which expects

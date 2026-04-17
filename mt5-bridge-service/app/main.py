@@ -144,6 +144,22 @@ def debug_mt5():
     }
 
 
+@app.get("/debug/processes", dependencies=[Depends(require_secret)])
+def debug_processes():
+    """Check which Wine/MT5 processes are running inside the container."""
+    import subprocess
+    try:
+        ps = subprocess.run(
+            ["ps", "aux"],
+            capture_output=True, text=True, timeout=5
+        )
+        all_lines = ps.stdout.splitlines()
+        wine_lines = [l for l in all_lines if "wine" in l.lower() or "terminal" in l.lower() or "xvfb" in l.lower()]
+    except Exception as exc:
+        wine_lines = [f"ps failed: {exc}"]
+    return {"wine_processes": wine_lines}
+
+
 @app.get("/account", dependencies=[Depends(require_secret)])
 def account():
     return adapter.account()
