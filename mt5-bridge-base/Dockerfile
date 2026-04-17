@@ -38,7 +38,7 @@ ENV WINEDLLOVERRIDES="mscoree,mshtml="
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     apt-get update -qq; \
-    apt-get install -y --no-install-recommends python3-venv; \
+    apt-get install -y --no-install-recommends curl python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
