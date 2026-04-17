@@ -277,9 +277,17 @@ fi
         break
       fi
 
+      # Build the initialize() call for the probe.
+      # In portable/data_dir mode the data directory is fresh (no saved account),
+      # so bare initialize() always returns False.  Pass credentials so the probe can
+      # actually attach and confirm IPC is working.
+      PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}'"
+      if [[ "${MT5_CONTEXT_MODE:-default}" == "portable" ]]; then
+        PROBE_INIT_ARGS="${PROBE_INIT_ARGS}, portable=True"
+      fi
+      PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
       PROBE_OUT=$(
-        timeout 90 "$WINE_CMD" "$FOUND_PYTHON" -c \
-          "import MetaTrader5 as mt5; ok = mt5.initialize(); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')" \
+        timeout 90 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
           2>&1
       )
       PROBE_EXIT=$?
