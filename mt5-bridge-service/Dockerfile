@@ -34,15 +34,14 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends --fix-missing supervisor python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
-# Fix wineprefix ownership to wineuser. The base image created it as wineuser,
-# but since we forced USER root above, this chown runs as root and succeeds.
-# At runtime (USER wineuser below), Wine will see the prefix owned by wineuser
-# and accept it — no more "not owned by you" errors.
-RUN chown -R wineuser:wineuser /opt/wineprefix
+# Fix wineprefix ownership to UID 1000 (the user that built the base image).
+# We use the numeric UID because the wineuser entry may not be in /etc/passwd
+# in all build environments.
+RUN chown -R 1000:1000 /opt/wineprefix
 
-# Create the Linux-side Python venv and make it accessible to wineuser.
+# Create the Linux-side Python venv and make it accessible to UID 1000.
 RUN python3 -m venv "${VIRTUAL_ENV}" && \
-    chown -R wineuser:wineuser "${VIRTUAL_ENV}"
+    chown -R 1000:1000 "${VIRTUAL_ENV}"
 
 WORKDIR /bridge
 
@@ -56,12 +55,12 @@ COPY supervisord.conf /bridge/supervisord.conf
 COPY bootstrap-mt5.sh /bridge/bootstrap-mt5.sh
 COPY start.sh /bridge/start.sh
 RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh && \
-    chown -R wineuser:wineuser /bridge
+    chown -R 1000:1000 /bridge
 
 EXPOSE 5555
 
-# Clear scottyhardy's gosu entrypoint and run as wineuser so Wine's IPC
-# user profile (C:\users\wineuser) matches the base image build context.
+# Clear scottyhardy's gosu entrypoint and run as UID 1000 (the base image's
+# build user) so Wine's IPC user profile (C:\users\<username>) matches.
 ENTRYPOINT []
-USER wineuser
+USER 1000
 CMD ["/bridge/start.sh"]
