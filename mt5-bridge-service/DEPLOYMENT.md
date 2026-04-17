@@ -166,8 +166,8 @@ All require `X-Bridge-Secret` header.
 
 ### Screenshot command
 ```powershell
-$hfToken = "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"
-$h = @{"Authorization"="Bearer $hfToken"; "X-Bridge-Secret"="1a364030bfe1ca13427f45d0fdcbb99a"}
+$hfToken = "<YOUR_HF_READ_TOKEN>"
+$h = @{"Authorization"="Bearer $hfToken"; "X-Bridge-Secret"="<YOUR_BRIDGE_SECRET>"}
 $r = Invoke-RestMethod -Uri "https://loriloha-mt5-bridge-service.hf.space/debug/screenshot" -Headers $h
 [IO.File]::WriteAllBytes("$env:USERPROFILE\Desktop\mt5-screen.png",
     [Convert]::FromBase64String($r.image_b64))
