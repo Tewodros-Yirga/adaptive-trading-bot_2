@@ -92,9 +92,18 @@ if command -v wine > /dev/null 2>&1; then
       exit 1
     fi
 
-    # Locate the Wine python.exe installed by bootstrap.
-    # We do NOT use `wine python` globally — that hangs if python.exe isn't on Wine PATH.
-    FOUND_PYTHON=$(find "${WINEPREFIX}/drive_c" -maxdepth 5 -name "python.exe" 2>/dev/null | head -1) || true
+    # Locate the Wine python.exe — check pre-baked base image path first.
+    FOUND_PYTHON=""
+    if [[ -f "/opt/wine_python_exe.path" ]]; then
+      PREBAKED=$(cat /opt/wine_python_exe.path 2>/dev/null | tr -d '\n') || true
+      if [[ -n "$PREBAKED" ]] && [[ -f "$PREBAKED" ]]; then
+        FOUND_PYTHON="$PREBAKED"
+        echo "[mt5linux-launcher] Using pre-baked python.exe: $FOUND_PYTHON"
+      fi
+    fi
+    if [[ -z "$FOUND_PYTHON" ]]; then
+      FOUND_PYTHON=$(find "${WINEPREFIX}/drive_c" -maxdepth 5 -name "python.exe" 2>/dev/null | head -1) || true
+    fi
     if [[ -z "$FOUND_PYTHON" ]]; then
       echo "[mt5linux-launcher] Wine python.exe not found under ${WINEPREFIX}/drive_c" >&2
       exit 1

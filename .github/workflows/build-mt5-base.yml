@@ -1,0 +1,63 @@
+name: Build & Push MT5 Bridge Base Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mt5-bridge-base/Dockerfile"
+  workflow_dispatch:
+    inputs:
+      mt5_url:
+        description: "MT5 setup.exe URL (leave empty to skip terminal install)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mt5-bridge-base
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # The build takes ~30-45 min due to Wine + Python installs.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
+      - name: Build and push base image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./mt5-bridge-base
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Pass MT5_URL build arg if provided (from workflow_dispatch or secret).
+          build-args: |
+            MT5_URL=${{ github.event.inputs.mt5_url || secrets.MT5_INSTALLER_URL || '' }}
+          # Cache layers in GitHub's cache for faster rebuilds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
