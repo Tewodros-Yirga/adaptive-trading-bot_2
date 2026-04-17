@@ -12,10 +12,9 @@
 
 FROM ghcr.io/loriloha/mt5-bridge-base:latest
 
-# Force root for ALL build steps and for the runtime CMD.
-# scottyhardy's base sets wineuser, but wine needs the WINEPREFIX
-# to be owned by whoever runs it. By running everything as root and
-# owning the prefix as root we avoid "not owned by you" errors.
+# Force root for all BUILD steps so we can install packages and chown freely.
+# We switch back to wineuser at the end so Wine's IPC user profile matches
+# what was created during the base image build (wineuser, not root).
 USER root
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,7 +24,9 @@ ENV WINEDEBUG=-all
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
-ENV HOME=/root
+# Match the base image's home directory (wineuser) so Wine resolves the
+# user profile correctly at runtime.
+ENV HOME=/home/wineuser
 
 # Install supervisor + python3-venv (Linux-side, for the FastAPI bridge).
 RUN set -eux; \
@@ -33,13 +34,15 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends --fix-missing supervisor python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
-# Fix wineprefix ownership to root so wine (running as root) accepts it.
-# The base image built as wineuser (uid 1000), so /opt/wineprefix is owned
-# by wineuser. With USER root above, this chown now runs as root and succeeds.
-RUN chown -R root:root /opt/wineprefix
+# Fix wineprefix ownership to wineuser. The base image created it as wineuser,
+# but since we forced USER root above, this chown runs as root and succeeds.
+# At runtime (USER wineuser below), Wine will see the prefix owned by wineuser
+# and accept it — no more "not owned by you" errors.
+RUN chown -R wineuser:wineuser /opt/wineprefix
 
-# Create the Linux-side Python venv for the FastAPI bridge.
-RUN python3 -m venv "${VIRTUAL_ENV}"
+# Create the Linux-side Python venv and make it accessible to wineuser.
+RUN python3 -m venv "${VIRTUAL_ENV}" && \
+    chown -R wineuser:wineuser "${VIRTUAL_ENV}"
 
 WORKDIR /bridge
 
@@ -52,10 +55,13 @@ COPY app /bridge/app
 COPY supervisord.conf /bridge/supervisord.conf
 COPY bootstrap-mt5.sh /bridge/bootstrap-mt5.sh
 COPY start.sh /bridge/start.sh
-RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
+RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh && \
+    chown -R wineuser:wineuser /bridge
 
 EXPOSE 5555
 
-# Clear scottyhardy's gosu entrypoint so start.sh runs directly as root.
+# Clear scottyhardy's gosu entrypoint and run as wineuser so Wine's IPC
+# user profile (C:\users\wineuser) matches the base image build context.
 ENTRYPOINT []
+USER wineuser
 CMD ["/bridge/start.sh"]
