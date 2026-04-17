@@ -60,6 +60,18 @@ if command -v wine >/dev/null 2>&1; then
     set +e
     echo "Starting mt5linux via wine python (best-effort)..."
 
+    # Wait for bootstrap to finish installing Wine python + packages.
+    for _ in $(seq 1 240); do
+      if [[ -f "${LOGDIR}/bootstrap.ready" ]]; then
+        break
+      fi
+      if [[ -f "${LOGDIR}/bootstrap.failed" ]]; then
+        echo "Bootstrap failed (see ${LOGDIR}/bootstrap-mt5.log)" >&2
+        break
+      fi
+      sleep 2
+    done
+
     # Wait until Wine python can import stdlib and mt5linux.
     for _ in $(seq 1 180); do
       if wine python -c "import encodings; import mt5linux" >/dev/null 2>&1; then

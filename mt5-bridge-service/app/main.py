@@ -73,6 +73,10 @@ def debug_mt5():
     """
 
     logdir = Path(os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"))
+    ready_file = logdir / "bootstrap.ready"
+    failed_file = logdir / "bootstrap.failed"
+    status_file = logdir / "bootstrap.status"
+
     return {
         "wineprefix": os.environ.get("WINEPREFIX"),
         "mt_terminal_exe": settings.mt_terminal_exe,
@@ -80,6 +84,11 @@ def debug_mt5():
         "mt5linux_port": settings.mt5linux_port,
         "mt5linux_port_open": _tcp_open(settings.mt5linux_host, settings.mt5linux_port),
         "logdir": str(logdir),
+        "bootstrap": {
+            "ready": ready_file.exists(),
+            "failed": failed_file.exists(),
+            "status": _tail_file(status_file, max_bytes=4_000),
+        },
         "logs": {
             "bootstrap-mt5": _tail_file(logdir / "bootstrap-mt5.log"),
             "mt5linux": _tail_file(logdir / "mt5linux.log"),
