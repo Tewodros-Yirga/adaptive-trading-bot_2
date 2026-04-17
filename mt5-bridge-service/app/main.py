@@ -154,10 +154,41 @@ def debug_processes():
             capture_output=True, text=True, timeout=5
         )
         all_lines = ps.stdout.splitlines()
-        wine_lines = [l for l in all_lines if "wine" in l.lower() or "terminal" in l.lower() or "xvfb" in l.lower()]
+        wine_lines = [l for l in all_lines if any(
+            kw in l.lower() for kw in ["wine", "terminal", "xvfb", "python", "mt5"]
+        )]
     except Exception as exc:
         wine_lines = [f"ps failed: {exc}"]
     return {"wine_processes": wine_lines}
+
+
+@app.get("/debug/screenshot", dependencies=[Depends(require_secret)])
+def debug_screenshot():
+    """Take a screenshot of the Xvfb display and return as base64 PNG."""
+    import subprocess
+    import base64
+    env = {**os.environ, "DISPLAY": ":99"}
+    path = "/tmp/mt5-screenshot.png"
+    # Try scrot first, then ffmpeg
+    for cmd in [
+        ["scrot", "-z", path],
+        ["ffmpeg", "-y", "-f", "x11grab", "-video_size", "1280x720",
+         "-i", ":99.0", "-vframes", "1", path],
+    ]:
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, timeout=10)
+            if r.returncode == 0:
+                data = open(path, "rb").read()
+                return {
+                    "format": "png",
+                    "tool": cmd[0],
+                    "image_b64": base64.b64encode(data).decode(),
+                }
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            return {"error": str(exc)}
+    return {"error": "Neither scrot nor ffmpeg available"}
 
 
 @app.get("/account", dependencies=[Depends(require_secret)])
