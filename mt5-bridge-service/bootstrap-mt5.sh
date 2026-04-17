@@ -4,6 +4,7 @@ set -euo pipefail
 export DISPLAY=${DISPLAY:-:99}
 export HOME="${HOME:-/home/wineuser}"
 export WINEPREFIX="${WINEPREFIX:-${HOME}/.wineprefix}"
+export WINEDEBUG="${WINEDEBUG:--all}"
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
 export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe}
@@ -37,7 +38,10 @@ if [[ -z "$WINEBOOT_CMD" ]]; then
   exit 1
 fi
 
-"$WINEBOOT_CMD" --init || true
+echo "Bootstrap: STEP wineboot_init starting"
+# wineboot can hang on first-run in constrained environments; never block forever.
+timeout 120s "$WINEBOOT_CMD" --init || true
+echo "Bootstrap: STEP wineboot_init done"
 
 WINE_CMD=""
 if command -v wine >/dev/null 2>&1; then
@@ -54,9 +58,11 @@ fi
 python_ok=false
 
 # Validate that Wine's stdlib is usable (encodings must exist).
-if "$WINE_CMD" python --version >/dev/null 2>&1; then
-  "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1 && python_ok=true || true
+echo "Bootstrap: STEP wine_python_probe starting"
+if timeout 15s "$WINE_CMD" python --version >/dev/null 2>&1; then
+  timeout 30s "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1 && python_ok=true || true
 fi
+echo "Bootstrap: STEP wine_python_probe done (python_ok=${python_ok})"
 
 if [[ "${python_ok}" != "true" ]]; then
   echo "Bootstrap: Wine Python missing or broken; installing Python..."
@@ -75,11 +81,13 @@ if [[ "${python_ok}" != "true" ]]; then
   # Use the same kind of flags as known-good Wine setups:
   # - install for all users
   # - prepend Python to PATH inside Wine so `wine python` works
-  "$WINE_CMD" "${MT5_WORKDIR}/dl/python-installer.exe" /quiet InstallAllUsers=1 PrependPath=1 > "${LOGDIR}/python-installer.log" 2>&1 || true
+  echo "Bootstrap: STEP python_install starting"
+  timeout 600s "$WINE_CMD" "${MT5_WORKDIR}/dl/python-installer.exe" /quiet InstallAllUsers=1 PrependPath=1 > "${LOGDIR}/python-installer.log" 2>&1 || true
+  echo "Bootstrap: STEP python_install done"
 
   # Wait for Python to become usable.
   for _ in $(seq 1 90); do
-    if "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1; then
+    if timeout 30s "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1; then
       python_ok=true
       break
     fi
@@ -98,10 +106,14 @@ fi
 
 # Install required Wine-side Python libraries.
 echo "Bootstrap: Installing Wine Python packages (mt5linux + MetaTrader5)..."
-"$WINE_CMD" python -m pip install --upgrade --no-cache-dir pip >"${LOGDIR}/wine-pip-upgrade.log" 2>&1 || true
-"$WINE_CMD" python -m pip install --no-cache-dir MetaTrader5 >"${LOGDIR}/wine-metatrader5-pip-install.log" 2>&1 || true
-"$WINE_CMD" python -m pip install --no-cache-dir "mt5linux>=0.1.9" >"${LOGDIR}/wine-mt5linux-pip-install.log" 2>&1 || true
-"$WINE_CMD" python -m pip install --no-cache-dir python-dateutil >"${LOGDIR}/wine-python-dateutil-pip-install.log" 2>&1 || true
+echo "Bootstrap: STEP wine_pip_upgrade starting"
+timeout 600s "$WINE_CMD" python -m pip install --upgrade --no-cache-dir pip >"${LOGDIR}/wine-pip-upgrade.log" 2>&1 || true
+echo "Bootstrap: STEP wine_pip_upgrade done"
+echo "Bootstrap: STEP wine_pip_install_libs starting"
+timeout 900s "$WINE_CMD" python -m pip install --no-cache-dir MetaTrader5 >"${LOGDIR}/wine-metatrader5-pip-install.log" 2>&1 || true
+timeout 900s "$WINE_CMD" python -m pip install --no-cache-dir "mt5linux>=0.1.9" >"${LOGDIR}/wine-mt5linux-pip-install.log" 2>&1 || true
+timeout 600s "$WINE_CMD" python -m pip install --no-cache-dir python-dateutil >"${LOGDIR}/wine-python-dateutil-pip-install.log" 2>&1 || true
+echo "Bootstrap: STEP wine_pip_install_libs done"
 
 # Cleanup downloaded installers to keep /tmp small on Render.
 rm -f "${MT5_WORKDIR}/dl/python-installer.exe" >/dev/null 2>&1 || true
