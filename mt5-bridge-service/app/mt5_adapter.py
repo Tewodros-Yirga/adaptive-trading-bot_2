@@ -156,9 +156,9 @@ class MT5Adapter:
                 client = None
                 for h in host_candidates:
                     try:
-                        # Use a short timeout for the RPC call itself so we don't
-                        # block the request for 300s when the terminal isn't ready.
-                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=30)
+                        # Use a longer timeout for the RPC call itself: MT5 terminal
+                        # can take 60-90s on first launch to connect to the broker.
+                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=120)
                         ok = client.initialize(
                             path=terminal_exe,
                             login=settings.mt_login,

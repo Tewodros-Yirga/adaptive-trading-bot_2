@@ -1,3 +1,4 @@
+import asyncio
 import os
 import socket
 from pathlib import Path
@@ -11,9 +12,28 @@ from .schemas import CloseRequest, OrderRequest
 app = FastAPI(title="Adaptive MT5 Bridge")
 
 
+async def _background_connect_loop() -> None:
+    """Proactively call ensure_connection every 60 s.
+
+    Starts after a 15-second grace period to let Xvfb + Wine + the RPyC server
+    come up before the first attempt. Once connected, continues polling to
+    detect and recover from disconnections.
+    """
+    await asyncio.sleep(15)
+    while True:
+        try:
+            adapter.ensure_connection()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
 @app.on_event("startup")
-def startup_validation() -> None:
+async def startup_validation() -> None:
     validate_required_settings()
+    # Kick off the background reconnect loop so the adapter connects
+    # proactively without waiting for the first HTTP request.
+    asyncio.create_task(_background_connect_loop())
 
 
 def require_secret(x_bridge_secret: str = Header(default="")) -> None:
