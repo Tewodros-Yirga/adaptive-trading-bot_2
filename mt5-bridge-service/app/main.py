@@ -159,7 +159,7 @@ def debug_processes():
         )]
     except Exception as exc:
         wine_lines = [f"ps failed: {exc}"]
-    return {\"wine_processes\": wine_lines}
+    return {"wine_processes": wine_lines}
 
 
 @app.get("/debug/mt5-ipc-test", dependencies=[Depends(require_secret)])
