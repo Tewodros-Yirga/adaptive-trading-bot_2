@@ -108,28 +108,23 @@ if command -v wine > /dev/null 2>&1; then
       echo "[mt5linux-launcher] Wine python.exe not found under ${WINEPREFIX}/drive_c" >&2
       exit 1
     fi
-    echo "[mt5linux-launcher] Unix path: $FOUND_PYTHON"
+    echo "[mt5linux-launcher] Using python.exe: $FOUND_PYTHON"
 
-    # Convert Unix path to Windows path to avoid wine space-in-path issues.
-    # e.g. /opt/wineprefix/drive_c/Program Files/Python39/python.exe
-    #   -> C:\Program Files\Python39\python.exe
-    WIN_PY=$(echo "$FOUND_PYTHON" | sed "s|${WINEPREFIX}/drive_c|C:|" | sed 's|/|\\|g')
-    echo "[mt5linux-launcher] Windows path: ${WIN_PY}"
-
-    # Best-effort pip install of mt5linux if it was somehow missed.
-    if ! timeout 30 wine cmd /c "\"${WIN_PY}\" -c \"import encodings; import mt5linux\"" > /dev/null 2>&1; then
+    # Run Wine Python directly (wine handles unix paths with spaces correctly).
+    # Ownership is now root:root so wine accepts the WINEPREFIX.
+    if ! timeout 30 wine "${FOUND_PYTHON}" -c "import encodings; import mt5linux" > /dev/null 2>&1; then
       echo "[mt5linux-launcher] mt5linux not importable; attempting pip install..." >&2
-      timeout 300 wine cmd /c "\"${WIN_PY}\" -m pip install --no-cache-dir mt5linux MetaTrader5 python-dateutil" \
+      timeout 300 wine "${FOUND_PYTHON}" -m pip install --no-cache-dir mt5linux MetaTrader5 python-dateutil \
         >> "${LOGDIR}/wine-mt5linux-pip-install.log" 2>&1 || true
     fi
 
-    if ! timeout 30 wine cmd /c "\"${WIN_PY}\" -c \"import encodings; import mt5linux\"" > /dev/null 2>&1; then
+    if ! timeout 30 wine "${FOUND_PYTHON}" -c "import encodings; import mt5linux" > /dev/null 2>&1; then
       echo "[mt5linux-launcher] mt5linux still not importable. Check ${LOGDIR}/bootstrap-mt5.log" >&2
       exit 1
     fi
 
     echo "[mt5linux-launcher] Launching mt5linux RPyC server on 127.0.0.1:18812"
-    wine cmd /c "\"${WIN_PY}\" -m mt5linux --host 127.0.0.1 --port 18812" 2>&1 \
+    wine "${FOUND_PYTHON}" -m mt5linux --host 127.0.0.1 --port 18812 2>&1 \
       | tee "${LOGDIR}/mt5linux.log" &
 
     # Wait for the RPyC port to open (up to 30s).
@@ -172,6 +167,15 @@ fi
 
   if [[ -z "$WINE_CMD" ]]; then
     echo "[mt5-terminal] Wine command not found; skipping MT5 terminal launch." >&2
+    exit 0
+  fi
+
+  # Guard: only launch MT5 terminal if explicitly enabled via env var.
+  # On Render free tier (512MB RAM), terminal64.exe uses ~400MB and causes OOM.
+  # Set MT5_LAUNCH_TERMINAL=true to enable (requires a paid plan with >=1GB RAM).
+  if [[ "${MT5_LAUNCH_TERMINAL:-false}" != "true" ]]; then
+    echo "[mt5-terminal] MT5_LAUNCH_TERMINAL is not 'true' — skipping terminal launch (OOM guard)."
+    echo "[mt5-terminal] Set MT5_LAUNCH_TERMINAL=true in Render env vars to enable (requires >=1GB RAM)."
     exit 0
   fi
 
