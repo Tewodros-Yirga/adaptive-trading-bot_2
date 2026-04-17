@@ -58,7 +58,7 @@ PORT="${PORT:-${BRIDGE_PORT:-5555}}"
 if command -v wine >/dev/null 2>&1; then
   (
     set +e
-    echo "Starting mt5linux via `wine python` (best-effort)..."
+    echo "Starting mt5linux via wine python (best-effort)..."
 
     # Wait until Wine python can import stdlib and mt5linux.
     for _ in $(seq 1 180); do

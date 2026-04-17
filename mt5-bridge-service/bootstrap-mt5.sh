@@ -38,9 +38,32 @@ if [[ -z "$WINEBOOT_CMD" ]]; then
   exit 1
 fi
 
+run_with_timeout() {
+  # usage: run_with_timeout <seconds> <command...>
+  local secs="$1"
+  shift
+  (
+    "$@" &
+    local pid=$!
+    local elapsed=0
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      if [[ "$elapsed" -ge "$secs" ]]; then
+        echo "Bootstrap: TIMEOUT after ${secs}s: $*" >&2
+        kill -TERM "$pid" >/dev/null 2>&1 || true
+        sleep 2
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+        return 124
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    wait "$pid"
+  )
+}
+
 echo "Bootstrap: STEP wineboot_init starting"
 # wineboot can hang on first-run in constrained environments; never block forever.
-timeout 120s "$WINEBOOT_CMD" --init || true
+run_with_timeout 120 "$WINEBOOT_CMD" --init || true
 echo "Bootstrap: STEP wineboot_init done"
 
 WINE_CMD=""
@@ -59,8 +82,8 @@ python_ok=false
 
 # Validate that Wine's stdlib is usable (encodings must exist).
 echo "Bootstrap: STEP wine_python_probe starting"
-if timeout 15s "$WINE_CMD" python --version >/dev/null 2>&1; then
-  timeout 30s "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1 && python_ok=true || true
+if run_with_timeout 15 "$WINE_CMD" python --version >/dev/null 2>&1; then
+  run_with_timeout 30 "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1 && python_ok=true || true
 fi
 echo "Bootstrap: STEP wine_python_probe done (python_ok=${python_ok})"
 
@@ -82,12 +105,12 @@ if [[ "${python_ok}" != "true" ]]; then
   # - install for all users
   # - prepend Python to PATH inside Wine so `wine python` works
   echo "Bootstrap: STEP python_install starting"
-  timeout 600s "$WINE_CMD" "${MT5_WORKDIR}/dl/python-installer.exe" /quiet InstallAllUsers=1 PrependPath=1 > "${LOGDIR}/python-installer.log" 2>&1 || true
+  run_with_timeout 600 "$WINE_CMD" "${MT5_WORKDIR}/dl/python-installer.exe" /quiet InstallAllUsers=1 PrependPath=1 > "${LOGDIR}/python-installer.log" 2>&1 || true
   echo "Bootstrap: STEP python_install done"
 
   # Wait for Python to become usable.
   for _ in $(seq 1 90); do
-    if timeout 30s "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1; then
+    if run_with_timeout 30 "$WINE_CMD" python -c "import encodings; print('encodings_ok')" >"${LOGDIR}/python-encodings-check.log" 2>&1; then
       python_ok=true
       break
     fi
@@ -107,12 +130,12 @@ fi
 # Install required Wine-side Python libraries.
 echo "Bootstrap: Installing Wine Python packages (mt5linux + MetaTrader5)..."
 echo "Bootstrap: STEP wine_pip_upgrade starting"
-timeout 600s "$WINE_CMD" python -m pip install --upgrade --no-cache-dir pip >"${LOGDIR}/wine-pip-upgrade.log" 2>&1 || true
+run_with_timeout 600 "$WINE_CMD" python -m pip install --upgrade --no-cache-dir pip >"${LOGDIR}/wine-pip-upgrade.log" 2>&1 || true
 echo "Bootstrap: STEP wine_pip_upgrade done"
 echo "Bootstrap: STEP wine_pip_install_libs starting"
-timeout 900s "$WINE_CMD" python -m pip install --no-cache-dir MetaTrader5 >"${LOGDIR}/wine-metatrader5-pip-install.log" 2>&1 || true
-timeout 900s "$WINE_CMD" python -m pip install --no-cache-dir "mt5linux>=0.1.9" >"${LOGDIR}/wine-mt5linux-pip-install.log" 2>&1 || true
-timeout 600s "$WINE_CMD" python -m pip install --no-cache-dir python-dateutil >"${LOGDIR}/wine-python-dateutil-pip-install.log" 2>&1 || true
+run_with_timeout 900 "$WINE_CMD" python -m pip install --no-cache-dir MetaTrader5 >"${LOGDIR}/wine-metatrader5-pip-install.log" 2>&1 || true
+run_with_timeout 900 "$WINE_CMD" python -m pip install --no-cache-dir "mt5linux>=0.1.9" >"${LOGDIR}/wine-mt5linux-pip-install.log" 2>&1 || true
+run_with_timeout 600 "$WINE_CMD" python -m pip install --no-cache-dir python-dateutil >"${LOGDIR}/wine-python-dateutil-pip-install.log" 2>&1 || true
 echo "Bootstrap: STEP wine_pip_install_libs done"
 
 # Cleanup downloaded installers to keep /tmp small on Render.
