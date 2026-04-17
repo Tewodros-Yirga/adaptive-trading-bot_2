@@ -182,24 +182,30 @@ class MT5Adapter:
                         # can take 60-90s on first launch to connect to the broker.
                         client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=120)
 
-                        # MetaTrader5.initialize() runs inside Wine Python so it
-                        # expects a Windows-style path.  Convert the Linux-side
-                        # WINEPREFIX path (e.g. /opt/wineprefix/drive_c/...) to
-                        # C:\... before passing it in.
-                        wine_path = self._to_wine_path(terminal_exe)
-
-                        init_kwargs: dict = {
+                        # Strategy 1: no path — connect to the already-running terminal.
+                        # When MT5_LAUNCH_TERMINAL=true our start.sh has already launched
+                        # terminal64.exe, so MetaTrader5.initialize() should find it
+                        # without needing the exe path (which can cause pipe-name mismatches
+                        # when the Linux launch path differs from the Windows path the
+                        # terminal registered its IPC pipe under).
+                        creds = {
                             "login": settings.mt_login,
                             "password": settings.mt_password,
                             "server": settings.mt_server,
                         }
-                        if wine_path:
-                            init_kwargs["path"] = wine_path
+                        ok = client.initialize(**creds)
 
-                        ok = client.initialize(**init_kwargs)
+                        if not ok:
+                            # Strategy 2: pass the Windows path so MetaTrader5 can launch
+                            # the terminal itself if it isn't running yet.
+                            wine_path = self._to_wine_path(terminal_exe)
+                            if wine_path:
+                                ok = client.initialize(path=wine_path, **creds)
+
                         if not ok:
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
                             raise RuntimeError(f"initialize() returned False: {err}")
+
                         info = client.account_info()
                         if info is None:
                             raise RuntimeError("account_info() returned None — terminal may not be logged in yet")
