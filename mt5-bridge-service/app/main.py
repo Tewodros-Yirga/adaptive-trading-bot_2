@@ -92,6 +92,10 @@ def debug_mt5():
         "logs": {
             "bootstrap-mt5": _tail_file(logdir / "bootstrap-mt5.log"),
             "mt5linux": _tail_file(logdir / "mt5linux.log"),
+            "python-encodings-check": _tail_file(logdir / "python-encodings-check.log"),
+            "mt5linux-import-check": _tail_file(logdir / "mt5linux-import-check.log"),
+            "python-download": _tail_file(logdir / "python-download.log"),
+            "python-installer": _tail_file(logdir / "python-installer.log"),
             "wine-pip-upgrade": _tail_file(logdir / "wine-pip-upgrade.log"),
             "wine-metatrader5-pip-install": _tail_file(logdir / "wine-metatrader5-pip-install.log"),
             "wine-mt5linux-pip-install": _tail_file(logdir / "wine-mt5linux-pip-install.log"),
