@@ -90,6 +90,28 @@ class MT5Adapter:
     def _last_error_repr(self) -> str:
         return self.last_error or "unknown error"
 
+    @staticmethod
+    def _to_wine_path(linux_path: str) -> str | None:
+        """
+        Convert a Linux-side WINEPREFIX path to a Windows-style path.
+
+        MetaTrader5.initialize(path=...) runs inside Wine Python, which expects
+        a Windows path (e.g. ``C:\Program Files\MetaTrader 5\terminal64.exe``).
+        Passing a Linux path (e.g. ``/opt/wineprefix/drive_c/...``) causes Wine
+        to silently fail finding the executable, so IPC never starts.
+        """
+        if not linux_path:
+            return None
+        wineprefix = os.environ.get("WINEPREFIX", "/opt/wineprefix").rstrip("/")
+        drive_c = wineprefix + "/drive_c"
+        if linux_path.startswith(drive_c):
+            rel = linux_path[len(drive_c):]
+            return "C:" + rel.replace("/", "\\")
+        # Already a Windows path (e.g. C:\...) — return as-is.
+        if linux_path.startswith("C:\\") or linux_path.startswith("c:\\"):
+            return linux_path
+        return None  # Unknown format — caller should omit the path argument.
+
     def _retry_backoff(self) -> float:
         """Return how many seconds to wait before the next connection attempt."""
         idx = min(self._connect_attempts, len(_RETRY_BACKOFF_SECONDS) - 1)
@@ -159,12 +181,22 @@ class MT5Adapter:
                         # Use a longer timeout for the RPC call itself: MT5 terminal
                         # can take 60-90s on first launch to connect to the broker.
                         client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=120)
-                        ok = client.initialize(
-                            path=terminal_exe,
-                            login=settings.mt_login,
-                            password=settings.mt_password,
-                            server=settings.mt_server,
-                        )
+
+                        # MetaTrader5.initialize() runs inside Wine Python so it
+                        # expects a Windows-style path.  Convert the Linux-side
+                        # WINEPREFIX path (e.g. /opt/wineprefix/drive_c/...) to
+                        # C:\... before passing it in.
+                        wine_path = self._to_wine_path(terminal_exe)
+
+                        init_kwargs: dict = {
+                            "login": settings.mt_login,
+                            "password": settings.mt_password,
+                            "server": settings.mt_server,
+                        }
+                        if wine_path:
+                            init_kwargs["path"] = wine_path
+
+                        ok = client.initialize(**init_kwargs)
                         if not ok:
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
                             raise RuntimeError(f"initialize() returned False: {err}")
