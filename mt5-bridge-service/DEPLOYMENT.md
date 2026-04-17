@@ -83,6 +83,8 @@ The FastAPI adapter runs an asyncio background loop (T+15s, every 60s thereafter
 | `MT_BRIDGE_SECRET` | `<token>` | Shared API auth secret — **Secret** |
 | `WINEPREFIX` | `/opt/wineprefix` | Pre-baked Wine prefix |
 | `DISPLAY` | `:99` | Xvfb display |
+| `MT5_CONTEXT_MODE` | `portable` | Terminal context mode (`portable`, `data_dir`, `default`) |
+| `MT5_CONTEXT_DIR` | `/opt/wineprefix/drive_c/mt5-data` | Data directory when `MT5_CONTEXT_MODE=data_dir` |
 
 ---
 
@@ -173,14 +175,22 @@ All require `X-Bridge-Secret` header.
 - `mt5_ipc.failed` — probe attempts exhausted or terminal exited before attach.
 - `mt5_ipc.status` — latest probe status line.
 - `mt5-ipc-probe.log` — attempt history.
+- `mt5_context.status` — selected terminal context mode and launch arguments.
 
-`/ready` and `/debug/mt5` expose these states (`ipc_ready`, `ipc_failed`, `ipc_status`).
+`/ready` and `/debug/mt5` expose these states (`ipc_ready`, `ipc_failed`, `ipc_status`, `context_status`).
+
+### Hard Readiness Policy
+
+- `/ready` now hard-fails (`ready=false`) whenever `mt5_ipc.ready` is absent.
+- `/account` no longer returns FALLBACK payloads when IPC is unavailable; it surfaces connection failure directly.
+- This prevents false-positive readiness in environments where terminal UI is visible but MT5 IPC is still detached.
 
 ### Interpreting New Signals
 
 - `ipc_ready=true` + `/account` still fails: likely broker login/session/credentials issue, not Wine pipe attach.
 - `ipc_ready=false` and `/debug/mt5-ipc-test` gives `err_code=-10005`: MT5 IPC attach is still failing at Wine/terminal layer.
 - `ipc_failed=true` quickly after startup: terminal likely exited or IPC never became attachable in allotted warmup window.
+- `ipc_ready=false` + repeated `-10005` under fixed `context_status` (e.g. `mode=portable`) strongly suggests Wine/MT5 runtime compatibility limits rather than startup sequencing.
 
 ### Screenshot command
 ```powershell

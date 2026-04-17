@@ -60,19 +60,28 @@ def ready():
     ipc_ready_file = logdir / "mt5_ipc.ready"
     ipc_failed_file = logdir / "mt5_ipc.failed"
     ipc_status_file = logdir / "mt5_ipc.status"
-    try:
-        data = adapter.account()
-        account_mode = data.get("mode", "UNKNOWN")
-        # If MT5 is not actually connected, adapter returns FALLBACK.
-        # Treat that as "not ready" so operators can distinguish endpoint availability vs MT5 connectivity.
+    context_status_file = logdir / "mt5_context.status"
+    if not ipc_ready_file.exists():
         return {
-            "ready": account_mode == "LIVE",
-            "account_mode": account_mode,
-            "warning": data.get("warning"),
-            "error_class": adapter.last_error_class,
-            "ipc_ready": ipc_ready_file.exists(),
+            "ready": False,
+            "error": "mt5 ipc not ready",
+            "error_class": adapter.last_error_class or "ipc_not_ready",
+            "ipc_ready": False,
             "ipc_failed": ipc_failed_file.exists(),
             "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
+            "context_status": _tail_file(context_status_file, max_bytes=4_000),
+        }
+    try:
+        data = adapter.account()
+        return {
+            "ready": True,
+            "account_mode": "LIVE",
+            "error_class": adapter.last_error_class,
+            "ipc_ready": True,
+            "ipc_failed": False,
+            "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
+            "context_status": _tail_file(context_status_file, max_bytes=4_000),
+            "backend": data.get("backend"),
         }
     except Exception as exc:
         return {
@@ -82,6 +91,7 @@ def ready():
             "ipc_ready": ipc_ready_file.exists(),
             "ipc_failed": ipc_failed_file.exists(),
             "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
+            "context_status": _tail_file(context_status_file, max_bytes=4_000),
         }
 
 
@@ -135,6 +145,7 @@ def debug_mt5():
     ipc_ready_file = logdir / "mt5_ipc.ready"
     ipc_failed_file = logdir / "mt5_ipc.failed"
     ipc_status_file = logdir / "mt5_ipc.status"
+    context_status_file = logdir / "mt5_context.status"
 
     terminal_exe_from_sentinel: str | None = None
     if terminal_path_file.exists():
@@ -166,6 +177,7 @@ def debug_mt5():
             "ipc_ready": ipc_ready_file.exists(),
             "ipc_failed": ipc_failed_file.exists(),
             "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
+            "context_status": _tail_file(context_status_file, max_bytes=4_000),
         },
         "logs": {
             "bootstrap-mt5": _tail_file(logdir / "bootstrap-mt5.log"),

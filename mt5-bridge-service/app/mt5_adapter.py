@@ -96,6 +96,8 @@ class MT5Adapter:
         low = (error_text or "").lower()
         if "-10005" in low or "ipc timeout" in low:
             return "ipc_timeout"
+        if "-10003" in low or "x64 not found" in low or "ipc initialize failed" in low:
+            return "terminal_not_found"
         if "account_info() returned none" in low or "not be logged in yet" in low:
             return "account_not_ready"
         if "connection refused" in low or "timed out" in low or "host" in low:
@@ -105,28 +107,6 @@ class MT5Adapter:
         if "initialize() returned false" in low:
             return "initialize_failed"
         return "unknown"
-
-    @staticmethod
-    def _to_wine_path(linux_path: str) -> str | None:
-        r"""
-        Convert a Linux-side WINEPREFIX path to a Windows-style path.
-
-        MetaTrader5.initialize(path=...) runs inside Wine Python, which expects
-        a Windows path (e.g. ``C:\Program Files\MetaTrader 5\terminal64.exe``).
-        Passing a Linux path (e.g. ``/opt/wineprefix/drive_c/...``) causes Wine
-        to silently fail finding the executable, so IPC never starts.
-        """
-        if not linux_path:
-            return None
-        wineprefix = os.environ.get("WINEPREFIX", "/opt/wineprefix").rstrip("/")
-        drive_c = wineprefix + "/drive_c"
-        if linux_path.startswith(drive_c):
-            rel = linux_path[len(drive_c):]
-            return "C:" + rel.replace("/", "\\")
-        # Already a Windows path (e.g. C:\...) — return as-is.
-        if linux_path.startswith("C:\\") or linux_path.startswith("c:\\"):
-            return linux_path
-        return None  # Unknown format — caller should omit the path argument.
 
     def _retry_backoff(self) -> float:
         """Return how many seconds to wait before the next connection attempt."""
@@ -153,7 +133,7 @@ class MT5Adapter:
         # Reset per-attempt resolution cache so we re-check the sentinel file
         # (bootstrap may have installed the terminal since the last attempt).
         self._resolved_terminal_exe = None
-        terminal_exe = self._resolve_terminal_exe()
+        self._resolve_terminal_exe()
 
         self._connect_attempts += 1
         backoff = min(self._retry_backoff(), _MAX_RETRY_INTERVAL)
@@ -230,26 +210,11 @@ class MT5Adapter:
                             break
 
                         if not ok:
-                            launch_terminal_enabled = os.environ.get("MT5_LAUNCH_TERMINAL", "false").lower() == "true"
-                            ipc_ready_file = os.path.join(
-                                os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"),
-                                "mt5_ipc.ready",
-                            )
-                            should_skip_path_fallback = launch_terminal_enabled or os.path.isfile(ipc_ready_file)
-
-                            # Strategy 2: pass the Windows path only when we're not in
-                            # pre-launched terminal mode. This avoids creating a second
-                            # attach path during active IPC warm-up.
-                            if not should_skip_path_fallback:
-                                wine_path = self._to_wine_path(terminal_exe)
-                                if wine_path:
-                                    ok = client.initialize(path=wine_path, **creds)
-                                    if not ok:
-                                        err = client.last_error() if hasattr(client, "last_error") else "unknown"
-                                        last_init_error = str(err)
-
-                        if not ok:
-                            self.last_error_class = self._classify_error_text(last_init_error)
+                            classified = self._classify_error_text(last_init_error)
+                            context_mode = os.environ.get("MT5_CONTEXT_MODE", "portable").lower()
+                            if classified == "ipc_timeout" and context_mode in {"portable", "data_dir"}:
+                                classified = "context_mismatch_suspected"
+                            self.last_error_class = classified
                             raise RuntimeError(
                                 f"initialize() returned False [{self.last_error_class}]: {last_init_error}"
                             )
@@ -298,15 +263,9 @@ class MT5Adapter:
     def account(self) -> dict[str, Any]:
         self.ensure_connection()
         if self._mt is None or not self.connected:
-            return {
-                "balance": 0.0,
-                "equity": 0.0,
-                "margin": 0.0,
-                "freeMargin": 0.0,
-                "mode": "FALLBACK",
-                "warning": self.last_error,
-                "nextRetryIn": max(0, self._next_connect_at - time.monotonic()),
-            }
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: {self.last_error or 'connection unavailable'}"
+            )
 
         try:
             info = self._mt.account_info()

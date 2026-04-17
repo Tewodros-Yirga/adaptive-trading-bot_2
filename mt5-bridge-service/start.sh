@@ -12,6 +12,8 @@ export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.o
 # Keep logs and bootstrap downloads out of /tmp (Render eviction limit).
 export MT5_WORKDIR=${MT5_WORKDIR:-${HOME}/.mt5-work}
 export LOGDIR=${LOGDIR:-${HOME}/.mt5-bridge-logs}
+export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-portable}"
+export MT5_CONTEXT_DIR="${MT5_CONTEXT_DIR:-${WINEPREFIX}/drive_c/mt5-data}"
 mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 
 # Render free-tier limits /tmp to ~2GB. Some Wine/MT5 output is redirected to
@@ -220,11 +222,30 @@ fi
   IPC_FAILED_FILE="${LOGDIR}/mt5_ipc.failed"
   IPC_STATUS_FILE="${LOGDIR}/mt5_ipc.status"
   IPC_PROBE_LOG="${LOGDIR}/mt5-ipc-probe.log"
-  rm -f "${IPC_READY_FILE}" "${IPC_FAILED_FILE}" "${IPC_STATUS_FILE}" "${IPC_PROBE_LOG}" 2>/dev/null || true
+  CONTEXT_STATUS_FILE="${LOGDIR}/mt5_context.status"
+  rm -f "${IPC_READY_FILE}" "${IPC_FAILED_FILE}" "${IPC_STATUS_FILE}" "${IPC_PROBE_LOG}" "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
   echo "pending" > "${IPC_STATUS_FILE}" 2>/dev/null || true
 
+  CONTEXT_ARGS=()
+  case "${MT5_CONTEXT_MODE}" in
+    portable)
+      CONTEXT_ARGS+=("/portable")
+      ;;
+    data_dir)
+      mkdir -p "${MT5_CONTEXT_DIR}" 2>/dev/null || true
+      CONTEXT_ARGS+=("/datapath:${MT5_CONTEXT_DIR}")
+      ;;
+    default)
+      ;;
+    *)
+      echo "[mt5-terminal] Unknown MT5_CONTEXT_MODE=${MT5_CONTEXT_MODE}; falling back to portable"
+      CONTEXT_ARGS+=("/portable")
+      ;;
+  esac
+  echo "mode=${MT5_CONTEXT_MODE}; exe=${TERMINAL_EXE}; args=${CONTEXT_ARGS[*]:-(none)}" > "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
+
   echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
-  "$WINE_CMD" "$TERMINAL_EXE" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
+  "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
   TERMINAL_PID=$!
 
   # Resolve Wine Python for IPC probe.
