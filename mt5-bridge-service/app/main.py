@@ -159,7 +159,44 @@ def debug_processes():
         )]
     except Exception as exc:
         wine_lines = [f"ps failed: {exc}"]
-    return {"wine_processes": wine_lines}
+    return {\"wine_processes\": wine_lines}
+
+
+@app.get("/debug/mt5-ipc-test", dependencies=[Depends(require_secret)])
+def debug_mt5_ipc_test():
+    """
+    Run MetaTrader5.initialize() directly inside Wine Python (bypasses RPyC).
+    Tests whether Wine IPC fundamentally works with the running terminal.
+    Times out after 90 seconds.
+    """
+    import subprocess
+    python_path = Path("/opt/wine_python_exe.path")
+    if not python_path.exists():
+        return {"error": "wine_python_exe.path sentinel not found"}
+    wine_python = python_path.read_text().strip()
+    script = (
+        "import MetaTrader5 as mt5; "
+        "ok = mt5.initialize(); "
+        "err = mt5.last_error(); "
+        "mt5.shutdown(); "
+        "print(f'ok={ok} err={err}')"
+    )
+    env = {**os.environ, "DISPLAY": ":99", "WINEPREFIX": "/opt/wineprefix",
+           "WINEDEBUG": "-all"}
+    try:
+        r = subprocess.run(
+            ["wine", wine_python, "-c", script],
+            env=env, capture_output=True, text=True, timeout=90
+        )
+        return {
+            "returncode": r.returncode,
+            "stdout": r.stdout.strip(),
+            "stderr": r.stderr.strip()[-2000:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "subprocess timed out after 90s"}
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @app.get("/debug/screenshot", dependencies=[Depends(require_secret)])

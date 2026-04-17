@@ -2,19 +2,19 @@
 
 ## What We're Building
 
-A cloud-hosted FastAPI bridge that connects the adaptive trading bot backend to a MetaTrader 5 terminal. The bridge translates REST API calls (`/order`, `/close`, `/account`, `/positions`) into MT5 operations via the `mt5linux` Python library, which uses Wine to run the Windows MT5 terminal on a Linux container.
+A cloud-hosted FastAPI bridge that connects the adaptive trading bot backend to a MetaTrader 5 terminal. The bridge translates REST API calls (`/order`, `/close`, `/account`, `/positions`) into MT5 operations via the `mt5linux` Python library, which uses RPyC to communicate with a Wine-hosted Windows Python process that talks to `terminal64.exe`.
 
 ```
 Trading Bot Backend (Node.js)
     │  HTTP REST
     ▼
 MT5 Bridge (FastAPI / Python)       ← hosted on HF Spaces (free, 16GB RAM)
-    │  RPyC (mt5linux)
+    │  RPyC (mt5linux, port 18812)
     ▼
 Wine Python (RPyC server, port 18812)
     │  Windows IPC / named pipes
     ▼
-MetaTrader 5 terminal64.exe (under Wine + Xvfb)
+MetaTrader 5 terminal64.exe (under Wine + Xvfb :99)
     │  TCP
     ▼
 MT5 Broker Server (e.g. MetaQuotes-Demo)
@@ -27,131 +27,116 @@ MT5 Broker Server (e.g. MetaQuotes-Demo)
 | Platform | RAM | Status | Issue |
 |----------|-----|--------|-------|
 | Render Free | 512MB | ❌ | OOM — terminal64.exe uses ~400MB |
-| Render Starter | $7/mo, 512MB | ❌ | Still OOM |
-| **HF Spaces CPU Basic** | **16GB** | ✅ Running | IPC timeout (current focus) |
+| Render Starter | $7/mo | ❌ | File ownership errors with pre-baked Wine prefix |
+| **HF Spaces CPU Basic** | **16GB** | ✅ Running | IPC connection being stabilised (current) |
 
 ---
 
 ## Architecture: Pre-Baked Base Image
 
-To avoid 30-minute cold starts, we build a custom base image (`ghcr.io/loriloha/mt5-bridge-base:latest`) containing:
+To avoid 30-minute cold starts, we build a custom base image (`ghcr.io/loriloha/mt5-bridge-base:latest`) via GitHub Actions, containing:
 
-- Wine64 + Xvfb
+- Wine 11.6 devel + Xvfb
 - Windows Python 3.9 (installed via Wine)
 - `MetaTrader5` + `mt5linux` Python packages (Wine-side)
 - MT5 terminal64.exe pre-installed in `/opt/wineprefix/drive_c/Program Files/MetaTrader 5/`
+- Saved MetaQuotes demo session (terminal auto-connects on startup)
 
-The bridge service Dockerfile (`mt5-bridge-service/`) builds FROM this base and adds the FastAPI app layer. Cold starts are now ~2 minutes instead of 30+.
+The bridge service Dockerfile (`mt5-bridge-service/`) builds FROM this base and only adds the FastAPI app layer. Cold starts are ~2 minutes instead of 30+.
 
 ---
 
-## Startup Sequence
+## Startup Sequence (runtime)
 
 ```
 Container start
     │
-    ├─ Xvfb :99          (virtual display for Wine GUI apps)
-    │
-    ├─ uvicorn            (FastAPI on port 7860, starts immediately)
-    │
-    ├─ bootstrap-mt5.sh   (background — skips all steps on pre-baked image)
+    ├─ Xvfb :99              (virtual display for Wine GUI apps)
+    ├─ uvicorn               (FastAPI on port 7860, starts immediately)
+    ├─ bootstrap-mt5.sh      (background — skips all installs on pre-baked image)
     │       └─ writes bootstrap.ready sentinel
-    │
-    ├─ mt5linux-launcher  (background — waits for bootstrap.ready)
+    ├─ mt5linux-launcher     (waits for bootstrap.ready)
     │       └─ wine python.exe -m mt5linux --host 127.0.0.1 --port 18812
     │               → RPyC server listening on 18812
-    │
-    └─ mt5-terminal       (background — if MT5_LAUNCH_TERMINAL=true)
+    └─ mt5-terminal          (if MT5_LAUNCH_TERMINAL=true)
             └─ wine terminal64.exe
+                    → loads saved session → connects to MetaQuotes demo
+                    → updates 453 MQL5 files (~8 min cold start)
+                    → recompiles MQL5 → shows charts
+                    → IPC pipe active
 ```
 
-The FastAPI adapter runs a background asyncio loop (T+15s, then every 60s) that calls `MetaTrader5.initialize(path, login, password, server)` via the RPyC bridge to connect to the terminal.
+The FastAPI adapter runs an asyncio background loop (T+15s, every 60s thereafter) that calls `MetaTrader5.initialize(login, password, server)` via RPyC to authenticate with your broker account.
 
 ---
 
-## Current Problem: IPC Timeout (-10005)
+## Environment Variables (HF Spaces)
 
-### Symptom
-Every `initialize()` call returns `False` with error `(-10005, 'IPC timeout')`.
-
-### What -10005 Means
-The `MetaTrader5` Python module (running inside Wine) tried to establish Windows IPC (named pipe) communication with `terminal64.exe` but the terminal did not respond within its internal ~60s timeout.
-
-### What We Know
-- ✅ Xvfb starts fine
-- ✅ Wine is working (Python starts, RPyC server starts)
-- ✅ RPyC port 18812 is open and accepts connections
-- ✅ `initialize()` runs to completion (returns `False`, not a timeout/exception)
-- ❓ `terminal64.exe` status is **unknown** — may be running (stuck at login dialog) or crashing silently
-
-### Root Causes Investigated (in order)
-
-| Attempt | Hypothesis | Result |
-|---------|-----------|--------|
-| 1 | Wine prefix not owned by runtime user | Fixed → still IPC timeout |
-| 2 | Manual terminal launch conflicts with API | Tested MT5_LAUNCH_TERMINAL=false → same timeout |
-| 3 | Wrong Wine username at runtime (root vs wineuser) | Tested USER 1000 → mkdir permission denied |
-| 4 | Linux path passed to Wine initialize(path=...) | Fixed → converted to `C:\...` Windows path → still timeout |
-| 5 | Terminal running vs. crashing? | **Diagnostic pending** (added `/debug/processes` endpoint) |
-
-### Next Diagnostic Step
-The `/debug/processes` endpoint (just deployed) will shows `ps aux` output filtered for `wine`/`terminal`/`xvfb`. This will tell us:
-
-- **If `terminal64.exe` is in the list** → terminal is alive but stuck behind login dialog → need one-time GUI login
-- **If `terminal64.exe` is missing** → terminal is crashing silently → likely a DirectX/rendering issue under Xvfb
-
----
-
-## Likely Resolution Paths
-
-### Path A: Terminal is alive, needs one-time GUI login
-MT5 requires a human to log in once before the Python IPC becomes available. Solution options:
-1. **Add VNC/noVNC** to the container so the user can browser-login once. After login, credentials are saved in the Wine prefix for future restarts.
-2. **Use `xdotool`** to automate typing credentials into the login dialog (fragile but no extra ports needed).
-
-### Path B: Terminal is crashing (DirectX/graphics issue)
-WineD3D software rendering might not be initializing correctly. Solutions:
-1. Set `LIBGL_ALWAYS_SOFTWARE=1` + `GALLIUM_DRIVER=llvmpipe`
-2. Add `mesa-utils` and software Vulkan drivers to the base image
-3. Use `WINEDLLOVERRIDES="d3d*=n,b"` to force Wine's built-in D3D
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | 5555 | Port for FastAPI bridge (set to `7860` on HF Spaces) |
-| `MT_LOGIN` | — | MT5 account login number (**secret**) |
-| `MT_PASSWORD` | — | MT5 account password (**secret**) |
-| `MT_SERVER` | — | MT5 broker server name (**secret**) |
-| `MT_BRIDGE_SECRET` | — | Shared secret for API auth header (**secret**) |
-| `MT5_LAUNCH_TERMINAL` | `false` | Set `true` to manually launch terminal64.exe |
-| `WINEPREFIX` | `/opt/wineprefix` | Wine prefix path |
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `PORT` | `7860` | HF Spaces required port |
+| `MT5_LAUNCH_TERMINAL` | `true` | Launch terminal64.exe on startup |
+| `MT_LOGIN` | `<number>` | Broker account number — **Secret** |
+| `MT_PASSWORD` | `<pass>` | Broker password — **Secret** |
+| `MT_SERVER` | `<server>` | Broker server name — **Secret** |
+| `MT_BRIDGE_SECRET` | `<token>` | Shared API auth secret — **Secret** |
+| `WINEPREFIX` | `/opt/wineprefix` | Pre-baked Wine prefix |
 | `DISPLAY` | `:99` | Xvfb display |
 
 ---
 
-## Key Files
+## IPC Timeout Debugging Chronicle
 
-| File | Purpose |
-|------|---------|
-| `mt5-bridge-base/Dockerfile` | Builds the pre-baked base image (Wine + Python + MT5 terminal) |
-| `.github/workflows/build-mt5-base.yml` | GitHub Actions workflow to build and push the base image |
-| `mt5-bridge-service/Dockerfile` | Bridge service image (FROM base + FastAPI app) |
-| `mt5-bridge-service/start.sh` | Container entrypoint: Xvfb → uvicorn → bootstrap → mt5linux |
-| `mt5-bridge-service/bootstrap-mt5.sh` | Installs Python/MT5 at runtime if not pre-baked |
-| `mt5-bridge-service/app/mt5_adapter.py` | MT5 connection adapter with retry/backoff logic |
-| `mt5-bridge-service/app/main.py` | FastAPI app with bridge endpoints |
+All attempts resulted in `(-10005, 'IPC timeout')` from `MetaTrader5.initialize()`.
+
+### What -10005 Means
+The `MetaTrader5` Python module (running inside Wine Python via RPyC) tried to communicate with `terminal64.exe` via Windows named pipes but the terminal's IPC pipe was not found within the module's internal ~60s window.
+
+### Confirmed Facts (via diagnostics)
+| Fact | How confirmed |
+|------|--------------|
+| ✅ Xvfb starts | startup logs |
+| ✅ Wine starts | wineserver in `ps aux` |
+| ✅ RPyC server port 18812 opens | `/debug/mt5` → `port_open=True` |
+| ✅ `initialize()` runs to completion | error is returned result, not RPyC exception |
+| ✅ **terminal64.exe IS running** | `/debug/processes` → PID visible, 241MB RAM, `Sl` state |
+| ✅ **Terminal shows full charts** | `/debug/screenshot` → live market data, loaded session |
+| ✅ Terminal logged in (MetaQuotes demo) | screenshot Journal tab confirms |
+| ❓ IPC pipe reachable from Python? | **See current attempt below** |
+
+### Root Causes Investigated
+
+| # | Hypothesis | Result |
+|---|-----------|--------|
+| 1 | Wine prefix not owned by runtime user | Fixed with `chown root:root` |
+| 2 | Scottyhardy gosu switches to UID 1000 at runtime | Fixed with `ENTRYPOINT []` |
+| 3 | Manual terminal launch causes login-dialog IPC block | Tested `MT5_LAUNCH_TERMINAL=false` → same error |
+| 4 | Running as UID 1000 — no `/home/wineuser` | Reverted to `USER root` |
+| 5 | Linux path passed to `initialize(path=...)` | Fixed → convert to `C:\...` Windows path |
+| 6 | Terminal not started yet (updating in background) | Eliminated — terminal visible in screenshot |
+| 7 | **`path=` causes pipe-name mismatch** | **Current fix: try `initialize()` without `path` first** |
+
+### Current Fix (attempt 7)
+When `MT5_LAUNCH_TERMINAL=true`, `start.sh` launches the terminal directly via:
+```bash
+wine /opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe
+```
+Passing `path="C:\..."` to `MetaTrader5.initialize()` tells the module to look for (or start) a terminal specifically registered under that Windows path. If the terminal's IPC pipe was registered under a slightly different name (e.g. from the Linux-path invocation), the lookup fails.
+
+**Fix**: call `initialize(login, password, server)` first with no `path` — this finds *any* running terminal. Only fall back to `path=` if no terminal is found.
 
 ---
 
 ## Deployment
 
-### Push to HF Spaces (from local)
+### Build and push base image
+Triggered automatically by GitHub Actions on push to `main` when files under `mt5-bridge-base/` change.
+
+### Push bridge service to HF Spaces
 ```powershell
-# First time
-git -C g:\adaptive-trading-bot remote add hf-space https://loriloha:HF_TOKEN@huggingface.co/spaces/loriloha/mt5-bridge-service
+# One-time remote setup
+git -C g:\adaptive-trading-bot remote add hf-space `
+  https://loriloha:HF_TOKEN@huggingface.co/spaces/loriloha/mt5-bridge-service
 
 # Every deploy
 git -C g:\adaptive-trading-bot subtree split --prefix=mt5-bridge-service -b hf-deploy-branch
@@ -164,5 +149,52 @@ git -C g:\adaptive-trading-bot branch -D hf-deploy-branch
 https://loriloha-mt5-bridge-service.hf.space
 ```
 
-### Keep-Alive (prevent HF free tier sleeping)
-Add a free UptimeRobot monitor pinging `https://loriloha-mt5-bridge-service.hf.space/health` every 5 minutes.
+---
+
+## Diagnostic Endpoints
+
+All require `X-Bridge-Secret` header.
+
+| Endpoint | What it shows |
+|----------|--------------|
+| `GET /health` | Basic liveness check (no auth required) |
+| `GET /debug/mt5` | Port status, adapt state, last error, log tails |
+| `GET /debug/processes` | `ps aux` filtered for wine/terminal/python |
+| `GET /debug/screenshot` | Base64 PNG of the Xvfb display (see terminal UI) |
+| `POST /reset` | Force adapter reconnect |
+| `GET /account` | MT5 account info (requires connection) |
+
+### Screenshot command
+```powershell
+$hfToken = "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"
+$h = @{"Authorization"="Bearer $hfToken"; "X-Bridge-Secret"="1a364030bfe1ca13427f45d0fdcbb99a"}
+$r = Invoke-RestMethod -Uri "https://loriloha-mt5-bridge-service.hf.space/debug/screenshot" -Headers $h
+[IO.File]::WriteAllBytes("$env:USERPROFILE\Desktop\mt5-screen.png",
+    [Convert]::FromBase64String($r.image_b64))
+```
+
+---
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `mt5-bridge-base/Dockerfile` | Pre-baked base image (Wine + Python + MT5 terminal) |
+| `.github/workflows/build-mt5-base.yml` | GHA workflow — builds and pushes base image to GHCR |
+| `mt5-bridge-service/Dockerfile` | Bridge image (FROM base + FastAPI app) |
+| `mt5-bridge-service/start.sh` | Entrypoint: Xvfb → uvicorn → bootstrap → mt5linux → terminal |
+| `mt5-bridge-service/bootstrap-mt5.sh` | Runtime installer (skipped on pre-baked image) |
+| `mt5-bridge-service/app/mt5_adapter.py` | MT5 adapter with retry/backoff + Wine path conversion |
+| `mt5-bridge-service/app/main.py` | FastAPI routes + diagnostic endpoints |
+| `mt5-bridge-service/DEPLOYMENT.md` | This file |
+
+---
+
+## Uptime / Keep-Alive
+
+HF Spaces free tier sleeps after ~15 minutes of inactivity. Add a free **UptimeRobot** monitor:
+- URL: `https://loriloha-mt5-bridge-service.hf.space/health`
+- Interval: every 5 minutes
+- Type: HTTP(s)
+
+This prevents the Space from sleeping and keeps the MT5 terminal session alive.
