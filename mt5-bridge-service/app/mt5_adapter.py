@@ -139,6 +139,21 @@ class MT5Adapter:
         backoff = min(self._retry_backoff(), _MAX_RETRY_INTERVAL)
         self._next_connect_at = now + backoff
 
+        # In deterministic pre-launch mode, fail fast until IPC probe confirms
+        # the terminal is attachable. This avoids long RPC waits on every request.
+        launch_terminal_enabled = os.environ.get("MT5_LAUNCH_TERMINAL", "false").lower() == "true"
+        ipc_ready_file = os.path.join(
+            os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"),
+            "mt5_ipc.ready",
+        )
+        if launch_terminal_enabled and not os.path.isfile(ipc_ready_file):
+            self.connected = False
+            self.last_error = "mt5 ipc not ready yet"
+            self.last_error_class = "ipc_not_ready"
+            if not settings.mt_fallback_mode:
+                raise RuntimeError(self.last_error)
+            return
+
         # 1) Try native MetaTrader5 (only works when the python bindings are
         #    actually usable in-container, which is rare on Linux).
         if mt5_native is not None:
@@ -179,19 +194,25 @@ class MT5Adapter:
                     try:
                         # Use a longer timeout for the RPC call itself: MT5 terminal
                         # can take 60-90s on first launch to connect to the broker.
-                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=120)
+                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "45"))
+                        client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=rpc_timeout)
 
-                        # Strategy 1: no path — connect to the already-running terminal.
-                        # When MT5_LAUNCH_TERMINAL=true our start.sh has already launched
-                        # terminal64.exe, so MetaTrader5.initialize() should find it
-                        # without needing the exe path (which can cause pipe-name mismatches
-                        # when the Linux launch path differs from the Windows path the
-                        # terminal registered its IPC pipe under).
-                        creds = {
+                        # Build credential kwargs.
+                        creds: dict = {
                             "login": settings.mt_login,
                             "password": settings.mt_password,
                             "server": settings.mt_server,
                         }
+
+                        # When the terminal is launched in portable mode (/portable),
+                        # MetaTrader5.initialize() must also receive portable=True so it
+                        # computes the IPC pipe name from the exe directory (portable data
+                        # dir) rather than %APPDATA%\MetaQuotes\...  Without this flag,
+                        # the pipe lookup always times out with -10005.
+                        context_mode = os.environ.get("MT5_CONTEXT_MODE", "default").lower()
+                        if context_mode == "portable":
+                            creds["portable"] = True
+
                         ok = False
                         last_init_error = "unknown"
                         # Reliability-first: retry no-path initialize several times
@@ -211,7 +232,6 @@ class MT5Adapter:
 
                         if not ok:
                             classified = self._classify_error_text(last_init_error)
-                            context_mode = os.environ.get("MT5_CONTEXT_MODE", "portable").lower()
                             if classified == "ipc_timeout" and context_mode in {"portable", "data_dir"}:
                                 classified = "context_mismatch_suspected"
                             self.last_error_class = classified
@@ -245,7 +265,9 @@ class MT5Adapter:
                 raise RuntimeError(f"mt5linux init failed (all hosts): {last_exc}")
             except Exception as exc:
                 self.last_error = f"mt5linux init failed: {exc}"
-                self.last_error_class = self._classify_error_text(self.last_error)
+                # Preserve more specific classification chosen in inner scope.
+                if self.last_error_class != "context_mismatch_suspected":
+                    self.last_error_class = self._classify_error_text(self.last_error)
 
         self.connected = False
         if not settings.mt_fallback_mode:
