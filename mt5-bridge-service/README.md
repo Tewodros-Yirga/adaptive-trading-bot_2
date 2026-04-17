@@ -1,30 +1,44 @@
-# MT5 Bridge Service (Render Account B)
+---
+title: MT5 Bridge Service
+emoji: 📈
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
 
-This service runs MT5 bridge components in one container:
+# MT5 Bridge Service
 
-- Xvfb (virtual display)
-- Wine + MT5 terminal
-- FastAPI bridge API (`/order`, `/close`, `/account`, `/positions`)
+FastAPI bridge connecting MetaTrader 5 (via Wine) to the trading bot backend.
+Runs on Hugging Face Spaces CPU Basic (16GB RAM, x86_64, free).
 
-## Required env vars
+## Required Environment Variables (Space Settings → Variables and Secrets)
 
-- `MT_LOGIN`
-- `MT_PASSWORD`
-- `MT_SERVER`
-- `MT_BRIDGE_SECRET`
+| Variable | Description | Secret? |
+|----------|-------------|---------|
+| `MT_LOGIN` | MT5 account login number | ✅ |
+| `MT_PASSWORD` | MT5 account password | ✅ |
+| `MT_SERVER` | MT5 broker server name | ✅ |
+| `MT_BRIDGE_SECRET` | Shared secret for API auth | ✅ |
+| `PORT` | Must be set to `7860` | No |
+| `MT5_LAUNCH_TERMINAL` | Set `true` to auto-launch MT5 terminal | No |
 
-## Optional env vars
+## API Endpoints
 
-- `MT5_INSTALLER_URL` (download URL for MT5 installer if terminal not pre-baked)
-- `MT_TERMINAL_EXE` (terminal path inside Wine prefix)
-- `BRIDGE_PORT` (default `5555`)
-- `MT_FALLBACK_MODE` (`true` by default, allows mock responses when MT5 binding unavailable)
+- `GET /health` — health check
+- `GET /debug/mt5` — diagnostics (requires `X-Bridge-Secret` header)
+- `POST /order` — place order
+- `POST /close` — close position
+- `GET /account` — account info
+- `GET /positions` — open positions
 
 ## Run locally
 
 ```bash
 docker build -t mt5-bridge-service .
-docker run --rm -p 5555:5555 \
+docker run --rm -p 7860:7860 \
+  -e PORT=7860 \
   -e MT_LOGIN=123456 \
   -e MT_PASSWORD=secret \
   -e MT_SERVER="Broker-Real 01" \
