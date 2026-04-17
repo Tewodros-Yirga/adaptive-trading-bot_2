@@ -27,6 +27,14 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends --fix-missing supervisor python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
+# Fix wineprefix ownership: scottyhardy's ENTRYPOINT uses gosu to switch to
+# wineuser at runtime, but /opt/wineprefix was created as root during build.
+# wine checks file ownership and refuses to run if the prefix isn't owned by you.
+RUN chown -R wineuser:wineuser /opt/wineprefix 2>/dev/null \
+    || chown -R 1000:1000 /opt/wineprefix \
+    || true
+
+
 # Create the Linux-side Python venv for the FastAPI bridge.
 RUN python3 -m venv "${VIRTUAL_ENV}"
 
