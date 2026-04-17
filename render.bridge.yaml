@@ -8,7 +8,11 @@ services:
     autoDeploy: true
     envVars:
       - key: WINEPREFIX
-        value: "/opt/wineprefix"
+        value: "/home/wineuser/.wineprefix"
+      - key: MT5_WORKDIR
+        value: "/home/wineuser/.mt5-work"
+      - key: LOGDIR
+        value: "/home/wineuser/.mt5-bridge-logs"
       - key: MT_LOGIN
         sync: false
       - key: MT_PASSWORD
@@ -20,7 +24,7 @@ services:
       - key: MT5_INSTALLER_URL
         sync: false
       - key: MT_TERMINAL_EXE
-        value: "/opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+        value: "/home/wineuser/.wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe"
       - key: MT_FALLBACK_MODE
         value: "true"
       - key: MT5LINUX_HOST

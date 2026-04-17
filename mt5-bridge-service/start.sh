@@ -3,15 +3,17 @@ set -euo pipefail
 
 export DISPLAY=${DISPLAY:-:99}
 export BRIDGE_PORT=${PORT:-${BRIDGE_PORT:-5555}}
-export WINEPREFIX="/opt/wineprefix"
+export HOME="${HOME:-/home/wineuser}"
+export WINEPREFIX="${WINEPREFIX:-${HOME}/.wineprefix}"
 DERIVED_TERMINAL_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 export MT_TERMINAL_EXE="${MT_TERMINAL_EXE:-$DERIVED_TERMINAL_EXE}"
 export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe}
 
 # Keep logs and bootstrap downloads out of /tmp (Render eviction limit).
-export MT5_WORKDIR=${MT5_WORKDIR:-/opt/mt5-work}
-export LOGDIR=${LOGDIR:-/opt/mt5-bridge-logs}
-mkdir -p "${MT5_WORKDIR}" "${LOGDIR}"
+# Use $HOME because Render may restrict writes to /opt and /bridge.
+export MT5_WORKDIR=${MT5_WORKDIR:-${HOME}/.mt5-work}
+export LOGDIR=${LOGDIR:-${HOME}/.mt5-bridge-logs}
+mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 
 # Render free-tier limits /tmp to ~2GB. Some Wine/MT5 output is redirected to
 # `/tmp/mt5-launch-wrapper.log`, so symlink it into our persistent LOGDIR.
