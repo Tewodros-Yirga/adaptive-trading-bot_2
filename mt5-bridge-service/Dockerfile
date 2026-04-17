@@ -12,6 +12,12 @@
 
 FROM ghcr.io/loriloha/mt5-bridge-base:latest
 
+# Force root for ALL build steps and for the runtime CMD.
+# scottyhardy's base sets wineuser, but wine needs the WINEPREFIX
+# to be owned by whoever runs it. By running everything as root and
+# owning the prefix as root we avoid "not owned by you" errors.
+USER root
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:99
 ENV WINEPREFIX=/opt/wineprefix
@@ -19,21 +25,18 @@ ENV WINEDEBUG=-all
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
+ENV HOME=/root
 
 # Install supervisor + python3-venv (Linux-side, for the FastAPI bridge).
-# apt-get works fine in Render's build environment.
 RUN set -eux; \
     apt-get update -qq || true; \
     apt-get install -y --no-install-recommends --fix-missing supervisor python3-venv; \
     rm -rf /var/lib/apt/lists/*
 
-# Fix wineprefix ownership: scottyhardy's ENTRYPOINT uses gosu to switch to
-# wineuser at runtime, but /opt/wineprefix was created as root during build.
-# wine checks file ownership and refuses to run if the prefix isn't owned by you.
-RUN chown -R wineuser:wineuser /opt/wineprefix 2>/dev/null \
-    || chown -R 1000:1000 /opt/wineprefix \
-    || true
-
+# Fix wineprefix ownership to root so wine (running as root) accepts it.
+# The base image built as wineuser (uid 1000), so /opt/wineprefix is owned
+# by wineuser. With USER root above, this chown now runs as root and succeeds.
+RUN chown -R root:root /opt/wineprefix
 
 # Create the Linux-side Python venv for the FastAPI bridge.
 RUN python3 -m venv "${VIRTUAL_ENV}"
@@ -53,6 +56,6 @@ RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
 
 EXPOSE 5555
 
-USER root
-
+# Clear scottyhardy's gosu entrypoint so start.sh runs directly as root.
+ENTRYPOINT []
 CMD ["/bridge/start.sh"]
