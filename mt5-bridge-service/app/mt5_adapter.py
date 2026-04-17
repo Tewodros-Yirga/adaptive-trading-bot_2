@@ -39,7 +39,7 @@ class MT5Adapter:
             self._resolved_terminal_exe = configured
             return configured
 
-        wineprefix = (os.environ.get("WINEPREFIX") or "/tmp/.wine").rstrip("/")
+        wineprefix = (os.environ.get("WINEPREFIX") or "/home/wineuser/.wineprefix").rstrip("/")
 
         derived_candidates = [
             os.path.join(wineprefix, "drive_c", "Program Files", "MetaTrader 5", "terminal64.exe"),

@@ -28,24 +28,6 @@ fi
 
 mkdir -p "${WINEPREFIX}"
 
-resolve_windows_python() {
-  shopt -s nullglob
-  local hits=()
-
-  hits+=("${WINEPREFIX}"/drive_c/users/*/AppData/Local/Programs/Python/Python*/python.exe)
-  hits+=("${WINEPREFIX}"/drive_c/Program\ Files/Python*/python.exe)
-  hits+=("${WINEPREFIX}"/drive_c/Python*/python.exe)
-
-  local c
-  for c in "${hits[@]}"; do
-    if [[ -f "$c" ]]; then
-      echo "$c"
-      return 0
-    fi
-  done
-  return 1
-}
-
 required_vars=("MT_LOGIN" "MT_PASSWORD" "MT_SERVER" "MT_BRIDGE_SECRET")
 for key in "${required_vars[@]}"; do
   if [[ -z "${!key:-}" ]]; then
