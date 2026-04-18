@@ -257,7 +257,9 @@ fi
     echo "0.0.0.0 ${_domain}" >> /etc/hosts 2>/dev/null || true
   done
 
-  CONTEXT_ARGS+=("/noupdate")
+  # Note: /noupdate is NOT a valid terminal64.exe flag (verified against MT5 docs).
+  # The update is handled via domain-blocking in /etc/hosts above and by rebuilding
+  # the base image monthly so the baked-in version stays current.
   echo "mode=${MT5_CONTEXT_MODE}; exe=${TERMINAL_EXE}; args=${CONTEXT_ARGS[*]:-(none)}" > "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
 
   echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
@@ -324,6 +326,8 @@ fi
     echo "[mt5-probe] Bounded find result: '${FOUND_PYTHON}'" >&2
   fi
 
+  # Enable xtrace so every command appears in the wrapper log for debugging.
+  set -x
   if [[ -z "$FOUND_PYTHON" ]] || [[ ! -f "$FOUND_PYTHON" ]]; then
     echo "[mt5-terminal] Could not find Wine python.exe for IPC probe." >&2
     echo "failed: python_not_found" > "${IPC_STATUS_FILE}" 2>/dev/null || true
@@ -342,14 +346,14 @@ fi
       # In portable/data_dir mode the data directory is fresh (no saved account),
       # so bare initialize() always returns False.  Pass credentials so the probe can
       # actually attach and confirm IPC is working.
-      PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=15000"
+      PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=60000"
       if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
         PROBE_INIT_ARGS="${PROBE_INIT_ARGS}, portable=True"
       fi
       PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
       PROBE_EXIT=0
       PROBE_OUT=$(
-        timeout 30 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+        timeout 75 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
           2>&1
       ) || PROBE_EXIT=$?
 
