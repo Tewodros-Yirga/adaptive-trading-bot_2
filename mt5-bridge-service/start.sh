@@ -268,20 +268,35 @@ fi
 
   # Fallback dialog dismisser: if a LiveUpdate domain was missed and the
   # "Restart to install" dialog still appears, dismiss it via xdotool.
-  # LiveUpdate is often nested inside the "open an account" wizard; target
-  # both window titles and click hotspots (Later/Restart + wizard Cancel/X).
+  # Note: xdotool --name is a plain substring match — do NOT use | here
+  # (e.g. "A|B" looks for a title literally containing a pipe character).
+  # LiveUpdate dialogs are often centered; Restart/Later sit lower than
+  # older wizard-nested coords (y ~400–430 on 1280x720), not y ~330.
   (
     _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
+    _uniq_ids() { awk 'NF' | sort -n -u; }
     sleep 8
     for _try in $(seq 1 48); do
-      LIVE_IDS=$(_xd search --onlyvisible --name "LiveUpdate|Updates have been downloaded")
-      WIZ_IDS=$(_xd search --onlyvisible --name "Select a company|open an account|MetaTrader 5")
-      WINIDS=$(_xd search --onlyvisible)
-      ALL_IDS=$(printf '%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${WINIDS}" | awk 'NF' | sort -n -u)
+      LIVE_IDS=$(
+        { _xd search --onlyvisible --name LiveUpdate
+          _xd search --onlyvisible --name "Welcome to"
+        } | _uniq_ids
+      )
+      WIZ_IDS=$(
+        { _xd search --onlyvisible --name "Select a company"
+          _xd search --onlyvisible --name "open an account"
+          _xd search --onlyvisible --name "MetaTrader 5"
+        } | _uniq_ids
+      )
+      WINIDS=$(_xd search --onlyvisible | _uniq_ids)
+      ALL_IDS=$(printf '%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${WINIDS}" | _uniq_ids)
       for _wid in ${ALL_IDS}; do
         _xd windowactivate --sync "${_wid}"
         sleep 0.25
+        # Centered LiveUpdate: hit Later/Restart band, then legacy wizard coords.
         for _xy in \
+          "548 418" "638 418" "728 418" \
+          "520 402" "600 428" "700 428" \
           "560 332" "530 330" "585 338" \
           "469 335" "445 328" \
           "724 488" "644 488" "972 183"; do
@@ -289,18 +304,18 @@ fi
           _xd mousemove --clearmodifiers "$1" "$2" click 1
           sleep 0.08
         done
-        # Avoid Alt+<key> mnemonics: MT5 steals these for main-menu shortcuts
-        # (e.g. Alt+C opens Charts), which can block dialog dismissal.
+        # Keystrokes scoped to this X window (avoids firing on wrong stack order).
+        _xd key --window "${_wid}" --clearmodifiers Escape
         sleep 0.1
-        _xd key --clearmodifiers Escape
-        sleep 0.1
-        _xd key --clearmodifiers Return
+        _xd key --window "${_wid}" --clearmodifiers Return
         sleep 0.08
-        _xd key --clearmodifiers Tab
-        sleep 0.05
-        _xd key --clearmodifiers Tab
-        sleep 0.05
-        _xd key --clearmodifiers Return
+        _xd key --window "${_wid}" --clearmodifiers Tab
+        sleep 0.06
+        _xd key --window "${_wid}" --clearmodifiers Return
+        sleep 0.06
+        _xd key --window "${_wid}" --clearmodifiers Tab
+        sleep 0.06
+        _xd key --window "${_wid}" --clearmodifiers Return
       done
       if (( _try <= 30 )); then
         sleep 5
