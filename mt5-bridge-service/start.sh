@@ -281,17 +281,41 @@ fi
     done
   ) &
 
-
   # Resolve Wine Python for IPC probe.
+  # Use predictable known paths first; avoid 'find | head -1' which can
+  # hang on Wine's large drive_c directory due to SIGPIPE + pipefail.
   FOUND_PYTHON=""
+  echo "[mt5-probe] Resolving Wine python.exe path..." >&2
+
   if [[ -f "/opt/wine_python_exe.path" ]]; then
-    PREBAKED=$(cat /opt/wine_python_exe.path 2>/dev/null | tr -d '\n') || true
+    PREBAKED=$(cat /opt/wine_python_exe.path 2>/dev/null | tr -d '\n\r') || true
     if [[ -n "$PREBAKED" ]] && [[ -f "$PREBAKED" ]]; then
       FOUND_PYTHON="$PREBAKED"
+      echo "[mt5-probe] Using prebaked path: ${FOUND_PYTHON}" >&2
     fi
   fi
+
+  # Try the common install locations directly.
   if [[ -z "$FOUND_PYTHON" ]]; then
-    FOUND_PYTHON=$(find "${WINEPREFIX}/drive_c" -maxdepth 5 -name "python.exe" 2>/dev/null | head -1) || true
+    for _py_candidate in \
+      "${WINEPREFIX}/drive_c/Program Files/Python39/python.exe" \
+      "${WINEPREFIX}/drive_c/Program Files/Python310/python.exe" \
+      "${WINEPREFIX}/drive_c/Program Files/Python311/python.exe" \
+      "${WINEPREFIX}/drive_c/Python39/python.exe" \
+      "${WINEPREFIX}/drive_c/Python310/python.exe"; do
+      if [[ -f "$_py_candidate" ]]; then
+        FOUND_PYTHON="$_py_candidate"
+        echo "[mt5-probe] Found python at: ${FOUND_PYTHON}" >&2
+        break
+      fi
+    done
+  fi
+
+  # Last-resort bounded find (5s timeout to prevent hang).
+  if [[ -z "$FOUND_PYTHON" ]]; then
+    echo "[mt5-probe] Trying bounded find (5s)..." >&2
+    FOUND_PYTHON=$(timeout 5 find "${WINEPREFIX}/drive_c" -maxdepth 6 -name "python.exe" 2>/dev/null | head -1) || true
+    echo "[mt5-probe] Bounded find result: '${FOUND_PYTHON}'" >&2
   fi
 
   if [[ -z "$FOUND_PYTHON" ]] || [[ ! -f "$FOUND_PYTHON" ]]; then
