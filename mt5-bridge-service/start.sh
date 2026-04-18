@@ -379,14 +379,27 @@ fi
       # after applying a LiveUpdate. The probe will detect the new process.
 
       # Build the initialize() call for the probe.
-      # In portable/data_dir mode the data directory is fresh (no saved account),
-      # so bare initialize() always returns False.  Pass credentials so the probe can
-      # actually attach and confirm IPC is working.
-      PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=60000"
+      # Strategy:
+      # 1) Try bare initialize(timeout=...) first to validate pure IPC pipe attach.
+      # 2) If bare attach fails, try credentialed initialize to mirror runtime auth.
+      # This avoids false negatives where auth/session is transient but IPC is ready.
+      PROBE_PORTABLE_ARG=""
       if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
-        PROBE_INIT_ARGS="${PROBE_INIT_ARGS}, portable=True"
+        PROBE_PORTABLE_ARG=", portable=True"
       fi
-      PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
+      PROBE_SCRIPT=$(cat <<PYEOF
+import MetaTrader5 as mt5
+ok = mt5.initialize(timeout=45000${PROBE_PORTABLE_ARG})
+err = mt5.last_error()
+mode = "bare"
+if not ok:
+    ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=60000${PROBE_PORTABLE_ARG})
+    err = mt5.last_error()
+    mode = "creds"
+mt5.shutdown()
+print(f"mode={mode} ok={ok} err={err}")
+PYEOF
+)
       PROBE_EXIT=0
       # Write to a temp FILE not a pipe: if wine is killed by timeout, wineserver
       # may keep python.exe alive (orphaned) with the stdout pipe still open.
