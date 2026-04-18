@@ -274,7 +274,7 @@ def debug_pipes():
     # 1. List \\.\pipe\ via Wine cmd
     try:
         r = subprocess.run(
-            ["wine", "cmd", "/c", r"dir \\.\pipe\"],
+            ["wine", "cmd", "/c", "dir \\\\.\\pipe\\"],
             env=env, capture_output=True, text=True, timeout=15
         )
         results["cmd_dir_pipe"] = (r.stdout + r.stderr).strip()[-3000:]
