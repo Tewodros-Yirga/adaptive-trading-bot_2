@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - "mt5-bridge-base/Dockerfile"
+  # Rebuild monthly to keep the baked-in MT5 terminal version current.
+  # A stale terminal triggers a blocking "Restart to install updates" dialog
+  # on every container start, which prevents IPC pipe creation.
+  schedule:
+    - cron: "0 3 1 * *"   # 03:00 UTC on the 1st of each month
   workflow_dispatch:
     inputs:
       mt5_url:

@@ -242,6 +242,11 @@ fi
       CONTEXT_ARGS+=("/portable")
       ;;
   esac
+  # Always suppress the update-restart dialog. When MT5 downloads an update
+  # it shows a blocking "Restart to install" prompt which prevents IPC pipe
+  # creation. /noupdate skips the update check entirely at startup.
+  # To get a fresh terminal version, rebuild the base image (see GHA schedule).
+  CONTEXT_ARGS+=("/noupdate")
   echo "mode=${MT5_CONTEXT_MODE}; exe=${TERMINAL_EXE}; args=${CONTEXT_ARGS[*]:-(none)}" > "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
 
   echo "[mt5-terminal] Launching MetaTrader 5 terminal..."

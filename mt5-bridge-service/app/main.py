@@ -283,42 +283,34 @@ def debug_pipes():
 
     # 2. Enumerate pipes from Python inside Wine
     if wine_python:
-        script = r"""
-import os, ctypes, ctypes.wintypes
-FindFirstFile = ctypes.windll.kernel32.FindFirstFileW
-FindNextFile = ctypes.windll.kernel32.FindNextFileW
-FindClose = ctypes.windll.kernel32.FindClose
-INVALID = ctypes.c_void_p(-1).value
-class WIN32_FIND_DATA(ctypes.Structure):
-    _fields_ = [('dwFileAttributes',ctypes.wintypes.DWORD),
-                ('ftCreationTime', ctypes.c_ulonglong),
-                ('ftLastAccessTime', ctypes.c_ulonglong),
-                ('ftLastWriteTime', ctypes.c_ulonglong),
-                ('nFileSizeHigh', ctypes.wintypes.DWORD),
-                ('nFileSizeLow', ctypes.wintypes.DWORD),
-                ('dwReserved0', ctypes.wintypes.DWORD),
-                ('dwReserved1', ctypes.wintypes.DWORD),
-                ('cFileName', ctypes.c_wchar * 260),
-                ('cAlternateFileName', ctypes.c_wchar * 14)]
-fd = WIN32_FIND_DATA()
-h = FindFirstFile(r'\\.\pipe\*', ctypes.byref(fd))
-pipes = []
-if h != INVALID:
-    while True:
-        pipes.append(fd.cFileName)
-        if not FindNextFile(h, ctypes.byref(fd)): break
-    FindClose(h)
-print('\n'.join(p for p in pipes if 'meta' in p.lower() or 'mt5' in p.lower() or 'metatrader' in p.lower()) or 'no_mt5_pipes_found')
-print('TOTAL_PIPES=' + str(len(pipes)))
-"""
+        script = (
+            "import ctypes, ctypes.wintypes\n"
+            "EnumWindows = ctypes.windll.user32.EnumWindows\n"
+            "WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)\n"
+            "GetWindowTextW = ctypes.windll.user32.GetWindowTextW\n"
+            "GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW\n"
+            "IsWindowVisible = ctypes.windll.user32.IsWindowVisible\n"
+            "titles = []\n"
+            "def cb(hwnd, _):\n"
+            "    if IsWindowVisible(hwnd):\n"
+            "        n = GetWindowTextLengthW(hwnd)\n"
+            "        if n > 0:\n"
+            "            b = ctypes.create_unicode_buffer(n+1)\n"
+            "            GetWindowTextW(hwnd, b, n+1)\n"
+            "            titles.append(b.value)\n"
+            "    return True\n"
+            "EnumWindows(WNDENUMPROC(cb), 0)\n"
+            "print('TOTAL_WINDOWS=' + str(len(titles)))\n"
+            "for t in titles: print('WIN:', t)\n"
+        )
         try:
             r2 = subprocess.run(
                 ["wine", wine_python, "-c", script],
                 env=env, capture_output=True, text=True, timeout=20
             )
-            results["wine_python_pipes"] = (r2.stdout + r2.stderr).strip()[-2000:]
+            results["wine_python_windows"] = (r2.stdout + r2.stderr).strip()[-3000:]
         except Exception as exc:
-            results["wine_python_pipes"] = f"error: {exc}"
+            results["wine_python_windows"] = f"error: {exc}"
 
     return results
 
