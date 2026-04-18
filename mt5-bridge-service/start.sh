@@ -242,10 +242,15 @@ fi
       echo "[mt5-terminal] MT5_CONTEXT_MODE=${MT5_CONTEXT_MODE:-unset}; using default (AppData) mode"
       ;;
   esac
-  # Always suppress the update-restart dialog. When MT5 downloads an update
-  # it shows a blocking "Restart to install" prompt which prevents IPC pipe
-  # creation. /noupdate skips the update check entirely at startup.
-  # To get a fresh terminal version, rebuild the base image (see GHA schedule).
+  # Block MT5 LiveUpdate servers so the update is never downloaded in the
+  # first place. Even /noupdate doesn't prevent the download; blocking the
+  # domain at the OS level is the most reliable approach.
+  for _domain in live.mql5.com updates.mql5.com update.mql5.com www.mql5.com \
+                 update.metatrader5.com updates.metatrader5.com \
+                 mt5-update.metaquotes.net metaquotes.net; do
+    echo "0.0.0.0 ${_domain}" >> /etc/hosts 2>/dev/null || true
+  done
+
   CONTEXT_ARGS+=("/noupdate")
   echo "mode=${MT5_CONTEXT_MODE}; exe=${TERMINAL_EXE}; args=${CONTEXT_ARGS[*]:-(none)}" > "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
 
@@ -253,20 +258,28 @@ fi
   "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
   TERMINAL_PID=$!
 
-  # Background daemon: dismiss the LiveUpdate "Restart to install" dialog.
-  # Even with /noupdate the terminal still downloads updates and shows a modal
-  # dialog that blocks IPC pipe creation. We click the "Later" button
-  # (screen-coordinates on 1280x720 Xvfb) every 10 s for the first 3 minutes.
+  # Fallback dialog dismisser: if a LiveUpdate domain was missed and the
+  # "Restart to install" dialog still appears, dismiss it via xdotool.
+  # We activate EVERY visible X11 window (Wine dialogs get their own XID),
+  # click the "Later" position, and send Tab+Return as keyboard fallback.
   (
-    sleep 15
-    for _click in $(seq 1 18); do
-      # "Later" button is at approx x=557 y=335 on 1280x720
-      DISPLAY=:99 xdotool mousemove 557 335 click 1 2>/dev/null || true
-      # Also try the "Next >" button area of the "Select company" wizard
-      DISPLAY=:99 xdotool mousemove 673 490 click 1 2>/dev/null || true
+    sleep 25
+    for _try in $(seq 1 24); do
+      WINIDS=$(DISPLAY=:99 xdotool search --onlyvisible 2>/dev/null) || WINIDS=""
+      for _wid in ${WINIDS}; do
+        DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true
+        sleep 0.2
+        # Click "Later" button at 1280x720 coordinates
+        DISPLAY=:99 xdotool mousemove --clearmodifiers 557 335 click 1 2>/dev/null || true
+        # Keyboard fallback: Tab to "Later", Enter to confirm
+        DISPLAY=:99 xdotool key --clearmodifiers Tab 2>/dev/null || true
+        sleep 0.1
+        DISPLAY=:99 xdotool key --clearmodifiers Return 2>/dev/null || true
+      done
       sleep 10
     done
   ) &
+
 
   # Resolve Wine Python for IPC probe.
   FOUND_PYTHON=""
