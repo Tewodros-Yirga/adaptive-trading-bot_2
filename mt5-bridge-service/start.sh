@@ -268,25 +268,30 @@ fi
 
   # Fallback dialog dismisser: if a LiveUpdate domain was missed and the
   # "Restart to install" dialog still appears, dismiss it via xdotool.
-  # LiveUpdate is often nested inside the "open an account" wizard; a single
-  # fixed click can miss the focused sub-dialog — try several 1280x720 coords,
-  # prefer "Later" first (avoids restart racing the IPC probe), then Restart.
+  # LiveUpdate is often nested inside the "open an account" wizard; target
+  # both window titles and click hotspots (Later/Restart + wizard Cancel/X).
   (
     _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
     sleep 8
-    for _try in $(seq 1 36); do
-      MT_IDS=$(_xd search --onlyvisible --name MetaTrader)
+    for _try in $(seq 1 48); do
+      LIVE_IDS=$(_xd search --onlyvisible --name "LiveUpdate|Updates have been downloaded")
+      WIZ_IDS=$(_xd search --onlyvisible --name "Select a company|open an account|MetaTrader 5")
       WINIDS=$(_xd search --onlyvisible)
-      ALL_IDS=$(printf '%s\n%s\n' "${MT_IDS}" "${WINIDS}" | awk 'NF' | sort -n -u)
+      ALL_IDS=$(printf '%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${WINIDS}" | awk 'NF' | sort -n -u)
       for _wid in ${ALL_IDS}; do
         _xd windowactivate --sync "${_wid}"
         sleep 0.25
-        for _xy in "560 332" "530 330" "585 338" "469 335" "445 328"; do
+        for _xy in \
+          "560 332" "530 330" "585 338" \
+          "469 335" "445 328" \
+          "724 488" "644 488" "972 183"; do
           set -- ${_xy}
           _xd mousemove --clearmodifiers "$1" "$2" click 1
           sleep 0.08
         done
         _xd key --clearmodifiers alt+l
+        sleep 0.08
+        _xd key --clearmodifiers alt+c
         sleep 0.1
         _xd key --clearmodifiers Escape
         sleep 0.1
@@ -296,7 +301,7 @@ fi
         sleep 0.05
         _xd key --clearmodifiers Return
       done
-      if (( _try <= 18 )); then
+      if (( _try <= 30 )); then
         sleep 5
       else
         sleep 10
