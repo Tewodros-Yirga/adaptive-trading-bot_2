@@ -253,6 +253,21 @@ fi
   "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
   TERMINAL_PID=$!
 
+  # Background daemon: dismiss the LiveUpdate "Restart to install" dialog.
+  # Even with /noupdate the terminal still downloads updates and shows a modal
+  # dialog that blocks IPC pipe creation. We click the "Later" button
+  # (screen-coordinates on 1280x720 Xvfb) every 10 s for the first 3 minutes.
+  (
+    sleep 15
+    for _click in $(seq 1 18); do
+      # "Later" button is at approx x=557 y=335 on 1280x720
+      DISPLAY=:99 xdotool mousemove 557 335 click 1 2>/dev/null || true
+      # Also try the "Next >" button area of the "Select company" wizard
+      DISPLAY=:99 xdotool mousemove 673 490 click 1 2>/dev/null || true
+      sleep 10
+    done
+  ) &
+
   # Resolve Wine Python for IPC probe.
   FOUND_PYTHON=""
   if [[ -f "/opt/wine_python_exe.path" ]]; then
