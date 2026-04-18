@@ -235,11 +235,11 @@ fi
       mkdir -p "${MT5_CONTEXT_DIR}" 2>/dev/null || true
       CONTEXT_ARGS+=("/datapath:${MT5_CONTEXT_DIR}")
       ;;
-    default)
-      ;;
-    *)
-      echo "[mt5-terminal] Unknown MT5_CONTEXT_MODE=${MT5_CONTEXT_MODE}; falling back to portable"
-      CONTEXT_ARGS+=("/portable")
+    default|*)
+      # Default: use the pre-baked AppData MetaQuotes demo session.
+      # The terminal auto-connects on startup → IPC pipes created immediately.
+      # Portable mode requires interactive login before IPC becomes available.
+      echo "[mt5-terminal] MT5_CONTEXT_MODE=${MT5_CONTEXT_MODE:-unset}; using default (AppData) mode"
       ;;
   esac
   # Always suppress the update-restart dialog. When MT5 downloads an update
