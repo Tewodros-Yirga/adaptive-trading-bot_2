@@ -289,12 +289,13 @@ fi
           _xd mousemove --clearmodifiers "$1" "$2" click 1
           sleep 0.08
         done
-        _xd key --clearmodifiers alt+l
-        sleep 0.08
-        _xd key --clearmodifiers alt+c
+        # Avoid Alt+<key> mnemonics: MT5 steals these for main-menu shortcuts
+        # (e.g. Alt+C opens Charts), which can block dialog dismissal.
         sleep 0.1
         _xd key --clearmodifiers Escape
         sleep 0.1
+        _xd key --clearmodifiers Return
+        sleep 0.08
         _xd key --clearmodifiers Tab
         sleep 0.05
         _xd key --clearmodifiers Tab
