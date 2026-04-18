@@ -50,6 +50,12 @@ if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
   exit 1
 fi
 
+# Start a lightweight window manager so xdotool can deliver focus events
+# to Wine dialogs. Without a WM, windowactivate is a no-op and keyboard/
+# mouse input never reaches Wine's message queue.
+DISPLAY="${DISPLAY}" openbox --sm-disable > "${LOGDIR}/openbox.log" 2>&1 &
+echo "Openbox WM started (PID $!)"
+
 echo "Starting bridge API (uvicorn) immediately; MT5 bootstrap in background..."
 
 PORT="${PORT:-${BRIDGE_PORT:-5555}}"
@@ -336,13 +342,13 @@ fi
       # In portable/data_dir mode the data directory is fresh (no saved account),
       # so bare initialize() always returns False.  Pass credentials so the probe can
       # actually attach and confirm IPC is working.
-      PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}'"
+      PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=15000"
       if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
         PROBE_INIT_ARGS="${PROBE_INIT_ARGS}, portable=True"
       fi
       PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
       PROBE_OUT=$(
-        timeout 90 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+        timeout --kill-after=10 100 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
           2>&1
       )
       PROBE_EXIT=$?
