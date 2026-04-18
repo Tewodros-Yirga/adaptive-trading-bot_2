@@ -83,7 +83,7 @@ The FastAPI adapter runs an asyncio background loop (T+15s, every 60s thereafter
 | `MT_BRIDGE_SECRET` | `<token>` | Shared API auth secret — **Secret** |
 | `WINEPREFIX` | `/opt/wineprefix` | Pre-baked Wine prefix |
 | `DISPLAY` | `:99` | Xvfb display |
-| `MT5_CONTEXT_MODE` | `portable` | Terminal context mode (`portable`, `data_dir`, `default`) |
+| `MT5_CONTEXT_MODE` | `default` (recommended) | `default` uses pre-baked AppData session; `portable` shows the setup wizard and blocks IPC until login — see [IPC_DEBUGGING.md](IPC_DEBUGGING.md) |
 | `MT5_CONTEXT_DIR` | `/opt/wineprefix/drive_c/mt5-data` | Data directory when `MT5_CONTEXT_MODE=data_dir` |
 
 ---
@@ -161,9 +161,9 @@ All require `X-Bridge-Secret` header.
 | Endpoint | What it shows |
 |----------|--------------|
 | `GET /health` | Basic liveness check (no auth required) |
-| `GET /debug/mt5` | Port status, adapt state, last error, log tails |
+| `GET /debug/mt5` | Port status, adapter state, log tails, `bootstrap.mt5_ipc_probe_log_exists`, and `runtime_env` (non-secret launch flags) |
 | `GET /debug/processes` | `ps aux` filtered for wine/terminal/python |
-| `GET /debug/mt5-ipc-test` | Direct Wine Python `MetaTrader5.initialize()` probe (parsed `ok/err_code/err_message`) |
+| `GET /debug/mt5-ipc-test` | Wine Python `initialize()` probe; **default** matches `start.sh` (`with_credentials=true`). Query: `with_credentials`, `portable`, `timeout_ms` |
 | `GET /debug/screenshot` | Base64 PNG of the Xvfb display (see terminal UI) |
 | `POST /reset` | Force adapter reconnect |
 | `GET /account` | MT5 account info (requires connection) |
@@ -188,7 +188,7 @@ All require `X-Bridge-Secret` header.
 ### Interpreting New Signals
 
 - `ipc_ready=true` + `/account` still fails: likely broker login/session/credentials issue, not Wine pipe attach.
-- `ipc_ready=false` and `/debug/mt5-ipc-test` gives `err_code=-10005`: MT5 IPC attach is still failing at Wine/terminal layer.
+- `ipc_ready=false` and `/debug/mt5-ipc-test?with_credentials=true` gives `err_code=-10005`: MT5 IPC attach is still failing at Wine/terminal layer (compare with `with_credentials=false` to see bare attach vs credentialed).
 - `ipc_failed=true` quickly after startup: terminal likely exited or IPC never became attachable in allotted warmup window.
 - `ipc_ready=false` + repeated `-10005` under fixed `context_status` (e.g. `mode=portable`) strongly suggests Wine/MT5 runtime compatibility limits rather than startup sequencing.
 
@@ -200,6 +200,24 @@ $r = Invoke-RestMethod -Uri "https://loriloha-mt5-bridge-service.hf.space/debug/
 [IO.File]::WriteAllBytes("$env:USERPROFILE\Desktop\mt5-screen.png",
     [Convert]::FromBase64String($r.image_b64))
 ```
+
+### One-shot diagnostic export (PowerShell)
+
+From the repo, with `HF_TOKEN` and `MT_BRIDGE_SECRET` set in the environment:
+
+```powershell
+cd mt5-bridge-service\scripts
+.\export-hf-diagnostics.ps1 -BaseUrl "https://loriloha-mt5-bridge-service.hf.space"
+```
+
+Writes `debug-mt5.json`, `debug-processes.json`, `debug-pipes.json`, `debug-mt5-ipc-test.json`, and `screenshot.png` under `./mt5-diagnostics-export` (override with `-OutDir`).
+
+### IPC remediation checklist (`-10005` / `ipc_ready=false`)
+
+1. Read `debug-mt5.json`: confirm `runtime_env.mt5_launch_terminal` is `true` and `runtime_env.mt5_context_mode` is `default` or empty (not `portable` unless intentional).
+2. Open `screenshot.png`: dismiss stuck **LiveUpdate** or **login** dialogs (see [IPC_DEBUGGING.md](IPC_DEBUGGING.md)); adjust `start.sh` xdotool coordinates if the button moved.
+3. Inspect `debug-pipes.json`: if `cmd_dir_pipe` shows no MetaTrader-related pipes, the terminal is not exposing IPC yet (UI block or crash).
+4. Rebuild the base image so the baked terminal matches current MetaQuotes builds: [.github/workflows/build-mt5-base.yml](../.github/workflows/build-mt5-base.yml) (reduces update dialogs on cold start).
 
 ---
 

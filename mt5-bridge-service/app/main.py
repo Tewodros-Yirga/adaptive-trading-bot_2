@@ -4,7 +4,7 @@ import re
 import socket
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .config import settings, validate_required_settings
 from .mt5_adapter import adapter
@@ -129,6 +129,31 @@ def _parse_ipc_probe_stdout(stdout: str) -> dict[str, object]:
     return parsed
 
 
+def _wine_mt5_ipc_probe_script(
+    *,
+    with_credentials: bool,
+    portable: bool,
+    timeout_ms: int,
+) -> str:
+    """Python source for `wine python.exe -c` — mirrors start.sh IPC probe."""
+    if not with_credentials:
+        return (
+            "import MetaTrader5 as mt5; "
+            f"ok = mt5.initialize(timeout={timeout_ms}); "
+            "err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
+        )
+    login = int(settings.mt_login)
+    pw = repr(settings.mt_password)
+    srv = repr(settings.mt_server)
+    portable_arg = ", portable=True" if portable else ""
+    return (
+        "import MetaTrader5 as mt5; "
+        f"ok = mt5.initialize(login={login}, password={pw}, server={srv}, "
+        f"timeout={timeout_ms}{portable_arg}); "
+        "err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
+    )
+
+
 @app.get("/debug/mt5", dependencies=[Depends(require_secret)])
 def debug_mt5():
     """
@@ -146,6 +171,7 @@ def debug_mt5():
     ipc_failed_file = logdir / "mt5_ipc.failed"
     ipc_status_file = logdir / "mt5_ipc.status"
     context_status_file = logdir / "mt5_context.status"
+    ipc_probe_log = logdir / "mt5-ipc-probe.log"
 
     terminal_exe_from_sentinel: str | None = None
     if terminal_path_file.exists():
@@ -178,6 +204,13 @@ def debug_mt5():
             "ipc_failed": ipc_failed_file.exists(),
             "ipc_status": _tail_file(ipc_status_file, max_bytes=4_000),
             "context_status": _tail_file(context_status_file, max_bytes=4_000),
+            "mt5_ipc_probe_log_exists": ipc_probe_log.is_file(),
+        },
+        "runtime_env": {
+            "mt5_launch_terminal": os.environ.get("MT5_LAUNCH_TERMINAL", ""),
+            "mt5_context_mode": os.environ.get("MT5_CONTEXT_MODE", ""),
+            "mt_login_configured": bool(settings.mt_login),
+            "mt_server_configured": bool(settings.mt_server.strip()),
         },
         "logs": {
             "bootstrap-mt5": _tail_file(logdir / "bootstrap-mt5.log"),
@@ -193,7 +226,7 @@ def debug_mt5():
             "wine-mt5linux-pip-install": _tail_file(logdir / "wine-mt5linux-pip-install.log"),
             "mt5-terminal": _tail_file(logdir / "mt5-terminal.log"),
             "mt5-launch-wrapper": _tail_file(logdir / "mt5-launch-wrapper.log"),
-            "mt5-ipc-probe": _tail_file(logdir / "mt5-ipc-probe.log"),
+            "mt5-ipc-probe": _tail_file(ipc_probe_log),
         },
     }
 
@@ -217,23 +250,50 @@ def debug_processes():
 
 
 @app.get("/debug/mt5-ipc-test", dependencies=[Depends(require_secret)])
-def debug_mt5_ipc_test():
+def debug_mt5_ipc_test(
+    with_credentials: bool = Query(
+        True,
+        description=(
+            "If true (default), call initialize(login, password, server, timeout=…) like start.sh; "
+            "if false, bare initialize(timeout=…) only."
+        ),
+    ),
+    portable: bool | None = Query(
+        None,
+        description="If set, forces portable=True on initialize when with_credentials is true; "
+        "if omitted, uses MT5_CONTEXT_MODE==portable from the environment.",
+    ),
+    timeout_ms: int = Query(
+        60_000,
+        ge=5_000,
+        le=120_000,
+        description="mt5.initialize timeout in milliseconds (matches start.sh probe default).",
+    ),
+):
     """
     Run MetaTrader5.initialize() directly inside Wine Python (bypasses RPyC).
-    Tests whether Wine IPC fundamentally works with the running terminal.
-    Times out after 90 seconds.
+    By default uses the same credentialized initialize() call as the IPC probe in start.sh.
+    Subprocess wall-clock timeout is max(95, timeout_ms // 1000 + 35) seconds.
     """
     import subprocess
+
     python_path = Path("/opt/wine_python_exe.path")
     if not python_path.exists():
         return {"error": "wine_python_exe.path sentinel not found"}
     wine_python = python_path.read_text().strip()
-    script = (
-        "import MetaTrader5 as mt5; "
-        "ok = mt5.initialize(); "
-        "err = mt5.last_error(); "
-        "mt5.shutdown(); "
-        "print(f'ok={ok} err={err}')"
+
+    portable_flag = (
+        portable
+        if portable is not None
+        else (os.environ.get("MT5_CONTEXT_MODE", "").lower() == "portable")
+    )
+    if with_credentials and not settings.mt_login:
+        return {"error": "MT_LOGIN unset or zero; set with_credentials=false or configure MT_LOGIN"}
+
+    script = _wine_mt5_ipc_probe_script(
+        with_credentials=with_credentials,
+        portable=portable_flag,
+        timeout_ms=timeout_ms,
     )
     env = {
         **os.environ,
@@ -241,13 +301,17 @@ def debug_mt5_ipc_test():
         "WINEPREFIX": os.environ.get("WINEPREFIX", "/opt/wineprefix"),
         "WINEDEBUG": "-all",
     }
+    wall_timeout = max(95, timeout_ms // 1000 + 35)
     try:
         r = subprocess.run(
             ["wine", wine_python, "-c", script],
-            env=env, capture_output=True, text=True, timeout=90
+            env=env, capture_output=True, text=True, timeout=wall_timeout
         )
         parsed = _parse_ipc_probe_stdout(r.stdout.strip())
         return {
+            "with_credentials": with_credentials,
+            "portable": portable_flag,
+            "timeout_ms": timeout_ms,
             "returncode": r.returncode,
             "stdout": r.stdout.strip(),
             "stderr": r.stderr.strip()[-2000:],
@@ -256,7 +320,7 @@ def debug_mt5_ipc_test():
             "err_message": parsed["err_message"],
         }
     except subprocess.TimeoutExpired:
-        return {"error": "subprocess timed out after 90s"}
+        return {"error": f"subprocess timed out after {wall_timeout}s"}
     except Exception as exc:
         return {"error": str(exc)}
 

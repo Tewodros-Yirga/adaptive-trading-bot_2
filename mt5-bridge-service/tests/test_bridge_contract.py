@@ -74,4 +74,32 @@ def test_debug_mt5_includes_ipc_diagnostics(monkeypatch, tmp_path):
     assert data["bootstrap"]["ipc_failed"] is True
     assert "attempts_exhausted" in (data["bootstrap"]["ipc_status"] or "")
     assert "mode=portable" in (data["bootstrap"]["context_status"] or "")
+    assert data["bootstrap"]["mt5_ipc_probe_log_exists"] is True
+    assert data["runtime_env"]["mt_login_configured"] is True
+    assert data["runtime_env"]["mt_server_configured"] is True
     assert "mt5-ipc-probe" in data["logs"]
+
+
+def test_debug_mt5_probe_log_missing_reported(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOGDIR", str(tmp_path))
+    client = TestClient(app)
+    res = client.get("/debug/mt5", headers={"X-Bridge-Secret": "bridge_secret_token"})
+    assert res.status_code == 200
+    assert res.json()["bootstrap"]["mt5_ipc_probe_log_exists"] is False
+
+
+def test_wine_mt5_ipc_probe_script_matches_modes():
+    from app.main import _wine_mt5_ipc_probe_script
+
+    bare = _wine_mt5_ipc_probe_script(with_credentials=False, portable=False, timeout_ms=30000)
+    assert "initialize(timeout=30000)" in bare
+    assert "login=" not in bare
+
+    cred = _wine_mt5_ipc_probe_script(with_credentials=True, portable=False, timeout_ms=60000)
+    assert "login=123456" in cred
+    assert "password='secret'" in cred
+    assert "server='Broker-Demo'" in cred
+    assert "portable=True" not in cred
+
+    port = _wine_mt5_ipc_probe_script(with_credentials=True, portable=True, timeout_ms=60000)
+    assert "portable=True" in port
