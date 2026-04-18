@@ -347,11 +347,11 @@ fi
         PROBE_INIT_ARGS="${PROBE_INIT_ARGS}, portable=True"
       fi
       PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
+      PROBE_EXIT=0
       PROBE_OUT=$(
-        timeout --kill-after=10 100 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+        timeout 30 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
           2>&1
-      )
-      PROBE_EXIT=$?
+      ) || PROBE_EXIT=$?
 
       {
         echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] exit=${PROBE_EXIT} output=${PROBE_OUT}"
