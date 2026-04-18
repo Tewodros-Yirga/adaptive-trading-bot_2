@@ -268,24 +268,39 @@ fi
 
   # Fallback dialog dismisser: if a LiveUpdate domain was missed and the
   # "Restart to install" dialog still appears, dismiss it via xdotool.
-  # We activate EVERY visible X11 window (Wine dialogs get their own XID),
-  # click the "Later" position, and send Tab+Return as keyboard fallback.
+  # LiveUpdate is often nested inside the "open an account" wizard; a single
+  # fixed click can miss the focused sub-dialog — try several 1280x720 coords,
+  # prefer "Later" first (avoids restart racing the IPC probe), then Restart.
   (
-    sleep 25
-    for _try in $(seq 1 24); do
-      WINIDS=$(DISPLAY=:99 xdotool search --onlyvisible 2>/dev/null) || WINIDS=""
-      for _wid in ${WINIDS}; do
-        DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true
-        sleep 0.2
-        # Click "Restart" button (x=469 y=335) — installs the update so the
-        # terminal restarts cleanly with no pending updates next time.
-        DISPLAY=:99 xdotool mousemove --clearmodifiers 469 335 click 1 2>/dev/null || true
-        # Keyboard fallback: Tab to "Later", Enter to confirm
-        DISPLAY=:99 xdotool key --clearmodifiers Tab 2>/dev/null || true
+    _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
+    sleep 8
+    for _try in $(seq 1 36); do
+      MT_IDS=$(_xd search --onlyvisible --name MetaTrader)
+      WINIDS=$(_xd search --onlyvisible)
+      ALL_IDS=$(printf '%s\n%s\n' "${MT_IDS}" "${WINIDS}" | awk 'NF' | sort -n -u)
+      for _wid in ${ALL_IDS}; do
+        _xd windowactivate --sync "${_wid}"
+        sleep 0.25
+        for _xy in "560 332" "530 330" "585 338" "469 335" "445 328"; do
+          set -- ${_xy}
+          _xd mousemove --clearmodifiers "$1" "$2" click 1
+          sleep 0.08
+        done
+        _xd key --clearmodifiers alt+l
         sleep 0.1
-        DISPLAY=:99 xdotool key --clearmodifiers Return 2>/dev/null || true
+        _xd key --clearmodifiers Escape
+        sleep 0.1
+        _xd key --clearmodifiers Tab
+        sleep 0.05
+        _xd key --clearmodifiers Tab
+        sleep 0.05
+        _xd key --clearmodifiers Return
       done
-      sleep 10
+      if (( _try <= 18 )); then
+        sleep 5
+      else
+        sleep 10
+      fi
     done
   ) &
 

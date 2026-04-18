@@ -37,7 +37,7 @@ The service starts the terminal (`terminal64.exe` visible in `ps`), yet `mt5.ini
 
 **Fixes applied:**
 - Domain-blocking in `/etc/hosts` (guessed wrong domains initially; actual LiveUpdate CDN domains not yet confirmed)
-- `xdotool` daemon clicking "Restart" every 10s at screen coordinates `(469, 335)`
+- `xdotool` daemon: activate MetaTrader-titled windows first, then a **grid of clicks** (Later-ish coords before Restart) plus `Escape` / `Tab`+`Return` / `Alt+l` fallbacks — LiveUpdate often stacks **inside** the "Select a company to open an account with" wizard, so one fixed `(469, 335)` click can miss the inner dialog entirely
 - Long-term: monthly base image rebuild via GitHub Actions ensures the terminal version is current
 
 ---
