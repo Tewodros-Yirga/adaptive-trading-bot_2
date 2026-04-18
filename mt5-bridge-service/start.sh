@@ -12,7 +12,7 @@ export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.o
 # Keep logs and bootstrap downloads out of /tmp (Render eviction limit).
 export MT5_WORKDIR=${MT5_WORKDIR:-${HOME}/.mt5-work}
 export LOGDIR=${LOGDIR:-${HOME}/.mt5-bridge-logs}
-export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-portable}"
+export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-default}"
 export MT5_CONTEXT_DIR="${MT5_CONTEXT_DIR:-${WINEPREFIX}/drive_c/mt5-data}"
 mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 
@@ -269,8 +269,9 @@ fi
       for _wid in ${WINIDS}; do
         DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true
         sleep 0.2
-        # Click "Later" button at 1280x720 coordinates
-        DISPLAY=:99 xdotool mousemove --clearmodifiers 557 335 click 1 2>/dev/null || true
+        # Click "Restart" button (x=469 y=335) — installs the update so the
+        # terminal restarts cleanly with no pending updates next time.
+        DISPLAY=:99 xdotool mousemove --clearmodifiers 469 335 click 1 2>/dev/null || true
         # Keyboard fallback: Tab to "Later", Enter to confirm
         DISPLAY=:99 xdotool key --clearmodifiers Tab 2>/dev/null || true
         sleep 0.1
@@ -304,18 +305,15 @@ fi
     ATTEMPT=0
     while (( ATTEMPT < MAX_ATTEMPTS )); do
       ATTEMPT=$((ATTEMPT + 1))
-      if ! kill -0 "${TERMINAL_PID}" 2>/dev/null; then
-        echo "failed: terminal_exited_before_ipc_ready" > "${IPC_STATUS_FILE}" 2>/dev/null || true
-        touch "${IPC_FAILED_FILE}" 2>/dev/null || true
-        break
-      fi
+      # Skip the terminal-pid liveness check: the terminal may restart itself
+      # after applying a LiveUpdate. The probe will detect the new process.
 
       # Build the initialize() call for the probe.
       # In portable/data_dir mode the data directory is fresh (no saved account),
       # so bare initialize() always returns False.  Pass credentials so the probe can
       # actually attach and confirm IPC is working.
       PROBE_INIT_ARGS="login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}'"
-      if [[ "${MT5_CONTEXT_MODE:-default}" == "portable" ]]; then
+      if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
         PROBE_INIT_ARGS="${PROBE_INIT_ARGS}, portable=True"
       fi
       PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
