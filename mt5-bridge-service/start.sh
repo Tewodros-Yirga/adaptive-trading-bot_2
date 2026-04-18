@@ -352,10 +352,16 @@ fi
       fi
       PROBE_SCRIPT="import MetaTrader5 as mt5; ok = mt5.initialize(${PROBE_INIT_ARGS}); err = mt5.last_error(); mt5.shutdown(); print(f'ok={ok} err={err}')"
       PROBE_EXIT=0
-      PROBE_OUT=$(
-        timeout 75 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
-          2>&1
-      ) || PROBE_EXIT=$?
+      # Write to a temp FILE not a pipe: if wine is killed by timeout, wineserver
+      # may keep python.exe alive (orphaned) with the stdout pipe still open.
+      # A file avoids that: the shell returns as soon as wine exits, regardless
+      # of orphaned wineserver children.
+      _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}"
+      rm -f "$_PROBE_TMP" 2>/dev/null || true
+      timeout 75 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+        > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
+      PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
+      rm -f "$_PROBE_TMP" 2>/dev/null || true
 
       {
         echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] exit=${PROBE_EXIT} output=${PROBE_OUT}"
