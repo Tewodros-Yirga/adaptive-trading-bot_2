@@ -63,9 +63,11 @@ RUN set -eux; \
     \
     # -- pip install MetaTrader5 + mt5linux -- \
     timeout 300 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir pip || true; \
-    timeout 600 wine "${WINE_PY}" -m pip install --no-cache-dir MetaTrader5 || true; \
-    timeout 600 wine "${WINE_PY}" -m pip install --no-cache-dir "mt5linux>=0.1.9" || true; \
+    timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
+    timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir "mt5linux>=0.1.9" || true; \
     timeout 300 wine "${WINE_PY}" -m pip install --no-cache-dir python-dateutil || true; \
+    wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
+      || echo "WARNING: MetaTrader5 verification failed"; \
     wine "${WINE_PY}" -c "import mt5linux; print('mt5linux OK')" \
       || echo "WARNING: mt5linux verification failed"; \
     \
