@@ -362,8 +362,6 @@ fi
     echo "[mt5-probe] Bounded find result: '${FOUND_PYTHON}'" >&2
   fi
 
-  # Enable xtrace so every command appears in the wrapper log for debugging.
-  set -x
   if [[ -z "$FOUND_PYTHON" ]] || [[ ! -f "$FOUND_PYTHON" ]]; then
     echo "[mt5-terminal] Could not find Wine python.exe for IPC probe." >&2
     echo "failed: python_not_found" > "${IPC_STATUS_FILE}" 2>/dev/null || true
@@ -389,7 +387,7 @@ fi
       fi
       PROBE_SCRIPT=$(cat <<PYEOF
 import MetaTrader5 as mt5
-ok = mt5.initialize(timeout=45000${PROBE_PORTABLE_ARG})
+ok = mt5.initialize(timeout=10000${PROBE_PORTABLE_ARG})
 err = mt5.last_error()
 mode = "bare"
 if not ok:
