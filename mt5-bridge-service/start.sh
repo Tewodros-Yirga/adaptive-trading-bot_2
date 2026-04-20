@@ -12,7 +12,7 @@ export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.o
 # Keep logs and bootstrap downloads out of /tmp (Render eviction limit).
 export MT5_WORKDIR=${MT5_WORKDIR:-${HOME}/.mt5-work}
 export LOGDIR=${LOGDIR:-${HOME}/.mt5-bridge-logs}
-export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-default}"
+export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-portable}"
 export MT5_CONTEXT_DIR="${MT5_CONTEXT_DIR:-${WINEPREFIX}/drive_c/mt5-data}"
 mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 
@@ -391,7 +391,7 @@ ok = mt5.initialize(timeout=10000${PROBE_PORTABLE_ARG})
 err = mt5.last_error()
 mode = "bare"
 if not ok:
-    ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=60000${PROBE_PORTABLE_ARG})
+    ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=50000${PROBE_PORTABLE_ARG})
     err = mt5.last_error()
     mode = "creds"
 mt5.shutdown()
