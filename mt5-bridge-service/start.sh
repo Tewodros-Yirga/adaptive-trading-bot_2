@@ -367,6 +367,15 @@ fi
     echo "failed: python_not_found" > "${IPC_STATUS_FILE}" 2>/dev/null || true
     touch "${IPC_FAILED_FILE}" 2>/dev/null || true
   else
+    # Upgrade the MetaTrader5 Python package to match the running terminal build.
+    # The pre-baked package (5.0.5735) is mismatched with terminal build 5800:
+    # the IPC handshake protocol changed between builds, causing a -10005 loop
+    # even though the IPC IS connecting (confirmed by +file NtReadFile/NtWriteFile trace).
+    echo "[mt5-probe] Upgrading MetaTrader5 package to match terminal build..." >&2
+    WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
+      --upgrade MetaTrader5 --quiet 2>&1 | tail -3 >&2 || true
+    echo "[mt5-probe] MetaTrader5 package after upgrade: $(WINEDEBUG="-all" timeout 20 "$WINE_CMD" "$FOUND_PYTHON" -c "import MetaTrader5 as m; print(getattr(m,'__version__','?'))" 2>/dev/null || echo 'unknown')" >&2
+
     # Probe MT5 IPC readiness using direct Wine Python initialize() calls.
     MAX_ATTEMPTS=40
     SLEEP_SECONDS=5
