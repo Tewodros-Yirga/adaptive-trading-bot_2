@@ -34,6 +34,60 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compute build mode (slim vs baked)
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EVENT_NAME="${{ github.event_name }}"
+          INPUT_URL="${{ github.event.inputs.mt5_url || '' }}"
+          SECRET_URL="${{ secrets.MT5_INSTALLER_URL || '' }}"
+
+          # We only bake MT5 into the image on schedule/manual runs.
+          # Push builds must NEVER overwrite the baked `latest` tag.
+          HAS_MT5="false"
+          MT5_URL=""
+          PUBLISH_LATEST="false"
+          PUBLISH_SLIM="false"
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" || "${EVENT_NAME}" == "schedule" ]]; then
+            MT5_URL="${INPUT_URL:-${SECRET_URL}}"
+            if [[ -n "${MT5_URL}" ]]; then
+              HAS_MT5="true"
+              PUBLISH_LATEST="true"
+            fi
+          fi
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            PUBLISH_SLIM="true"
+          fi
+
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          TAGS=()
+          # Always publish a sha tag for traceability.
+          TAGS+=("${IMAGE}:sha-${{ github.sha }}")
+          if [[ "${PUBLISH_SLIM}" == "true" ]]; then
+            TAGS+=("${IMAGE}:slim")
+          fi
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            TAGS+=("${IMAGE}:latest")
+          fi
+
+          echo "event_name=${EVENT_NAME}"
+          echo "has_mt5=${HAS_MT5}"
+          echo "publish_slim=${PUBLISH_SLIM}"
+          echo "publish_latest=${PUBLISH_LATEST}"
+          echo "mt5_url_present=$([[ -n "${MT5_URL}" ]] && echo true || echo false)"
+
+          {
+            echo "has_mt5=${HAS_MT5}"
+            echo "mt5_url=${MT5_URL}"
+            echo "tags<<EOF"
+            printf "%s\n" "${TAGS[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -44,22 +98,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
-
       # Pre-download installers on the runner (fast internet) so Dockerfile can
       # COPY them in — avoids slow/broken apt mirrors inside Docker on GHA runners.
       - name: Download installers to build context
+        env:
+          MT5_URL: ${{ steps.mode.outputs.mt5_url }}
         run: |
           set -eux
           PYTHON_URL="https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe"
-          MT5_URL="${{ github.event.inputs.mt5_url || secrets.MT5_INSTALLER_URL || '' }}"
 
           echo "Downloading Windows Python installer..."
           curl -fsSL --retry 5 --retry-delay 5 --max-time 300 \
@@ -81,10 +127,9 @@ jobs:
         with:
           context: ./mt5-bridge-base
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.mode.outputs.tags }}
           build-args: |
-            HAS_MT5=${{ github.event.inputs.mt5_url != '' || 'false' }}
+            HAS_MT5=${{ steps.mode.outputs.has_mt5 }}
           # Cache layers in GitHub's cache for faster rebuilds.
           cache-from: type=gha
           cache-to: type=gha,mode=max

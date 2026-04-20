@@ -133,7 +133,16 @@ Passing `path="C:\..."` to `MetaTrader5.initialize()` tells the module to look f
 ## Deployment
 
 ### Build and push base image
-Triggered automatically by GitHub Actions on push to `main` when files under `mt5-bridge-base/` change.
+GitHub Actions publishes **two** base-image flavors to GHCR:
+
+- **Slim (no MT5 terminal baked in)**: built on **push** to `main`
+  - Tags: `:slim` and `:sha-<commit>`
+  - Purpose: fast iteration on base-layer changes without risking overwriting the baked `:latest`.
+- **Baked (MT5 terminal included)**: built on **schedule** (monthly) or **manual dispatch**
+  - Tags: `:latest` and `:sha-<commit>`
+  - Purpose: keep a fresh MT5 terminal baked in so cold starts are fast and LiveUpdate dialogs are minimized.
+
+Important: **push builds do not publish `:latest`**.
 
 ### Push bridge service to HF Spaces
 ```powershell
@@ -151,6 +160,18 @@ git -C g:\adaptive-trading-bot branch -D hf-deploy-branch
 ```
 https://loriloha-mt5-bridge-service.hf.space
 ```
+
+---
+
+## Runtime MT5 install fallback (HF Spaces)
+
+If HF ever deploys a base image **without** a baked terminal (or the terminal path is missing), the container can still recover by downloading and installing MT5 at runtime via `bootstrap-mt5.sh`.
+
+Set this **secret** env var in the Space settings:
+
+- `MT5_INSTALLER_URL`: direct URL to `mt5setup.exe` (used only when the terminal isn’t already present)
+
+Then restart/redeploy the Space. Once installed, `bootstrap-mt5.sh` will write `mt5_terminal.ready` and `start.sh` can launch `terminal64.exe` and begin IPC probing.
 
 ---
 
