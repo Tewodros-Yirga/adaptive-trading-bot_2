@@ -386,35 +386,24 @@ fi
         PROBE_PORTABLE_ARG=", portable=True"
       fi
       PROBE_SCRIPT=$(cat <<PYEOF
-import MetaTrader5 as mt5, sys
-# Strategy 1: explicit path + bare (bypasses process-scan; direct IPC addr)
-TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
+import MetaTrader5 as mt5
+# Log package version — mismatch with terminal build causes protocol loop.
 try:
-    ok = mt5.initialize(path=TERM_PATH, timeout=10000${PROBE_PORTABLE_ARG})
+    mt5_ver = getattr(mt5, '__version__', 'unknown')
+except Exception:
+    mt5_ver = 'error'
+# Single comprehensive call with a long timeout.
+# The +file trace confirmed IPC IS connected and exchanging data;
+# the protocol may simply need more time to complete.
+TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
+ok = False
+try:
+    ok = mt5.initialize(path=TERM_PATH, login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=90000${PROBE_PORTABLE_ARG})
 except Exception as _e:
     ok = False
 err = mt5.last_error()
-mode = 'path+bare'
-# Strategy 2: explicit path + credentials
-if not ok:
-    mt5.shutdown()
-    try:
-        ok = mt5.initialize(path=TERM_PATH, login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=25000${PROBE_PORTABLE_ARG})
-    except Exception as _e:
-        ok = False
-    err = mt5.last_error()
-    mode = 'path+creds'
-# Strategy 3: credentials only (original, no explicit path)
-if not ok:
-    mt5.shutdown()
-    try:
-        ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=25000${PROBE_PORTABLE_ARG})
-    except Exception as _e:
-        ok = False
-    err = mt5.last_error()
-    mode = 'creds'
 mt5.shutdown()
-print(f'mode={mode} ok={ok} err={err}')
+print(f'mt5_pkg={mt5_ver} ok={ok} err={err}')
 PYEOF
 )
       PROBE_EXIT=0
@@ -429,7 +418,7 @@ PYEOF
       # so +pipe shows nothing — +file captures the actual open attempts.
       _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}"
       rm -f "$_PROBE_TMP" 2>/dev/null || true
-      WINEDEBUG="+file" timeout 75 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+      WINEDEBUG="-all" timeout 100 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
         > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
       PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
       rm -f "$_PROBE_TMP" 2>/dev/null || true
