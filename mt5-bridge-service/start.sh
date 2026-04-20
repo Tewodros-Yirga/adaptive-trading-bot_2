@@ -399,13 +399,17 @@ print(f"mode={mode} ok={ok} err={err}")
 PYEOF
 )
       PROBE_EXIT=0
-      # Write to a temp FILE not a pipe: if wine is killed by timeout, wineserver
-      # may keep python.exe alive (orphaned) with the stdout pipe still open.
-      # A file avoids that: the shell returns as soon as wine exits, regardless
-      # of orphaned wineserver children.
+      # Kill any orphaned wine python probe processes from prior attempts.
+      # When `timeout 75` kills the wine loader, python.exe in wineserver
+      # survives as an orphan still holding the MT5 IPC pipe open.
+      # That causes ERROR_PIPE_BUSY → instant -10005 for the next attempt.
+      pkill -f "mt5\\.initialize" 2>/dev/null || true
+      sleep 2
+      # Write to a temp FILE (not a pipe) to avoid blocking on Wine orphans.
+      # Use WINEDEBUG=+pipe to capture pipe-level trace for diagnostics.
       _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}"
       rm -f "$_PROBE_TMP" 2>/dev/null || true
-      timeout 75 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+      WINEDEBUG="+pipe" timeout 75 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
         > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
       PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
       rm -f "$_PROBE_TMP" 2>/dev/null || true
