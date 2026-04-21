@@ -387,6 +387,40 @@ fi
     echo "[mt5-probe] MetaTrader5 package after upgrade: $(cat "${_VER_TMP}" 2>/dev/null || echo 'unknown')" >&2
     rm -f "${_VER_TMP}" 2>/dev/null || true
 
+    # -----------------------------------------------------------------------
+    # Gate: wait for MT5 IPC pipe to actually exist before probing.
+    # On cold starts MT5 may be compiling/updating; IPC pipes can appear late.
+    # -----------------------------------------------------------------------
+    _PIPE_STATUS_TMP="/tmp/mt5-pipe-status-$$"
+    _pipe_has_any() {
+      # Returns 0 when \\.\pipe\ has any entries beyond the header.
+      # Wine's `dir \\.\pipe\` prints a header even when empty.
+      timeout 10 "$WINE_CMD" cmd /c "dir \\\\.\\pipe\\\\" 2>/dev/null \
+        | tr -d '\r' \
+        | awk '
+            BEGIN{found=0}
+            /^\\s*Directory of \\\\.\\\\pipe\\\\/ {next}
+            /^\\s*Volume in drive/ {next}
+            /^\\s*Volume Serial Number/ {next}
+            /^\\s*File Not Found/ {next}
+            /^[[:space:]]*$/ {next}
+            {found=1}
+            END{exit(found?0:1)}
+          '
+    }
+
+    PIPE_WAITED=0
+    PIPE_MAX=600   # 10 minutes
+    while (( PIPE_WAITED < PIPE_MAX )); do
+      if _pipe_has_any; then
+        echo "[mt5-probe] Detected one or more Wine named pipes (\\.\pipe\\). Proceeding with IPC probe." >&2
+        break
+      fi
+      echo "waiting: mt5_pipe_absent elapsed=${PIPE_WAITED}s" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      sleep 5
+      PIPE_WAITED=$((PIPE_WAITED + 5))
+    done
+
     # Enable xtrace from here so every probe command is visible in the wrapper log.
     # This lets us pinpoint exactly which line fails in the probe loop.
     set -x
@@ -409,6 +443,9 @@ fi
       if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
         PROBE_PORTABLE_ARG=", portable=True"
       fi
+      # IMPORTANT: disable xtrace while constructing the probe script because it
+      # contains credentials; we never want those echoed into logs.
+      { set +x; } 2>/dev/null || true
       PROBE_SCRIPT=$(cat <<PYEOF
 import MetaTrader5 as mt5
 try:
@@ -439,6 +476,7 @@ mt5.shutdown()
 print(f'mt5_pkg={mt5_ver} mode={mode} ok={ok} err={err}')
 PYEOF
 )
+      set -x
       PROBE_EXIT=0
       # Kill any orphaned wine python probe processes from prior attempts.
       # When `timeout 75` kills the wine loader, python.exe in wineserver
