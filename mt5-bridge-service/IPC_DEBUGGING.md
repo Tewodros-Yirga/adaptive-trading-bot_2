@@ -100,15 +100,49 @@ The `|| PROBE_EXIT=$?` suppresses `set -e` and captures the real exit code.
 
 ---
 
-### 7. Probe loop still not running (under investigation)
+### 7. Probe loop stalled by Wine pipe hang (root cause confirmed)
 
-**Current symptoms:**
-- Wrapper log ends at `[mt5-probe] Using prebaked path: ...`
-- `mt5-ipc-probe.log` remains empty after 10+ minutes
-- No `timeout`/`wine python.exe -c ...` process visible in `ps`
-- `ipc_status` stays `pending`
+**Previous symptom:** Wrapper log ended at `[mt5-probe] Using prebaked path: ...`; `mt5-ipc-probe.log` stayed empty.
 
-**`set -x` xtrace added** to the probe section — every executed command is now logged to the wrapper log. The next deployment will reveal the exact line that fails.
+**Root cause confirmed:** `start.sh` line 375 used a pipe:
+```bash
+timeout 120 wine python.exe -m pip install ... 2>&1 | tail -3 >&2
+```
+`timeout 120` sends SIGTERM to the `wine` loader, but **wineserver survives** holding its end of the pipe open.
+`tail -3 >&2` blocks indefinitely waiting for EOF on stdin.
+`set +euo pipefail` suppresses the hang — it looks like the script stopped, but it is actually frozen in `tail`.
+The entire probe section never runs.
+
+**Fix applied:**
+```bash
+# Write pip output to a temp FILE; read it after Wine exits — no hanging pipe.
+_PIP_TMP="/tmp/mt5-pip-upgrade-$$"
+timeout 120 wine python.exe -m pip install ... > "${_PIP_TMP}" 2>&1 || true
+tail -5 "${_PIP_TMP}" >&2 2>/dev/null || true
+rm -f "${_PIP_TMP}" 2>/dev/null || true
+```
+
+- **`set -x` xtrace** added immediately after pip upgrade (before probe loop) so every executed command appears in the wrapper log.
+
+---
+
+### 8. `MT5_CONTEXT_MODE` default regressed back to `portable`
+
+**Symptom:** Start.sh line 15 still had `portable` as the default, even though Issue #4 documented this was the cause of the wizard-blocking IPC failure.
+
+**Root cause:** The fix was documented but never committed.
+
+**Fix applied:** `start.sh` line 15 changed from `portable` → `default`.
+
+---
+
+### 9. `mt5_adapter.py` — `terminal_exe` undefined variable (latent `NameError`)
+
+**Symptom:** `self._resolve_terminal_exe()` return value was discarded at line 136, then `path=terminal_exe` on line 162 would raise `NameError` if ever reached.
+
+**Root cause:** Refactor left the call without capturing the return.
+
+**Fix applied:** Changed to `terminal_exe = self._resolve_terminal_exe()`.
 
 ---
 
@@ -143,13 +177,13 @@ Xvfb :99 starts (1280×720)
 
 ## Open Questions
 
-1. **Does the probe loop start at all?** The `set -x` trace in the next deployment will answer this definitively.
+1. **Does `xdotool + openbox` successfully click the LiveUpdate dialogs?** The coordinate bands added in `start.sh` cover both the old wizard-nested layout and the newer centered LiveUpdate panel. First clean-log test still pending.
 
-2. **Does `xdotool + openbox` successfully click "Restart"?** The coordinates `(469, 335)` are derived from screenshot analysis at 1280×720. First confirmed test pending.
+2. **Is the MetaQuotes demo session still valid?** The session is pre-baked in the base image. If expired, the terminal shows a login dialog, IPC is unavailable. A base image rebuild would fix this.
 
-3. **Is the MetaQuotes demo session still valid?** The session is pre-baked in the base image. If expired, the terminal shows a login dialog, IPC is unavailable. A base image rebuild would fix this.
+3. **Do we still need domain-blocking?** With `MT5_CONTEXT_MODE=default` and a fresh base image, the terminal auto-connects from baked AppData. If LiveUpdate still downloads, the domain-list in `start.sh` should cover it. Confirm via `tcpdump` or by checking the wrapper log for xdotool activity.
 
-4. **Do the correct LiveUpdate domains need to be blocked?** Need to capture actual outbound connections (e.g., via `tcpdump` or `ss`) to identify the real CDN/hostnames used by LiveUpdate.
+4. **HF Space 404:** The Space returned a Hugging Face 404 HTML page (not a FastAPI 404). The Space is sleeping or failed to boot. Push the fixes in this commit to trigger a redeploy.
 
 ---
 

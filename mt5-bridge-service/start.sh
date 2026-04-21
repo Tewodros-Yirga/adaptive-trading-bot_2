@@ -12,7 +12,7 @@ export PYTHON_WIN_INSTALLER_URL=${PYTHON_WIN_INSTALLER_URL:-https://www.python.o
 # Keep logs and bootstrap downloads out of /tmp (Render eviction limit).
 export MT5_WORKDIR=${MT5_WORKDIR:-${HOME}/.mt5-work}
 export LOGDIR=${LOGDIR:-${HOME}/.mt5-bridge-logs}
-export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-portable}"
+export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-default}"
 export MT5_CONTEXT_DIR="${MT5_CONTEXT_DIR:-${WINEPREFIX}/drive_c/mt5-data}"
 mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 
@@ -372,9 +372,24 @@ fi
     # the IPC handshake protocol changed between builds, causing a -10005 loop
     # even though the IPC IS connecting (confirmed by +file NtReadFile/NtWriteFile trace).
     echo "[mt5-probe] Upgrading MetaTrader5 package to match terminal build..." >&2
+    # Write to a temp FILE (not a pipe) — piping through `tail` keeps the pipe
+    # open when `timeout` kills the Wine loader but wineserver survives, causing
+    # `tail` to block indefinitely and silently stall the entire probe section.
+    _PIP_TMP="/tmp/mt5-pip-upgrade-$$"
     WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
-      --upgrade MetaTrader5 --quiet 2>&1 | tail -3 >&2 || true
-    echo "[mt5-probe] MetaTrader5 package after upgrade: $(WINEDEBUG="-all" timeout 20 "$WINE_CMD" "$FOUND_PYTHON" -c "import MetaTrader5 as m; print(getattr(m,'__version__','?'))" 2>/dev/null || echo 'unknown')" >&2
+      --upgrade MetaTrader5 --quiet > "${_PIP_TMP}" 2>&1 || true
+    tail -5 "${_PIP_TMP}" >&2 2>/dev/null || true
+    rm -f "${_PIP_TMP}" 2>/dev/null || true
+    _VER_TMP="/tmp/mt5-ver-$$"
+    WINEDEBUG="-all" timeout 20 "$WINE_CMD" "$FOUND_PYTHON" \
+      -c "import MetaTrader5 as m; print(getattr(m,'__version__','?'))" \
+      > "${_VER_TMP}" 2>&1 || true
+    echo "[mt5-probe] MetaTrader5 package after upgrade: $(cat "${_VER_TMP}" 2>/dev/null || echo 'unknown')" >&2
+    rm -f "${_VER_TMP}" 2>/dev/null || true
+
+    # Enable xtrace from here so every probe command is visible in the wrapper log.
+    # This lets us pinpoint exactly which line fails in the probe loop.
+    set -x
 
     # Probe MT5 IPC readiness using direct Wine Python initialize() calls.
     MAX_ATTEMPTS=40

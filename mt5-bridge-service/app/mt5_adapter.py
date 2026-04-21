@@ -133,7 +133,7 @@ class MT5Adapter:
         # Reset per-attempt resolution cache so we re-check the sentinel file
         # (bootstrap may have installed the terminal since the last attempt).
         self._resolved_terminal_exe = None
-        self._resolve_terminal_exe()
+        terminal_exe = self._resolve_terminal_exe()
 
         self._connect_attempts += 1
         backoff = min(self._retry_backoff(), _MAX_RETRY_INTERVAL)
