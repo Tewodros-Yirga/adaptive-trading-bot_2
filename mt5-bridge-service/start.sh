@@ -514,27 +514,18 @@ except Exception:
     mt5_ver = 'error'
 TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
 PORTABLE = (os.environ.get('MT5_CONTEXT_MODE', 'default').lower() == 'portable')
-LOGIN_RAW = os.environ.get('MT_LOGIN', '')
-try:
-    LOGIN = int(LOGIN_RAW)
-except Exception:
-    LOGIN = LOGIN_RAW
-PASSWORD = os.environ.get('MT_PASSWORD', '')
-SERVER = os.environ.get('MT_SERVER', '')
 # Attach strategy:
 # 1) bare_no_path  -> best for discovering any running terminal instance
 # 2) bare_path     -> fallback for explicit terminal path
-# 3) creds_no_path -> auth attach if bare failed
-# 4) creds_path    -> final fallback
 # This avoids path-pipe mismatches that can cause endless -10005 loops.
+# NOTE: readiness probe intentionally avoids credentialed initialize() calls
+# to prevent long broker-auth waits. Account auth is handled by the adapter.
 ok = False
 err = None
 mode = 'none'
 attempts = [
     ('bare_no_path', {'timeout': 5000, 'portable': PORTABLE}),
     ('bare_path', {'path': TERM_PATH, 'timeout': 5000, 'portable': PORTABLE}),
-    ('creds_no_path', {'login': LOGIN, 'password': PASSWORD, 'server': SERVER, 'timeout': 90000, 'portable': PORTABLE}),
-    ('creds_path', {'path': TERM_PATH, 'login': LOGIN, 'password': PASSWORD, 'server': SERVER, 'timeout': 90000, 'portable': PORTABLE}),
 ]
 for _mode, _kwargs in attempts:
     try:
