@@ -289,9 +289,15 @@ INI
   _mt5_precfg "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"
   unset -f _mt5_precfg
 
-  echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
-  "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
-  TERMINAL_PID=$!
+  _launch_terminal() {
+    echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
+    "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
+    TERMINAL_PID=$!
+    echo "[mt5-terminal] terminal pid=${TERMINAL_PID}"
+  }
+  _launch_terminal
+  IPC_TIMEOUT_STREAK=0
+  IPC_RESTART_COUNT=0
 
   # Fallback dialog dismisser: if a LiveUpdate domain was missed and the
   # "Restart to install" dialog still appears, dismiss it via xdotool.
@@ -551,6 +557,22 @@ PYEOF
         echo "ready: attempt=${ATTEMPT} ${PROBE_SUMMARY}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
         touch "${IPC_READY_FILE}" 2>/dev/null || true
         break
+      fi
+
+      if [[ "${PROBE_SUMMARY}" == *"-10005"* ]]; then
+        IPC_TIMEOUT_STREAK=$((IPC_TIMEOUT_STREAK + 1))
+      else
+        IPC_TIMEOUT_STREAK=0
+      fi
+      if (( IPC_TIMEOUT_STREAK >= 6 && IPC_RESTART_COUNT < 2 )); then
+        IPC_RESTART_COUNT=$((IPC_RESTART_COUNT + 1))
+        IPC_TIMEOUT_STREAK=0
+        echo "[mt5-terminal] restarting terminal after repeated -10005 (restart=${IPC_RESTART_COUNT})" \
+          >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+        kill "${TERMINAL_PID}" 2>/dev/null || true
+        sleep 2
+        _launch_terminal
+        sleep 5
       fi
 
       echo "waiting: attempt=${ATTEMPT} ${PROBE_SUMMARY}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
