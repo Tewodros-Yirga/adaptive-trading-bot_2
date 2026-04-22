@@ -511,7 +511,7 @@ try:
 except Exception:
     mt5_ver = 'error'
 TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
-PORTABLE = (os.environ.get('MT5_CONTEXT_MODE', 'default').lower() == 'portable')
+PORTABLE = (os.environ.get('PROBE_PORTABLE', '0') == '1')
 MODE = os.environ.get('PROBE_MODE', 'bare_no_path')
 kwargs = {'timeout': 5000, 'portable': PORTABLE}
 if MODE == 'bare_path':
@@ -529,7 +529,13 @@ PYEOF
       set -x
       PROBE_OK=0
       PROBE_SUMMARY="none"
-      for PROBE_MODE in bare_no_path bare_path; do
+      if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
+        PROBE_PORTABLE_VALUES=(1 0)
+      else
+        PROBE_PORTABLE_VALUES=(0 1)
+      fi
+      for PROBE_PORTABLE in "${PROBE_PORTABLE_VALUES[@]}"; do
+        for PROBE_MODE in bare_no_path bare_path; do
         PROBE_EXIT=0
         # Kill orphaned Wine-side python.exe from the previous probe.
         # wine taskkill targets ONLY the Windows process — it does NOT kill
@@ -537,18 +543,22 @@ PYEOF
         WINEDEBUG="-all" "${WINE_CMD}" taskkill /F /IM python.exe > /dev/null 2>&1 || true
         pkill -f "wine.*python.*-c" > /dev/null 2>&1 || true
         sleep 1
-        _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}-${PROBE_MODE}"
+        _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}-${PROBE_MODE}-p${PROBE_PORTABLE}"
         rm -f "$_PROBE_TMP" 2>/dev/null || true
-        PROBE_MODE="${PROBE_MODE}" WINEDEBUG="-all" timeout 35 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+        PROBE_MODE="${PROBE_MODE}" PROBE_PORTABLE="${PROBE_PORTABLE}" WINEDEBUG="-all" timeout 35 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
           > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
         PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
         rm -f "$_PROBE_TMP" 2>/dev/null || true
-        PROBE_SUMMARY="mode=${PROBE_MODE} exit=${PROBE_EXIT} output=${PROBE_OUT}"
+        PROBE_SUMMARY="portable=${PROBE_PORTABLE} mode=${PROBE_MODE} exit=${PROBE_EXIT} output=${PROBE_OUT}"
         {
           echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] ${PROBE_SUMMARY}"
         } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
         if [[ "$PROBE_OUT" == *"ok=True"* ]]; then
           PROBE_OK=1
+          break
+        fi
+        done
+        if [[ "${PROBE_OK}" -eq 1 ]]; then
           break
         fi
       done
