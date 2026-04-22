@@ -38,8 +38,17 @@ if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
   exit 1
 fi
 
+# A window manager is required for reliable focus/input delivery to Wine dialogs.
+if command -v openbox >/dev/null 2>&1; then
+  DISPLAY="${DISPLAY}" openbox --sm-disable > "${LOGDIR}/openbox.log" 2>&1 &
+  OPENBOX_PID=$!
+else
+  OPENBOX_PID=""
+fi
+
 cleanup() {
   kill "${TERM_PID:-}" 2>/dev/null || true
+  kill "${OPENBOX_PID:-}" 2>/dev/null || true
   kill "${XVFB_PID:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -48,7 +57,48 @@ wine "${TERM_EXE}" > "${LOGDIR}/terminal.log" 2>&1 &
 TERM_PID=$!
 sleep 8
 
+# Best-effort dialog dismisser for LiveUpdate/first-run wizards that block IPC.
+(
+  if ! command -v xdotool >/dev/null 2>&1; then
+    exit 0
+  fi
+  _xd() { DISPLAY="${DISPLAY}" xdotool "$@" 2>/dev/null || true; }
+  sleep 5
+  for _ in $(seq 1 90); do
+    IDS=$(
+      { _xd search --onlyvisible --name LiveUpdate;
+        _xd search --onlyvisible --name "Select a company";
+        _xd search --onlyvisible --name "Welcome to";
+        _xd search --onlyvisible --name "MetaTrader 5";
+      } | awk 'NF' | sort -n -u
+    )
+    for wid in ${IDS}; do
+      _xd windowactivate --sync "${wid}"
+      sleep 0.2
+      # Click common button/list locations.
+      for xy in "400 245" "520 402" "638 418" "724 488" "640 520"; do
+        set -- ${xy}
+        _xd mousemove --clearmodifiers "$1" "$2" click 1
+        sleep 0.08
+      done
+      _xd key --window "${wid}" --clearmodifiers Return
+      _xd key --window "${wid}" --clearmodifiers Escape
+    done
+    sleep 3
+  done
+) &
+
 for attempt in $(seq 1 20); do
+  WIN_TITLES=""
+  if command -v xdotool >/dev/null 2>&1; then
+    WIN_TITLES=$(
+      DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
+        | while IFS= read -r wid; do
+            DISPLAY="${DISPLAY}" xdotool getwindowname "${wid}" 2>/dev/null || true
+          done | paste -sd'|' - 2>/dev/null
+    ) || WIN_TITLES=""
+  fi
+  echo "[attempt ${attempt}] windows=${WIN_TITLES}"
   for mode in default portable; do
     PORTABLE_FLAG="False"
     if [[ "${mode}" == "portable" ]]; then
@@ -78,4 +128,12 @@ print(f'ok={ok} portable={portable} err={err}')
 done
 
 echo "SMOKE TEST FAIL: IPC attach never succeeded"
+echo "--- terminal.log (tail) ---"
+tail -n 200 "${LOGDIR}/terminal.log" 2>/dev/null || true
+echo "--- xvfb.log (tail) ---"
+tail -n 100 "${LOGDIR}/xvfb.log" 2>/dev/null || true
+if [[ -n "${OPENBOX_PID}" ]]; then
+  echo "--- openbox.log (tail) ---"
+  tail -n 100 "${LOGDIR}/openbox.log" 2>/dev/null || true
+fi
 exit 1
