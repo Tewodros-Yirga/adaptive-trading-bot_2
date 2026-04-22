@@ -16,6 +16,20 @@ export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-default}"
 export MT5_CONTEXT_DIR="${MT5_CONTEXT_DIR:-${WINEPREFIX}/drive_c/mt5-data}"
 mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 
+# ── Block MT5 LiveUpdate domains NOW — before Xvfb/Wine process any DNS ──────
+# Must run here (before any subprocess) so the terminal binary never resolves
+# update CDNs on startup. Covers the original set plus extra domains.
+for _d in \
+  live.mql5.com updates.mql5.com update.mql5.com \
+  download.mql5.com cdn.mql5.com ec.mql5.com files.mql5.com \
+  www.mql5.com mql5.com \
+  update.metatrader5.com updates.metatrader5.com \
+  mt5-update.metaquotes.net metaquotes.net; do
+  grep -qF "${_d}" /etc/hosts 2>/dev/null || \
+    echo "0.0.0.0 ${_d}" >> /etc/hosts 2>/dev/null || true
+done
+unset _d
+
 # Render free-tier limits /tmp to ~2GB. Some Wine/MT5 output is redirected to
 # `/tmp/mt5-launch-wrapper.log`, so symlink it into our persistent LOGDIR.
 rm -f /tmp/mt5-launch-wrapper.log > /dev/null 2>&1 || true
@@ -248,19 +262,32 @@ fi
       echo "[mt5-terminal] MT5_CONTEXT_MODE=${MT5_CONTEXT_MODE:-unset}; using default (AppData) mode"
       ;;
   esac
-  # Block MT5 LiveUpdate servers so the update is never downloaded in the
-  # first place. Even /noupdate doesn't prevent the download; blocking the
-  # domain at the OS level is the most reliable approach.
-  for _domain in live.mql5.com updates.mql5.com update.mql5.com www.mql5.com \
-                 update.metatrader5.com updates.metatrader5.com \
-                 mt5-update.metaquotes.net metaquotes.net; do
-    echo "0.0.0.0 ${_domain}" >> /etc/hosts 2>/dev/null || true
-  done
-
-  # Note: /noupdate is NOT a valid terminal64.exe flag (verified against MT5 docs).
-  # The update is handled via domain-blocking in /etc/hosts above and by rebuilding
-  # the base image monthly so the baked-in version stays current.
+  # MT5 update-domain blocking is done at the top of start.sh (before Xvfb),
+  # so the terminal never resolves update CDN domains on startup.
+  # Note: /noupdate is NOT a valid terminal64.exe argument.
   echo "mode=${MT5_CONTEXT_MODE}; exe=${TERMINAL_EXE}; args=${CONTEXT_ARGS[*]:-(none)}" > "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
+
+  # Pre-write MT5 server config so the terminal can skip the "Select a company"
+  # first-run wizard and proceed to a Login screen instead.
+  # The Login screen responds to mt5.initialize(login,password,server) over IPC;
+  # the company-selection wizard does NOT. Password is NOT stored here (MT5
+  # encrypts it; plaintext is ignored) — it is injected by mt5.initialize().
+  _mt5_precfg() {
+    local _d="$1"
+    mkdir -p "${_d}" 2>/dev/null || return
+    [[ -f "${_d}/common.ini" ]] && return          # don't clobber existing cfg
+    cat > "${_d}/common.ini" <<INI
+[Common]
+Login=${MT_LOGIN}
+Server=${MT_SERVER}
+NewsEnable=0
+AutoSync=0
+INI
+    echo "[mt5-terminal] Pre-wrote server config → ${_d}/common.ini"
+  }
+  _mt5_precfg "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config"
+  _mt5_precfg "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"
+  unset -f _mt5_precfg
 
   echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
   "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
@@ -276,7 +303,7 @@ fi
     _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
     _uniq_ids() { awk 'NF' | sort -n -u; }
     sleep 8
-    for _try in $(seq 1 48); do
+    for _try in $(seq 1 120); do
       LIVE_IDS=$(
         { _xd search --onlyvisible --name LiveUpdate
           _xd search --onlyvisible --name "Welcome to"
@@ -286,6 +313,8 @@ fi
         { _xd search --onlyvisible --name "Select a company"
           _xd search --onlyvisible --name "open an account"
           _xd search --onlyvisible --name "MetaTrader 5"
+          _xd search --onlyvisible --name "MetaTrader"
+          _xd search --onlyvisible --name "Setup"
         } | _uniq_ids
       )
       WINIDS=$(_xd search --onlyvisible | _uniq_ids)
@@ -293,17 +322,28 @@ fi
       for _wid in ${ALL_IDS}; do
         _xd windowactivate --sync "${_wid}"
         sleep 0.25
-        # Centered LiveUpdate: hit Later/Restart band, then legacy wizard coords.
+        # Click bands: LiveUpdate Restart/Later rows, legacy wizard Next rows,
+        # and first-run broker-list item rows (critical: Next is disabled until
+        # a company is selected from the list).
         for _xy in \
           "548 418" "638 418" "728 418" \
           "520 402" "600 428" "700 428" \
           "560 332" "530 330" "585 338" \
           "469 335" "445 328" \
-          "724 488" "644 488" "972 183"; do
+          "724 488" "644 488" "972 183" \
+          "400 210" "500 210" "640 210" \
+          "400 245" "500 245" "640 245" \
+          "400 275" "500 275" "640 275" \
+          "640 520" "700 520" "640 540"; do
           set -- ${_xy}
           _xd mousemove --clearmodifiers "$1" "$2" click 1
-          sleep 0.08
+          sleep 0.06
         done
+        # Double-click on first broker list item to select + activate it.
+        _xd mousemove --clearmodifiers "400" "245" click 1
+        sleep 0.05
+        _xd mousemove --clearmodifiers "400" "245" click 1
+        sleep 0.1
         # Keystrokes scoped to this X window (avoids firing on wrong stack order).
         _xd key --window "${_wid}" --clearmodifiers Escape
         sleep 0.1
@@ -316,12 +356,22 @@ fi
         _xd key --window "${_wid}" --clearmodifiers Tab
         sleep 0.06
         _xd key --window "${_wid}" --clearmodifiers Return
+        sleep 0.06
+        _xd key --window "${_wid}" --clearmodifiers Return
+        # For wizard windows: type the broker server name to filter the list,
+        # then hit Return twice to select + advance.
+        for _wzid in ${WIZ_IDS:-}; do
+          if [[ "${_wid}" == "${_wzid}" ]]; then
+            _xd type --clearmodifiers "${MT_SERVER:-MetaQuotes-Demo}"
+            sleep 0.3
+            _xd key --window "${_wid}" --clearmodifiers Return
+            sleep 0.2
+            _xd key --window "${_wid}" --clearmodifiers Return
+            break
+          fi
+        done
       done
-      if (( _try <= 30 )); then
-        sleep 5
-      else
-        sleep 10
-      fi
+      sleep 5
     done
   ) &
 
@@ -431,6 +481,15 @@ fi
     ATTEMPT=0
     while (( ATTEMPT < MAX_ATTEMPTS )); do
       ATTEMPT=$((ATTEMPT + 1))
+      # Snapshot visible X11 window titles — written BEFORE the probe fires so
+      # the wrapper log shows what was on screen at each attempt.
+      _WIN_SNAP=$(DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
+        | while IFS= read -r _wsid; do
+            DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || true
+          done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
+      { echo "[pre-probe ${ATTEMPT}/${MAX_ATTEMPTS}] windows=${_WIN_SNAP}"; } \
+        >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+      unset _WIN_SNAP _wsid
       # Skip the terminal-pid liveness check: the terminal may restart itself
       # after applying a LiveUpdate. The probe will detect the new process.
 
@@ -458,7 +517,7 @@ TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
 # A bare attach to a live session should complete almost instantly.
 ok = False
 try:
-    ok = mt5.initialize(path=TERM_PATH, timeout=60000${PROBE_PORTABLE_ARG})
+    ok = mt5.initialize(path=TERM_PATH, timeout=5000${PROBE_PORTABLE_ARG})
 except Exception as _e:
     ok = False
 err = mt5.last_error()
@@ -467,7 +526,7 @@ mode = 'bare'
 if not ok:
     mt5.shutdown()
     try:
-        ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=25000${PROBE_PORTABLE_ARG})
+        ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=90000${PROBE_PORTABLE_ARG})
     except Exception as _e:
         ok = False
     err = mt5.last_error()
@@ -478,18 +537,19 @@ PYEOF
 )
       set -x
       PROBE_EXIT=0
-      # Kill any orphaned wine python probe processes from prior attempts.
-      # When `timeout 75` kills the wine loader, python.exe in wineserver
-      # survives as an orphan still holding the MT5 IPC pipe open.
-      # That causes ERROR_PIPE_BUSY → instant -10005 for the next attempt.
-      pkill -f "mt5\\.initialize" 2>/dev/null || true
-      sleep 2
+      # Kill orphaned Wine-side python.exe from the previous probe.
+      # wine taskkill targets ONLY the Windows process — it does NOT kill
+      # wineserver, terminal64.exe, or the mt5linux RPyC server (-m mt5linux).
+      # The Linux-side pkill cleans up any stray wine launcher that survived.
+      WINEDEBUG="-all" "${WINE_CMD}" taskkill /F /IM python.exe > /dev/null 2>&1 || true
+      pkill -f "wine.*python.*-c" > /dev/null 2>&1 || true
+      sleep 3
       # Write to a temp FILE (not a pipe) to avoid blocking on Wine orphans.
       # Switch to +file: MT5 opens pipes via NtCreateFile (not kernel32:pipe)
       # so +pipe shows nothing — +file captures the actual open attempts.
       _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}"
       rm -f "$_PROBE_TMP" 2>/dev/null || true
-      WINEDEBUG="-all" timeout 100 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+      WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
         > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
       PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
       rm -f "$_PROBE_TMP" 2>/dev/null || true
