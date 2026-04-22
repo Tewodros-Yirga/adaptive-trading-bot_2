@@ -6,7 +6,7 @@
 # and COPY'd in — no apt-get, no curl inside Docker.
 # ============================================================
 
-ARG WINE_BASE=scottyhardy/docker-wine:devel-11.6-20260412
+ARG WINE_BASE=scottyhardy/docker-wine:latest
 FROM ${WINE_BASE}
 
 ARG HAS_MT5=false

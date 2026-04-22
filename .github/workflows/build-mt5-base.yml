@@ -17,6 +17,10 @@ on:
         description: "MT5 setup.exe URL (leave empty to skip terminal install)"
         required: false
         default: ""
+      wine_base:
+        description: "Wine base image tag (e.g. scottyhardy/docker-wine:latest)"
+        required: false
+        default: "scottyhardy/docker-wine:latest"
 
 env:
   REGISTRY: ghcr.io
@@ -43,17 +47,22 @@ jobs:
 
           EVENT_NAME="${{ github.event_name }}"
           INPUT_URL="${{ github.event.inputs.mt5_url || '' }}"
+          INPUT_WINE_BASE="${{ github.event.inputs.wine_base || '' }}"
           SECRET_URL="${{ secrets.MT5_INSTALLER_URL || '' }}"
 
           # We only bake MT5 into the image on schedule/manual runs.
           # Push builds must NEVER overwrite the baked `latest` tag.
           HAS_MT5="false"
           MT5_URL=""
+          WINE_BASE="scottyhardy/docker-wine:latest"
           PUBLISH_LATEST="false"
           PUBLISH_SLIM="false"
 
           if [[ "${EVENT_NAME}" == "workflow_dispatch" || "${EVENT_NAME}" == "schedule" ]]; then
             MT5_URL="${INPUT_URL:-${SECRET_URL}}"
+            if [[ -n "${INPUT_WINE_BASE}" ]]; then
+              WINE_BASE="${INPUT_WINE_BASE}"
+            fi
             if [[ -n "${MT5_URL}" ]]; then
               HAS_MT5="true"
               PUBLISH_LATEST="true"
@@ -80,12 +89,14 @@ jobs:
           echo "has_mt5=${HAS_MT5}"
           echo "publish_slim=${PUBLISH_SLIM}"
           echo "publish_latest=${PUBLISH_LATEST}"
+          echo "wine_base=${WINE_BASE}"
           echo "mt5_url_present=$([[ -n "${MT5_URL}" ]] && echo true || echo false)"
           echo "candidate_tag=${CANDIDATE_TAG}"
 
           {
             echo "has_mt5=${HAS_MT5}"
             echo "mt5_url=${MT5_URL}"
+            echo "wine_base=${WINE_BASE}"
             echo "candidate_tag=${CANDIDATE_TAG}"
             echo "promote_tags<<EOF"
             printf "%s\n" "${PROMOTE_TAGS[@]}"
@@ -135,6 +146,7 @@ jobs:
           tags: ${{ steps.mode.outputs.candidate_tag }}
           build-args: |
             HAS_MT5=${{ steps.mode.outputs.has_mt5 }}
+            WINE_BASE=${{ steps.mode.outputs.wine_base }}
           # Cache layers in GitHub's cache for faster rebuilds.
           cache-from: type=gha
           cache-to: type=gha,mode=max
