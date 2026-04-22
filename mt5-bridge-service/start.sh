@@ -493,17 +493,9 @@ INI
       # Skip the terminal-pid liveness check: the terminal may restart itself
       # after applying a LiveUpdate. The probe will detect the new process.
 
-      # Build the initialize() call for the probe.
-      # Strategy:
-      # 1) Try bare initialize(timeout=...) first to validate pure IPC pipe attach.
-      # 2) If bare attach fails, try credentialed initialize to mirror runtime auth.
-      # This avoids false negatives where auth/session is transient but IPC is ready.
-      PROBE_PORTABLE_ARG=""
-      if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
-        PROBE_PORTABLE_ARG=", portable=True"
-      fi
-      # IMPORTANT: disable xtrace while constructing the probe script because it
-      # contains credentials; we never want those echoed into logs.
+      # Build a single-mode initialize() probe script.
+      # We run each mode in an isolated subprocess so one hung initialize() call
+      # cannot block the entire attempt sequence.
       { set +x; } 2>/dev/null || true
       PROBE_SCRIPT=$(cat <<PYEOF
 import MetaTrader5 as mt5
@@ -514,63 +506,54 @@ except Exception:
     mt5_ver = 'error'
 TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
 PORTABLE = (os.environ.get('MT5_CONTEXT_MODE', 'default').lower() == 'portable')
-# Attach strategy:
-# 1) bare_no_path  -> best for discovering any running terminal instance
-# 2) bare_path     -> fallback for explicit terminal path
-# This avoids path-pipe mismatches that can cause endless -10005 loops.
-# NOTE: readiness probe intentionally avoids credentialed initialize() calls
-# to prevent long broker-auth waits. Account auth is handled by the adapter.
+MODE = os.environ.get('PROBE_MODE', 'bare_no_path')
+kwargs = {'timeout': 5000, 'portable': PORTABLE}
+if MODE == 'bare_path':
+    kwargs['path'] = TERM_PATH
 ok = False
-err = None
-mode = 'none'
-attempts = [
-    ('bare_no_path', {'timeout': 5000, 'portable': PORTABLE}),
-    ('bare_path', {'path': TERM_PATH, 'timeout': 5000, 'portable': PORTABLE}),
-]
-for _mode, _kwargs in attempts:
-    try:
-        ok = mt5.initialize(**_kwargs)
-    except Exception:
-        ok = False
-    err = mt5.last_error()
-    mode = _mode
-    if ok:
-        break
-    mt5.shutdown()
+try:
+    ok = mt5.initialize(**kwargs)
+except Exception:
+    ok = False
+err = mt5.last_error()
 mt5.shutdown()
-print(f'mt5_pkg={mt5_ver} mode={mode} ok={ok} err={err}')
+print(f'mt5_pkg={mt5_ver} mode={MODE} ok={ok} err={err}')
 PYEOF
 )
       set -x
-      PROBE_EXIT=0
-      # Kill orphaned Wine-side python.exe from the previous probe.
-      # wine taskkill targets ONLY the Windows process — it does NOT kill
-      # wineserver, terminal64.exe, or the mt5linux RPyC server (-m mt5linux).
-      # The Linux-side pkill cleans up any stray wine launcher that survived.
-      WINEDEBUG="-all" "${WINE_CMD}" taskkill /F /IM python.exe > /dev/null 2>&1 || true
-      pkill -f "wine.*python.*-c" > /dev/null 2>&1 || true
-      sleep 3
-      # Write to a temp FILE (not a pipe) to avoid blocking on Wine orphans.
-      # Switch to +file: MT5 opens pipes via NtCreateFile (not kernel32:pipe)
-      # so +pipe shows nothing — +file captures the actual open attempts.
-      _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}"
-      rm -f "$_PROBE_TMP" 2>/dev/null || true
-      WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
-        > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
-      PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
-      rm -f "$_PROBE_TMP" 2>/dev/null || true
+      PROBE_OK=0
+      PROBE_SUMMARY="none"
+      for PROBE_MODE in bare_no_path bare_path; do
+        PROBE_EXIT=0
+        # Kill orphaned Wine-side python.exe from the previous probe.
+        # wine taskkill targets ONLY the Windows process — it does NOT kill
+        # wineserver, terminal64.exe, or the mt5linux RPyC server (-m mt5linux).
+        WINEDEBUG="-all" "${WINE_CMD}" taskkill /F /IM python.exe > /dev/null 2>&1 || true
+        pkill -f "wine.*python.*-c" > /dev/null 2>&1 || true
+        sleep 1
+        _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}-${PROBE_MODE}"
+        rm -f "$_PROBE_TMP" 2>/dev/null || true
+        PROBE_MODE="${PROBE_MODE}" WINEDEBUG="-all" timeout 35 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
+          > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
+        PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
+        rm -f "$_PROBE_TMP" 2>/dev/null || true
+        PROBE_SUMMARY="mode=${PROBE_MODE} exit=${PROBE_EXIT} output=${PROBE_OUT}"
+        {
+          echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] ${PROBE_SUMMARY}"
+        } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+        if [[ "$PROBE_OUT" == *"ok=True"* ]]; then
+          PROBE_OK=1
+          break
+        fi
+      done
 
-      {
-        echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] exit=${PROBE_EXIT} output=${PROBE_OUT}"
-      } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-
-      if [[ "$PROBE_OUT" == *"ok=True"* ]]; then
-        echo "ready: attempt=${ATTEMPT} output=${PROBE_OUT}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      if [[ "${PROBE_OK}" -eq 1 ]]; then
+        echo "ready: attempt=${ATTEMPT} ${PROBE_SUMMARY}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
         touch "${IPC_READY_FILE}" 2>/dev/null || true
         break
       fi
 
-      echo "waiting: attempt=${ATTEMPT} exit=${PROBE_EXIT} output=${PROBE_OUT}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      echo "waiting: attempt=${ATTEMPT} ${PROBE_SUMMARY}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
       sleep "${SLEEP_SECONDS}"
     done
 
