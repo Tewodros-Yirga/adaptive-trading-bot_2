@@ -514,6 +514,13 @@ except Exception:
     mt5_ver = 'error'
 TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
 PORTABLE = (os.environ.get('MT5_CONTEXT_MODE', 'default').lower() == 'portable')
+LOGIN_RAW = os.environ.get('MT_LOGIN', '')
+try:
+    LOGIN = int(LOGIN_RAW)
+except Exception:
+    LOGIN = LOGIN_RAW
+PASSWORD = os.environ.get('MT_PASSWORD', '')
+SERVER = os.environ.get('MT_SERVER', '')
 # Attach strategy:
 # 1) bare_no_path  -> best for discovering any running terminal instance
 # 2) bare_path     -> fallback for explicit terminal path
@@ -526,8 +533,8 @@ mode = 'none'
 attempts = [
     ('bare_no_path', {'timeout': 5000, 'portable': PORTABLE}),
     ('bare_path', {'path': TERM_PATH, 'timeout': 5000, 'portable': PORTABLE}),
-    ('creds_no_path', {'login': ${MT_LOGIN}, 'password': '${MT_PASSWORD}', 'server': '${MT_SERVER}', 'timeout': 90000, 'portable': PORTABLE}),
-    ('creds_path', {'path': TERM_PATH, 'login': ${MT_LOGIN}, 'password': '${MT_PASSWORD}', 'server': '${MT_SERVER}', 'timeout': 90000, 'portable': PORTABLE}),
+    ('creds_no_path', {'login': LOGIN, 'password': PASSWORD, 'server': SERVER, 'timeout': 90000, 'portable': PORTABLE}),
+    ('creds_path', {'path': TERM_PATH, 'login': LOGIN, 'password': PASSWORD, 'server': SERVER, 'timeout': 90000, 'portable': PORTABLE}),
 ]
 for _mode, _kwargs in attempts:
     try:
