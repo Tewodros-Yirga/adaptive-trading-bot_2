@@ -23,6 +23,7 @@ ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
 # ---------------------------------------------------------------------------
 COPY python-installer.exe /tmp/python-installer.exe
 COPY mt5setup.exe         /tmp/mt5setup.exe
+COPY smoke-test-ipc.sh    /bridge/smoke-test-ipc.sh
 
 # ---------------------------------------------------------------------------
 # 2. All Wine operations in ONE RUN step with a single Xvfb session.
@@ -85,6 +86,9 @@ RUN set -eux; \
     else \
       echo "HAS_MT5 not true — skipping MT5 terminal"; \
     fi; \
+    \
+    # -- Smoke-test script perms -- \
+    chmod +x /bridge/smoke-test-ipc.sh; \
     \
     # -- Cleanup -- \
     kill "${XVFB_PID}" 2>/dev/null || pkill Xvfb || true; \

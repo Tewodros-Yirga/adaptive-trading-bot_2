@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "mt5-bridge-base/Dockerfile"
+      - "mt5-bridge-base/smoke-test-ipc.sh"
   # Rebuild monthly to keep the baked-in MT5 terminal version current.
   # A stale terminal triggers a blocking "Restart to install updates" dialog
   # on every container start, which prevents IPC pipe creation.
@@ -64,27 +65,30 @@ jobs:
           fi
 
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAGS=()
+          PROMOTE_TAGS=()
           # Always publish a sha tag for traceability.
-          TAGS+=("${IMAGE}:sha-${{ github.sha }}")
+          PROMOTE_TAGS+=("${IMAGE}:sha-${{ github.sha }}")
           if [[ "${PUBLISH_SLIM}" == "true" ]]; then
-            TAGS+=("${IMAGE}:slim")
+            PROMOTE_TAGS+=("${IMAGE}:slim")
           fi
           if [[ "${PUBLISH_LATEST}" == "true" ]]; then
-            TAGS+=("${IMAGE}:latest")
+            PROMOTE_TAGS+=("${IMAGE}:latest")
           fi
+          CANDIDATE_TAG="${IMAGE}:candidate-${{ github.sha }}"
 
           echo "event_name=${EVENT_NAME}"
           echo "has_mt5=${HAS_MT5}"
           echo "publish_slim=${PUBLISH_SLIM}"
           echo "publish_latest=${PUBLISH_LATEST}"
           echo "mt5_url_present=$([[ -n "${MT5_URL}" ]] && echo true || echo false)"
+          echo "candidate_tag=${CANDIDATE_TAG}"
 
           {
             echo "has_mt5=${HAS_MT5}"
             echo "mt5_url=${MT5_URL}"
-            echo "tags<<EOF"
-            printf "%s\n" "${TAGS[@]}"
+            echo "candidate_tag=${CANDIDATE_TAG}"
+            echo "promote_tags<<EOF"
+            printf "%s\n" "${PROMOTE_TAGS[@]}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
@@ -122,14 +126,39 @@ jobs:
             touch ./mt5-bridge-base/mt5setup.exe
           fi
 
-      - name: Build and push base image
+      - name: Build candidate base image
+        id: build_candidate
         uses: docker/build-push-action@v5
         with:
           context: ./mt5-bridge-base
           push: true
-          tags: ${{ steps.mode.outputs.tags }}
+          tags: ${{ steps.mode.outputs.candidate_tag }}
           build-args: |
             HAS_MT5=${{ steps.mode.outputs.has_mt5 }}
           # Cache layers in GitHub's cache for faster rebuilds.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke test candidate image (IPC attach gate)
+        if: steps.mode.outputs.has_mt5 == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANDIDATE="${{ steps.mode.outputs.candidate_tag }}"
+          echo "Pulling candidate image: ${CANDIDATE}"
+          docker pull "${CANDIDATE}"
+          echo "Running IPC smoke test..."
+          docker run --rm --entrypoint bash "${CANDIDATE}" /bridge/smoke-test-ipc.sh
+
+      - name: Promote candidate tags after smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DIGEST="${{ steps.build_candidate.outputs.digest }}"
+          SOURCE_REF="${IMAGE}@${DIGEST}"
+          while IFS= read -r TARGET_TAG; do
+            [[ -z "${TARGET_TAG}" ]] && continue
+            echo "Promoting ${SOURCE_REF} -> ${TARGET_TAG}"
+            docker buildx imagetools create --tag "${TARGET_TAG}" "${SOURCE_REF}"
+          done <<< "${{ steps.mode.outputs.promote_tags }}"
