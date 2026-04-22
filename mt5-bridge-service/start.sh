@@ -507,30 +507,38 @@ INI
       { set +x; } 2>/dev/null || true
       PROBE_SCRIPT=$(cat <<PYEOF
 import MetaTrader5 as mt5
+import os
 try:
     mt5_ver = getattr(mt5, '__version__', 'unknown')
 except Exception:
     mt5_ver = 'error'
 TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
-# Strategy 1: bare attach (just connect to already-authenticated terminal).
-# Passing credentials forces terminal re-auth with broker -> 90s IPC cycling.
-# A bare attach to a live session should complete almost instantly.
+PORTABLE = (os.environ.get('MT5_CONTEXT_MODE', 'default').lower() == 'portable')
+# Attach strategy:
+# 1) bare_no_path  -> best for discovering any running terminal instance
+# 2) bare_path     -> fallback for explicit terminal path
+# 3) creds_no_path -> auth attach if bare failed
+# 4) creds_path    -> final fallback
+# This avoids path-pipe mismatches that can cause endless -10005 loops.
 ok = False
-try:
-    ok = mt5.initialize(path=TERM_PATH, timeout=5000${PROBE_PORTABLE_ARG})
-except Exception as _e:
-    ok = False
-err = mt5.last_error()
-mode = 'bare'
-# Strategy 2: creds (only if bare fails - triggers broker re-auth)
-if not ok:
-    mt5.shutdown()
+err = None
+mode = 'none'
+attempts = [
+    ('bare_no_path', {'timeout': 5000, 'portable': PORTABLE}),
+    ('bare_path', {'path': TERM_PATH, 'timeout': 5000, 'portable': PORTABLE}),
+    ('creds_no_path', {'login': ${MT_LOGIN}, 'password': '${MT_PASSWORD}', 'server': '${MT_SERVER}', 'timeout': 90000, 'portable': PORTABLE}),
+    ('creds_path', {'path': TERM_PATH, 'login': ${MT_LOGIN}, 'password': '${MT_PASSWORD}', 'server': '${MT_SERVER}', 'timeout': 90000, 'portable': PORTABLE}),
+]
+for _mode, _kwargs in attempts:
     try:
-        ok = mt5.initialize(login=${MT_LOGIN}, password='${MT_PASSWORD}', server='${MT_SERVER}', timeout=90000${PROBE_PORTABLE_ARG})
-    except Exception as _e:
+        ok = mt5.initialize(**_kwargs)
+    except Exception:
         ok = False
     err = mt5.last_error()
-    mode = 'creds'
+    mode = _mode
+    if ok:
+        break
+    mt5.shutdown()
 mt5.shutdown()
 print(f'mt5_pkg={mt5_ver} mode={mode} ok={ok} err={err}')
 PYEOF
