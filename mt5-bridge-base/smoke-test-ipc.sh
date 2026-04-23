@@ -68,10 +68,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# /portable skips the broker-selection wizard that blocks IPC on first launch.
-wine "${TERM_EXE}" /portable > "${LOGDIR}/terminal.log" 2>&1 &
+# Override WINEDEBUG for the terminal only so crash reasons appear in terminal.log.
+# WINEESYNC/WINEFSYNC=0 are inherited from ENV; explicit here for clarity.
+WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
+  wine "${TERM_EXE}" > "${LOGDIR}/terminal.log" 2>&1 &
 TERM_PID=$!
 sleep 30
+
+# Diagnose early exit — if the process is already dead the crash reason is in terminal.log.
+if ! kill -0 "${TERM_PID}" 2>/dev/null; then
+  echo "WARNING: terminal64.exe exited within 30s (PID ${TERM_PID} is gone)"
+  echo "--- terminal.log early-exit dump ---"
+  cat "${LOGDIR}/terminal.log" 2>/dev/null || echo "(empty)"
+fi
 
 # Best-effort dialog dismisser for LiveUpdate/first-run wizards that block IPC.
 (

@@ -19,8 +19,9 @@ ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
 # Force Mesa software rasteriser — no GPU/DRI3 in headless containers.
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV GALLIUM_DRIVER=llvmpipe
-ENV MESA_GL_VERSION_OVERRIDE=4.5
-ENV MESA_GLSL_VERSION_OVERRIDE=450
+# Disable Wine esync/fsync — require futex kernel support absent in most Docker envs.
+ENV WINEESYNC=0
+ENV WINEFSYNC=0
 
 # ---------------------------------------------------------------------------
 # 1. Copy pre-downloaded installers from the build context
