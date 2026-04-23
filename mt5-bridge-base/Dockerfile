@@ -16,6 +16,11 @@ ENV WINEPREFIX=/opt/wineprefix
 ENV WINEDEBUG=-all
 ENV WINEDLLOVERRIDES="mscoree,mshtml="
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
+# Force Mesa software rasteriser — no GPU/DRI3 in headless containers.
+ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV GALLIUM_DRIVER=llvmpipe
+ENV MESA_GL_VERSION_OVERRIDE=4.5
+ENV MESA_GLSL_VERSION_OVERRIDE=450
 
 # ---------------------------------------------------------------------------
 # 1. Copy pre-downloaded installers from the build context

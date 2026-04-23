@@ -6,6 +6,12 @@ export WINEPREFIX="${WINEPREFIX:-/opt/wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export HOME="${HOME:-/root}"
 
+# Force Mesa software rasterisation — GHA runners have no GPU / DRI3.
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+export MESA_GL_VERSION_OVERRIDE=4.5
+export MESA_GLSL_VERSION_OVERRIDE=450
+
 LOGDIR="/tmp/mt5-ipc-smoke"
 mkdir -p "${LOGDIR}"
 
@@ -28,6 +34,15 @@ if [[ -z "${TERM_EXE}" || ! -f "${TERM_EXE}" ]]; then
   echo "ERROR: terminal64.exe not found: '${TERM_EXE}'"
   exit 1
 fi
+
+# Block MT5 update/LiveUpdate domains before launching terminal.
+for _d in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
+          cdn.mql5.com update.metatrader5.com updates.metatrader5.com \
+          mt5-update.metaquotes.net metaquotes.net; do
+  grep -qF "${_d}" /etc/hosts 2>/dev/null || \
+    echo "0.0.0.0 ${_d}" >> /etc/hosts 2>/dev/null || true
+done
+unset _d
 
 rm -f /tmp/.X99-lock || true
 Xvfb "${DISPLAY}" -screen 0 1280x720x24 > "${LOGDIR}/xvfb.log" 2>&1 &
@@ -53,9 +68,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-wine "${TERM_EXE}" > "${LOGDIR}/terminal.log" 2>&1 &
+# /portable skips the broker-selection wizard that blocks IPC on first launch.
+wine "${TERM_EXE}" /portable > "${LOGDIR}/terminal.log" 2>&1 &
 TERM_PID=$!
-sleep 8
+sleep 30
 
 # Best-effort dialog dismisser for LiveUpdate/first-run wizards that block IPC.
 (
