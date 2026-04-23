@@ -1,0 +1,115 @@
+name: Build MT5 Base (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mt5_url:
+        description: "Pinned MT5 setup.exe URL"
+        required: true
+      wine_base:
+        description: "Wine base image tag (e.g. scottyhardy/docker-wine:devel)"
+        required: false
+        default: "scottyhardy/docker-wine:devel"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mt5-bridge-base
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download installers to build context
+        env:
+          MT5_URL: ${{ github.event.inputs.mt5_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -eux
+          PYTHON_URL="https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe"
+          echo "Downloading Windows Python installer..."
+          curl -fsSL --retry 5 --retry-delay 5 --max-time 300 \
+            "${PYTHON_URL}" -o ./mt5-bridge-base/python-installer.exe
+
+          echo "Downloading MT5 setup..."
+          if echo "${MT5_URL}" | grep -qE '^https://github\.com/.+/releases/download/'; then
+            OWNER="$(echo "${MT5_URL}" | cut -d/ -f4)"
+            REPO="$(echo "${MT5_URL}"  | cut -d/ -f5)"
+            TAG="$(echo "${MT5_URL}"   | cut -d/ -f9)"
+            ASSET="$(echo "${MT5_URL}" | cut -d/ -f10-)"
+            API_JSON="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}")"
+            ASSET_ID="$(python - <<PY
+import json, sys
+data=json.loads(sys.stdin.read())
+assets=data.get("assets", [])
+target="${ASSET}"
+for a in assets:
+    if a.get("name") == target:
+        print(a.get("id"))
+        raise SystemExit(0)
+print("")
+PY
+              <<< "${API_JSON}")"
+            test -n "${ASSET_ID}"
+            curl -fsSL --retry 5 --retry-delay 5 --max-time 600 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/releases/assets/${ASSET_ID}" \
+              -o ./mt5-bridge-base/mt5setup.exe
+          else
+            curl -fsSL --retry 5 --retry-delay 5 --max-time 600 \
+              "${MT5_URL}" -o ./mt5-bridge-base/mt5setup.exe
+          fi
+
+      - name: Build candidate base image
+        id: build_candidate
+        uses: docker/build-push-action@v5
+        with:
+          context: ./mt5-bridge-base
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:candidate-${{ github.sha }}
+          build-args: |
+            HAS_MT5=true
+            WINE_BASE=${{ github.event.inputs.wine_base }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test candidate image (IPC attach gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANDIDATE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:candidate-${{ github.sha }}"
+          docker pull "${CANDIDATE}"
+          docker run --rm --entrypoint bash "${CANDIDATE}" /bridge/smoke-test-ipc.sh
+
+      - name: Promote latest on pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DIGEST="${{ steps.build_candidate.outputs.digest }}"
+          SOURCE_REF="${IMAGE}@${DIGEST}"
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${SOURCE_REF}"
+          docker buildx imagetools create --tag "${IMAGE}:sha-${{ github.sha }}" "${SOURCE_REF}"
