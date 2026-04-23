@@ -118,6 +118,7 @@ jobs:
       - name: Download installers to build context
         env:
           MT5_URL: ${{ steps.mode.outputs.mt5_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
           PYTHON_URL="https://www.python.org/ftp/python/3.9.13/python-3.9.13-amd64.exe"
@@ -129,8 +130,52 @@ jobs:
 
           if [ -n "${MT5_URL}" ]; then
             echo "Downloading MT5 setup..."
-            curl -fsSL --retry 5 --retry-delay 5 --max-time 600 \
-              "${MT5_URL}" -o ./mt5-bridge-base/mt5setup.exe
+
+            # If the URL is a GitHub release asset in a private repo, the public
+            # github.com download URL will 404 on CI runners. In that case, fetch
+            # via the GitHub API (authenticated with GITHUB_TOKEN).
+            if echo "${MT5_URL}" | grep -qE '^https://github\.com/.+/releases/download/'; then
+              # Parse: https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
+              OWNER="$(echo "${MT5_URL}" | cut -d/ -f4)"
+              REPO="$(echo "${MT5_URL}"  | cut -d/ -f5)"
+              TAG="$(echo "${MT5_URL}"   | cut -d/ -f9)"
+              ASSET="$(echo "${MT5_URL}" | cut -d/ -f10-)"
+              echo "Detected GitHub release asset URL (owner=${OWNER} repo=${REPO} tag=${TAG} asset=${ASSET})"
+
+              API_JSON="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}")"
+
+              ASSET_ID="$(python - <<PY
+import json, sys
+data=json.loads(sys.stdin.read())
+assets=data.get("assets", [])
+target="${ASSET}"
+for a in assets:
+    if a.get("name") == target:
+        print(a.get("id"))
+        raise SystemExit(0)
+print("")
+PY
+              <<< "${API_JSON}")"
+
+              if [ -z "${ASSET_ID}" ]; then
+                echo "ERROR: could not find asset '${ASSET}' on release tag '${TAG}'" >&2
+                exit 1
+              fi
+
+              curl -fsSL --retry 5 --retry-delay 5 --max-time 600 \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${OWNER}/${REPO}/releases/assets/${ASSET_ID}" \
+                -o ./mt5-bridge-base/mt5setup.exe
+            else
+              curl -fsSL --retry 5 --retry-delay 5 --max-time 600 \
+                "${MT5_URL}" -o ./mt5-bridge-base/mt5setup.exe
+            fi
+
             echo "MT5 setup: $(du -sh ./mt5-bridge-base/mt5setup.exe)"
           else
             echo "MT5_URL not set — creating empty placeholder"
