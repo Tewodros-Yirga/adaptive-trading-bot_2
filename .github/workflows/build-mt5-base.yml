@@ -138,8 +138,8 @@ jobs:
               # Parse: https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
               OWNER="$(echo "${MT5_URL}" | cut -d/ -f4)"
               REPO="$(echo "${MT5_URL}"  | cut -d/ -f5)"
-              TAG="$(echo "${MT5_URL}"   | cut -d/ -f9)"
-              ASSET="$(echo "${MT5_URL}" | cut -d/ -f10-)"
+              TAG="$(echo "${MT5_URL}"   | cut -d/ -f8)"
+              ASSET="$(echo "${MT5_URL}" | cut -d/ -f9-)"
               echo "Detected GitHub release asset URL (owner=${OWNER} repo=${REPO} tag=${TAG} asset=${ASSET})"
 
               API_JSON="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
