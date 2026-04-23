@@ -1,0 +1,3 @@
+# Force LF line endings for files GitHub Actions must parse
+*.yml  text eol=lf
+*.yaml text eol=lf
