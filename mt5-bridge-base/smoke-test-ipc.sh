@@ -68,6 +68,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Pre-write MetaQuotes-Demo server config to bypass the first-run broker wizard.
+# MT5 creates the IPC named pipe only after the main window initialises,
+# which is blocked by the wizard. With Server already set the wizard is skipped.
+for _cfg_dir in \
+  "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config" \
+  "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"; do
+  mkdir -p "${_cfg_dir}" 2>/dev/null || true
+  if [[ ! -f "${_cfg_dir}/common.ini" ]]; then
+    printf '[Common]\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+      > "${_cfg_dir}/common.ini" 2>/dev/null || true
+    echo "Pre-wrote server config: ${_cfg_dir}/common.ini"
+  fi
+done
+unset _cfg_dir
+
 # Override WINEDEBUG for the terminal only so crash reasons appear in terminal.log.
 # WINEESYNC/WINEFSYNC=0 are inherited from ENV; explicit here for clarity.
 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
