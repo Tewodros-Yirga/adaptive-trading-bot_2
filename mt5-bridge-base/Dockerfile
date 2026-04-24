@@ -31,7 +31,7 @@ ENV WINEFSYNC=0
 # ---------------------------------------------------------------------------
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        openbox xdotool p7zip-full \
+        openbox xdotool p7zip-full file \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
