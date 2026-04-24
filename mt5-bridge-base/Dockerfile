@@ -79,8 +79,39 @@ RUN set -eux; \
       || echo "WARNING: mt5linux verification failed"; \
     \
     # -- Install MT5 terminal (only if HAS_MT5=true) -- \
+    # Even with /auto, mt5setup.exe shows a dialog under Wine that requires a \
+    # click to proceed. Run a background xdotool dismisser to auto-click any \
+    # dialogs that appear during installation. \
     if [ "${HAS_MT5}" = "true" ]; then \
+      if command -v openbox >/dev/null 2>&1; then \
+        DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
+        OPENBOX_INSTALL_PID=$!; sleep 2; \
+      else \
+        OPENBOX_INSTALL_PID=""; \
+      fi; \
+      ( \
+        sleep 15; \
+        for _try in $(seq 1 180); do \
+          _IDS=$(DISPLAY=:99 xdotool search --onlyvisible 2>/dev/null \
+            | awk 'NF' | sort -n -u) || true; \
+          for _wid in ${_IDS}; do \
+            DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true; \
+            sleep 0.2; \
+            for _xy in "400 300" "500 300" "640 350" \
+                       "400 380" "500 400" "640 400" \
+                       "360 450" "500 450" "640 450"; do \
+              set -- ${_xy}; \
+              DISPLAY=:99 xdotool mousemove --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
+            done; \
+            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
+          done; \
+          sleep 5; \
+        done; \
+      ) & \
+      INSTALLER_DISMISS_PID=$!; \
       timeout 900 wine /tmp/mt5setup.exe /auto || true; \
+      kill "${INSTALLER_DISMISS_PID}" 2>/dev/null || true; \
+      kill "${OPENBOX_INSTALL_PID:-}" 2>/dev/null || true; \
       sleep 5; \
       TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 6 \
         -name "terminal64.exe" 2>/dev/null | head -1) || true; \
