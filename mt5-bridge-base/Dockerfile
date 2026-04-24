@@ -113,34 +113,19 @@ RUN set -eux; \
       fi; \
       rm -rf /tmp/mt5_extr; \
       \
-      # --- Method B: GUI installer fallback (only if 7z found nothing) ---- \
+      # --- Method B: Run with /auto — no GUI interaction ------------------- \
+      # mt5setup.exe from build 4816 is a CDN downloader whose CDN no longer \
+      # serves that build. Re-trigger the workflow with the official MetaQuotes \
+      # current URL: \
+      #   https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe \
+      # That URL is maintained, serves the current build, and /auto silently \
+      # installs without dialogs. \
+      # \
+      # DO NOT start any background dismisser process here: every run showed \
+      # that key presses/mouse clicks during installation abort the downloader. \
       if [ -z "${TERM_EXE}" ]; then \
-        echo "7z extraction did not yield terminal64.exe — falling back to GUI installer"; \
-        DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
-        OPENBOX_INSTALL_PID=$!; \
-        sleep 2; \
-        ( \
-          sleep 120; \
-          for _try in $(seq 1 60); do \
-            _W=$(DISPLAY=:99 xdotool getactivewindow 2>/dev/null) || true; \
-            if [ -n "${_W}" ]; then \
-              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+n 2>/dev/null || true; \
-              sleep 0.5; \
-              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+a 2>/dev/null || true; \
-              sleep 0.5; \
-              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+i 2>/dev/null || true; \
-              sleep 0.5; \
-              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+f 2>/dev/null || true; \
-              sleep 0.5; \
-              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers Return 2>/dev/null || true; \
-            fi; \
-            sleep 8; \
-          done; \
-        ) & \
-        INSTALLER_DISMISS_PID=$!; \
+        echo "Running mt5setup.exe /auto (no GUI interaction — needs official URL)"; \
         timeout 900 wine /tmp/mt5setup.exe /auto || true; \
-        kill "${INSTALLER_DISMISS_PID}" 2>/dev/null || true; \
-        kill "${OPENBOX_INSTALL_PID:-}" 2>/dev/null || true; \
         sleep 5; \
         TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
           -name "terminal64.exe" 2>/dev/null | head -1) || true; \
