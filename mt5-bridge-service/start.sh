@@ -267,31 +267,49 @@ fi
   # Note: /noupdate is NOT a valid terminal64.exe argument.
   echo "mode=${MT5_CONTEXT_MODE}; exe=${TERMINAL_EXE}; args=${CONTEXT_ARGS[*]:-(none)}" > "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
 
-  # Pre-write MT5 server config so the terminal can skip the "Select a company"
-  # first-run wizard and proceed to a Login screen instead.
+  # Pre-write MT5 server config to every candidate config path so the terminal
+  # skips the "Select a company" first-run wizard and goes straight to a Login
+  # screen instead.  We always overwrite (remove the guard) because MT_SERVER
+  # may differ from whatever the Dockerfile baked in.
   # The Login screen responds to mt5.initialize(login,password,server) over IPC;
   # the company-selection wizard does NOT. Password is NOT stored here (MT5
   # encrypts it; plaintext is ignored) — it is injected by mt5.initialize().
   _mt5_precfg() {
     local _d="$1"
     mkdir -p "${_d}" 2>/dev/null || return
-    [[ -f "${_d}/common.ini" ]] && return          # don't clobber existing cfg
-    cat > "${_d}/common.ini" <<INI
-[Common]
-Login=${MT_LOGIN}
-Server=${MT_SERVER}
-NewsEnable=0
-AutoSync=0
-INI
-    echo "[mt5-terminal] Pre-wrote server config → ${_d}/common.ini"
+    printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+      "${MT_LOGIN}" "${MT_SERVER}" > "${_d}/common.ini" 2>/dev/null || true
+    echo "[mt5-terminal] Wrote server config → ${_d}/common.ini"
   }
+  # Standard install path and the Common AppData path.
   _mt5_precfg "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config"
   _mt5_precfg "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"
+  # Also write to every hash-subdirectory created by the Dockerfile first-run
+  # init so the correct profile-specific config directory is covered.
+  find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+    -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null \
+    | while IFS= read -r _hcfg; do _mt5_precfg "${_hcfg}"; done || true
   unset -f _mt5_precfg
+
+  # Write a Windows-accessible standalone config file used by the /config: flag.
+  # This is the most reliable way to pass Login/Server to the terminal on startup
+  # regardless of which profile directory it selects internally.
+  _WIN_CFG_LINUX="${WINEPREFIX}/drive_c/mt5-headless.ini"
+  printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+    "${MT_LOGIN}" "${MT_SERVER}" > "${_WIN_CFG_LINUX}" 2>/dev/null || true
+  echo "[mt5-terminal] Wrote Windows-accessible config → ${_WIN_CFG_LINUX}"
 
   _launch_terminal() {
     echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
-    "$WINE_CMD" "$TERMINAL_EXE" "${CONTEXT_ARGS[@]}" > "${LOGDIR}/mt5-terminal.log" 2>&1 &
+    # Pass /config: so the terminal reads our pre-written Login+Server ini on
+    # startup.  This is the documented way to inject settings without relying
+    # on the correct AppData hash-subdirectory being known in advance.
+    # Combined with the pre-baked AppData (Dockerfile first-run layer) this
+    # means the terminal starts in a Login form rather than the wizard.
+    "$WINE_CMD" "$TERMINAL_EXE" \
+      /config:"C:\\mt5-headless.ini" \
+      "${CONTEXT_ARGS[@]}" \
+      > "${LOGDIR}/mt5-terminal.log" 2>&1 &
     TERMINAL_PID=$!
     echo "[mt5-terminal] terminal pid=${TERMINAL_PID}"
   }
@@ -513,7 +531,7 @@ except Exception:
 TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
 PORTABLE_MODE = os.environ.get('PROBE_PORTABLE', 'default')
 MODE = os.environ.get('PROBE_MODE', 'bare_no_path')
-kwargs = {'timeout': 15000}
+kwargs = {'timeout': 30000}  # 30 s — enough for a cold broker TCP handshake
 if PORTABLE_MODE == 'portable':
     kwargs['portable'] = True
 if MODE == 'bare_path':
