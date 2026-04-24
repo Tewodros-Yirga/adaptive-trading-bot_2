@@ -1,0 +1,114 @@
+name: Package MT5 Portable Archive (Windows)
+# Runs on a native Windows GHA runner to install MetaTrader 5 and create
+# a portable ZIP archive. The resulting archive is then used by the Linux
+# Docker build (via 7z extraction into the Wine prefix), completely bypassing
+# the Wine WinHTTP incompatibility that prevents the installer from running
+# under Wine.
+#
+# USAGE: Run this workflow once. After it completes, copy the release asset
+# URL into the main build-mt5-base.yml workflow's mt5_url input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mt5_url:
+        description: "MT5 installer URL"
+        required: false
+        default: "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+      release_tag:
+        description: "Release tag (e.g. mt5-portable-5800)"
+        required: false
+        default: "mt5-portable-latest"
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download MT5 installer
+        shell: bash
+        run: |
+          set -eux
+          curl -fsSL --max-time 300 \
+            "${{ github.event.inputs.mt5_url }}" \
+            -o mt5setup.exe
+          du -sh mt5setup.exe
+
+      - name: Run MT5 installer silently
+        shell: cmd
+        run: |
+          echo Starting MT5 installer with /auto flag...
+          start "" /wait mt5setup.exe /auto
+          echo Installer process exited.
+
+      - name: Poll until terminal64.exe appears (up to 10 min)
+        shell: bash
+        run: |
+          set -eux
+          FOUND=false
+          for n in $(seq 1 120); do
+            if [ -f "C:/Program Files/MetaTrader 5/terminal64.exe" ]; then
+              echo "terminal64.exe found after ${n} poll(s)!"
+              FOUND=true
+              break
+            fi
+            echo "Waiting for installation... attempt ${n}/120"
+            sleep 5
+          done
+          if [ "${FOUND}" != "true" ]; then
+            echo "ERROR: terminal64.exe was not found after 10 minutes."
+            ls "C:/Program Files/" || true
+            exit 1
+          fi
+
+      - name: Print installed MT5 version
+        id: mt5_ver
+        shell: powershell
+        run: |
+          $f      = "C:\Program Files\MetaTrader 5\terminal64.exe"
+          $v      = (Get-Item $f).VersionInfo.FileVersion
+          $build  = $v -replace '[^0-9]', ''
+          Write-Host "MT5 version: $v  build: $build"
+          "build=$build"    | Out-File $env:GITHUB_OUTPUT -Append
+          "tag=mt5-portable-$build" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Create portable ZIP archive
+        shell: bash
+        run: |
+          set -eux
+          cd "C:/Program Files"
+          ls "MetaTrader 5/"
+          7z a "$GITHUB_WORKSPACE/mt5-portable.zip" "MetaTrader 5" -mx=5
+          du -sh "$GITHUB_WORKSPACE/mt5-portable.zip"
+
+      - name: Upload to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          TAG="${{ steps.mt5_ver.outputs.tag }}"
+          # Create or update the release
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            echo "Release ${TAG} exists — uploading asset..."
+          else
+            echo "Creating release ${TAG}..."
+            gh release create "${TAG}" \
+              --title "MT5 Portable Build ${{ steps.mt5_ver.outputs.build }}" \
+              --notes "MetaTrader 5 portable archive (Windows GHA, $(date -u +%Y-%m-%d)).
+          
+          Use this URL as mt5_url in the build-mt5-base workflow:
+          https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5-portable.zip"
+          fi
+          gh release upload "${TAG}" \
+            "$GITHUB_WORKSPACE/mt5-portable.zip" \
+            --clobber
+          echo ""
+          echo "=== Use this URL in build-mt5-base.yml ==="
+          echo "https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5-portable.zip"

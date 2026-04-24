@@ -98,42 +98,44 @@ RUN set -eux; \
       || echo "WARNING: mt5linux verification failed"; \
     \
     # -- Install MT5 terminal (only if HAS_MT5=true) -- \
-    # mt5setup.exe is an NSIS-family self-extracting archive.  We first try \
-    # to extract it with 7-Zip (fast, no GUI needed); only if that doesn't \
-    # yield terminal64.exe do we fall back to running the GUI installer. \
+    # \
+    # Two supported input formats for /tmp/mt5setup.exe: \
+    # \
+    #  A) Portable ZIP archive (preferred). \
+    #     Created by the package-mt5-windows.yml workflow which installs MT5 on \
+    #     a native Windows GHA runner and zips C:\Program Files\MetaTrader 5\. \
+    #     This completely bypasses Wine — we just extract and place the files. \
+    #     Use by passing the release asset URL as mt5_url in the build workflow. \
+    # \
+    #  B) MetaQuotes installer stub (mt5setup.exe, official URL). \
+    #     EXE-based fallback.  This path always hangs under Wine because the \
+    #     MetaQuotes downloader uses WinHTTP which does not support the CDN's \
+    #     TLS requirements under Wine.  Left here for completeness; do NOT \
+    #     expect it to succeed. \
     if [ "${HAS_MT5}" = "true" ]; then \
       TERM_EXE=""; \
       \
-      # --- Method A: 7-Zip extraction (no Wine, no GUI) ------------------- \
-      echo "=== Trying 7-Zip extraction of mt5setup.exe ==="; \
-      7z x /tmp/mt5setup.exe -o/tmp/mt5_extr -y > /tmp/7z-extract.log 2>&1 || true; \
-      echo "=== 7z extraction log (last 20 lines) ==="; \
-      tail -20 /tmp/7z-extract.log 2>/dev/null || true; \
-      echo "=== Files extracted from mt5setup.exe ==="; \
-      find /tmp/mt5_extr -maxdepth 4 -type f 2>/dev/null | head -40 || true; \
-      TERM_EXE=$(find /tmp/mt5_extr -name "terminal64.exe" 2>/dev/null | head -1) || true; \
-      if [ -n "${TERM_EXE}" ]; then \
-        echo "Found terminal64.exe via 7z: ${TERM_EXE}"; \
-        _MT5_DEST="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5"; \
-        mkdir -p "${_MT5_DEST}"; \
-        cp -r /tmp/mt5_extr/. "${_MT5_DEST}/" 2>/dev/null || true; \
-        TERM_EXE="${_MT5_DEST}/terminal64.exe"; \
-      fi; \
-      rm -rf /tmp/mt5_extr; \
+      # Detect file type so we can branch correctly. \
+      MT5_FILE_TYPE=$(file /tmp/mt5setup.exe 2>/dev/null || echo "unknown"); \
+      echo "File type of mt5setup.exe: ${MT5_FILE_TYPE}"; \
       \
-      # --- Method B: Run with /auto — no GUI interaction ------------------- \
-      # mt5setup.exe from build 4816 is a CDN downloader whose CDN no longer \
-      # serves that build. Re-trigger the workflow with the official MetaQuotes \
-      # current URL: \
-      #   https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe \
-      # That URL is maintained, serves the current build, and /auto silently \
-      # installs without dialogs. \
-      # \
-      # DO NOT start any background dismisser process here: every run showed \
-      # that key presses/mouse clicks during installation abort the downloader. \
+      # --- Method A: Portable ZIP archive (Windows-packaged, preferred) ----- \
+      if echo "${MT5_FILE_TYPE}" | grep -qiE '(Zip archive|zip)'; then \
+        echo "=== Detected ZIP archive — extracting portable MT5 installation ==="; \
+        _MT5_PARENT="${WINEPREFIX}/drive_c/Program Files"; \
+        mkdir -p "${_MT5_PARENT}"; \
+        7z x /tmp/mt5setup.exe -o"${_MT5_PARENT}" -y > /tmp/7z-extract.log 2>&1 || true; \
+        echo "=== 7z extraction log (last 10 lines) ==="; \
+        tail -10 /tmp/7z-extract.log 2>/dev/null || true; \
+        TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
+          -name "terminal64.exe" 2>/dev/null | head -1) || true; \
+      fi; \
+      \
+      # --- Method B: EXE stub fallback (likely to hang — see comments above) \
       if [ -z "${TERM_EXE}" ]; then \
-        echo "Running mt5setup.exe /auto (no GUI interaction — needs official URL)"; \
-        timeout 900 wine /tmp/mt5setup.exe /auto || true; \
+        echo "No terminal64.exe from ZIP extraction — trying wine /auto fallback"; \
+        echo "(Note: MetaQuotes stub WinHTTP downloads fail under Wine — use ZIP instead)"; \
+        timeout 300 wine /tmp/mt5setup.exe /auto || true; \
         sleep 5; \
         TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
           -name "terminal64.exe" 2>/dev/null | head -1) || true; \
