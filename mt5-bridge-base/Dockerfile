@@ -118,7 +118,8 @@ RUN set -eux; \
           # Also find named windows (real dialogs, skip Wine internal ones). \
           # IMPORTANT: only click left/center of window — rightside coords \
           # (x>500) hit the WM close-button and abort the installer! \
-          while IFS= read -r _wid; do \
+          _ALL_WIDS=$(DISPLAY=:99 xdotool search --name "" 2>/dev/null) || true; \
+          for _wid in ${_ALL_WIDS}; do \
             _NAME=$(DISPLAY=:99 xdotool getwindowname "${_wid}" 2>/dev/null) \
               || continue; \
             [ -z "${_NAME}" ] && continue; \
@@ -132,7 +133,7 @@ RUN set -eux; \
             done; \
             DISPLAY=:99 xdotool key --window "${_wid}" \
               --clearmodifiers Return 2>/dev/null || true; \
-          done < <(DISPLAY=:99 xdotool search --name "" 2>/dev/null || true); \
+          done; \
           sleep 5; \
         done; \
       ) & \
