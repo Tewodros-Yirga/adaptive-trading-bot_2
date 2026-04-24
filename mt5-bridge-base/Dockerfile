@@ -90,62 +90,47 @@ RUN set -eux; \
       || echo "WARNING: mt5linux verification failed"; \
     \
     # -- Install MT5 terminal (only if HAS_MT5=true) -- \
-    # Even with /auto, mt5setup.exe shows a dialog under Wine that requires a \
-    # click to proceed. Run a background xdotool dismisser to auto-click any \
-    # dialogs that appear during installation. \
+    # Strategy: \
+    #  1. Run installer with /auto to suppress welcome/EULA dialogs while \
+    #     the file download happens in the background (may take 60-120s). \
+    #  2. Wait 120s before any keyboard interaction so the download phase \
+    #     finishes before we touch anything (early Return = Cancel abort). \
+    #  3. Use Windows Alt+key accelerators (Alt+N=Next, Alt+F=Finish, \
+    #     Alt+A=Agree) — these target named button labels, not focus order, \
+    #     so they cannot accidentally hit the close-button or Cancel. \
     if [ "${HAS_MT5}" = "true" ]; then \
-      # openbox is now installed via the apt layer above — start it so \
-      # Wine dialogs register as visible to xdotool. \
       DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
       OPENBOX_INSTALL_PID=$!; \
       sleep 2; \
       ( \
-        sleep 20; \
-        for _try in $(seq 1 180); do \
-          # Use the active/focused window first — keyboard Return advances \
-          # all installer pages (Next, Accept, Install, Finish). \
-          _ACTIVE=$(DISPLAY=:99 xdotool getactivewindow 2>/dev/null) || true; \
-          if [ -n "${_ACTIVE}" ]; then \
-            DISPLAY=:99 xdotool key --window "${_ACTIVE}" \
-              --clearmodifiers Return 2>/dev/null || true; \
-            sleep 0.4; \
-            DISPLAY=:99 xdotool key --window "${_ACTIVE}" \
-              --clearmodifiers space 2>/dev/null || true; \
-            sleep 0.4; \
-            DISPLAY=:99 xdotool key --window "${_ACTIVE}" \
-              --clearmodifiers Tab Return 2>/dev/null || true; \
+        sleep 120; \
+        for _try in $(seq 1 60); do \
+          _W=$(DISPLAY=:99 xdotool getactivewindow 2>/dev/null) || true; \
+          if [ -n "${_W}" ]; then \
+            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+n 2>/dev/null || true; \
+            sleep 0.5; \
+            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+a 2>/dev/null || true; \
+            sleep 0.5; \
+            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+i 2>/dev/null || true; \
+            sleep 0.5; \
+            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+f 2>/dev/null || true; \
+            sleep 0.5; \
+            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers Return 2>/dev/null || true; \
           fi; \
-          # Also find named windows (real dialogs, skip Wine internal ones). \
-          # IMPORTANT: only click left/center of window — rightside coords \
-          # (x>500) hit the WM close-button and abort the installer! \
-          _ALL_WIDS=$(DISPLAY=:99 xdotool search --name "" 2>/dev/null) || true; \
-          for _wid in ${_ALL_WIDS}; do \
-            _NAME=$(DISPLAY=:99 xdotool getwindowname "${_wid}" 2>/dev/null) \
-              || continue; \
-            [ -z "${_NAME}" ] && continue; \
-            DISPLAY=:99 xdotool windowfocus --sync "${_wid}" 2>/dev/null \
-              || continue; \
-            sleep 0.2; \
-            for _xy in "300 380" "350 400" "280 420" "200 400"; do \
-              set -- ${_xy}; \
-              DISPLAY=:99 xdotool mousemove --window "${_wid}" \
-                --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
-            done; \
-            DISPLAY=:99 xdotool key --window "${_wid}" \
-              --clearmodifiers Return 2>/dev/null || true; \
-          done; \
-          sleep 5; \
+          sleep 8; \
         done; \
       ) & \
       INSTALLER_DISMISS_PID=$!; \
-      # Run installer WITHOUT /auto so the GUI wizard appears and the \
-      # xdotool dismisser can click through it. /auto does not reliably \
-      # suppress all dialogs, causing a 900s hang. \
-      timeout 900 wine /tmp/mt5setup.exe || true; \
+      timeout 900 wine /tmp/mt5setup.exe /auto || true; \
       kill "${INSTALLER_DISMISS_PID}" 2>/dev/null || true; \
       kill "${OPENBOX_INSTALL_PID:-}" 2>/dev/null || true; \
       sleep 5; \
-      TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 6 \
+      # Diagnostic: show what was installed so we can debug path issues. \
+      echo "=== drive_c top-level ==="; \
+      ls "${WINEPREFIX}/drive_c/" 2>/dev/null || true; \
+      echo "=== Program Files ==="; \
+      ls "${WINEPREFIX}/drive_c/Program Files/" 2>/dev/null || true; \
+      TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
         -name "terminal64.exe" 2>/dev/null | head -1) || true; \
       echo "terminal64.exe: ${TERM_EXE:-NOT FOUND}"; \
       if [ -n "${TERM_EXE}" ]; then \
