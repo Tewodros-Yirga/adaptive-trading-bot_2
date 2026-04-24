@@ -24,7 +24,18 @@ ENV WINEESYNC=0
 ENV WINEFSYNC=0
 
 # ---------------------------------------------------------------------------
-# 1. Copy pre-downloaded installers from the build context
+# 1. Install openbox + xdotool for GUI automation during build.
+#    Separate layer so it is cached independently of Wine operations.
+#    openbox is REQUIRED: without a WM, Wine dialogs don't register as
+#    visible to xdotool, so the installer dismisser loop finds nothing.
+# ---------------------------------------------------------------------------
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        openbox xdotool \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 2. Copy pre-downloaded installers from the build context
 #    (downloaded on the GHA runner — no apt/curl needed inside Docker)
 # ---------------------------------------------------------------------------
 COPY python-installer.exe /tmp/python-installer.exe
@@ -83,25 +94,27 @@ RUN set -eux; \
     # click to proceed. Run a background xdotool dismisser to auto-click any \
     # dialogs that appear during installation. \
     if [ "${HAS_MT5}" = "true" ]; then \
-      if command -v openbox >/dev/null 2>&1; then \
-        DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
-        OPENBOX_INSTALL_PID=$!; sleep 2; \
-      else \
-        OPENBOX_INSTALL_PID=""; \
-      fi; \
+      # openbox is now installed via the apt layer above — start it so \
+      # Wine dialogs register as visible to xdotool. \
+      DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
+      OPENBOX_INSTALL_PID=$!; \
+      sleep 2; \
       ( \
         sleep 15; \
         for _try in $(seq 1 180); do \
-          _IDS=$(DISPLAY=:99 xdotool search --onlyvisible 2>/dev/null \
+          # Use plain search (not --onlyvisible) because without a WM all \
+          # Wine windows appear invisible to xdotool but are still clickable. \
+          _IDS=$(DISPLAY=:99 xdotool search --name "" 2>/dev/null \
             | awk 'NF' | sort -n -u) || true; \
           for _wid in ${_IDS}; do \
-            DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true; \
+            DISPLAY=:99 xdotool windowfocus --sync "${_wid}" 2>/dev/null || true; \
             sleep 0.2; \
             for _xy in "400 300" "500 300" "640 350" \
                        "400 380" "500 400" "640 400" \
                        "360 450" "500 450" "640 450"; do \
               set -- ${_xy}; \
-              DISPLAY=:99 xdotool mousemove --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
+              DISPLAY=:99 xdotool mousemove --window "${_wid}" \
+                --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
             done; \
             DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
           done; \
@@ -109,7 +122,10 @@ RUN set -eux; \
         done; \
       ) & \
       INSTALLER_DISMISS_PID=$!; \
-      timeout 900 wine /tmp/mt5setup.exe /auto || true; \
+      # Run installer WITHOUT /auto so the GUI wizard appears and the \
+      # xdotool dismisser can click through it. /auto does not reliably \
+      # suppress all dialogs, causing a 900s hang. \
+      timeout 900 wine /tmp/mt5setup.exe || true; \
       kill "${INSTALLER_DISMISS_PID}" 2>/dev/null || true; \
       kill "${OPENBOX_INSTALL_PID:-}" 2>/dev/null || true; \
       sleep 5; \
