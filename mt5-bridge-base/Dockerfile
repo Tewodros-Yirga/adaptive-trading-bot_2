@@ -39,8 +39,16 @@ RUN apt-get update -qq && \
 #    (downloaded on the GHA runner — no apt/curl needed inside Docker)
 # ---------------------------------------------------------------------------
 COPY python-installer.exe /tmp/python-installer.exe
+
+# CACHE_BUST is set to github.run_id in CI so that every manual MT5 build
+# forces a fresh download and install, even when the Dockerfile is unchanged.
+# Without this, Docker GHA cache re-uses the previous failed installer layer.
+ARG CACHE_BUST=0
+RUN echo "Cache-bust value: ${CACHE_BUST}"
+
 COPY mt5setup.exe         /tmp/mt5setup.exe
 COPY smoke-test-ipc.sh    /bridge/smoke-test-ipc.sh
+
 
 # ---------------------------------------------------------------------------
 # 2. All Wine operations in ONE RUN step with a single Xvfb session.

@@ -83,6 +83,7 @@ jobs:
           build-args: |
             HAS_MT5=true
             WINE_BASE=${{ github.event.inputs.wine_base }}
+            CACHE_BUST=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

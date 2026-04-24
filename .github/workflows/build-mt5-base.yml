@@ -181,6 +181,7 @@ jobs:
           build-args: |
             HAS_MT5=${{ steps.mode.outputs.has_mt5 }}
             WINE_BASE=${{ steps.mode.outputs.wine_base }}
+            CACHE_BUST=${{ github.run_id }}
           # Cache layers in GitHub's cache for faster rebuilds.
           cache-from: type=gha
           cache-to: type=gha,mode=max
