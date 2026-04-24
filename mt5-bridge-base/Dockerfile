@@ -273,8 +273,8 @@ RUN set -eux; \
           done; \
           DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
           sleep 0.1; \
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
-          sleep 0.1; \
+          # DO NOT send Escape — it cancels the wizard and closes the terminal. \
+          # A second Return advances past any confirmation step. \
           DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
         done; \
         sleep 5; \
@@ -320,6 +320,20 @@ RUN set -eux; \
           grep -q "\[Experts\]" "${_tini}" 2>/dev/null \
             || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' >> "${_tini}" 2>/dev/null || true; \
           echo "Patched ${_tini}"; \
+        done; \
+    \
+    # Write common.ini into every terminal hash sub-directory the terminal \
+    # created during this first run, so subsequent startups (including the \
+    # smoke test) skip the server-selection wizard. \
+    find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+      -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | while IFS= read -r _hdir; do \
+          _basename=$(basename "${_hdir}"); \
+          if [ "${_basename}" = "Common" ] || [ "${_basename}" = "Community" ]; then continue; fi; \
+          mkdir -p "${_hdir}/config" 2>/dev/null || true; \
+          printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+            > "${_hdir}/config/common.ini" 2>/dev/null || true; \
+          echo "Wrote hash-dir config: ${_hdir}/config/common.ini"; \
         done; \
     \
     # Show what was created so the build log is self-documenting. \
