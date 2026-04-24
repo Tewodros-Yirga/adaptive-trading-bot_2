@@ -173,7 +173,7 @@ fi
         sleep 0.06
       done
       _xd key --window "${_wid}" --clearmodifiers Return; sleep 0.1
-      _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.1
+      # DO NOT send Escape — it cancels the wizard and kills the terminal.
       _xd key --window "${_wid}" --clearmodifiers Return; sleep 0.06
     done
     sleep 3

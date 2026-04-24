@@ -224,10 +224,16 @@ RUN set -eux; \
       echo "Pre-wrote server config: ${_cfg_dir}/common.ini"; \
     done; \
     \
-    # Launch terminal — allow it to populate AppData and create IPC pipes. \
+    # Launch terminal with a pre-written config so it skips the wizard. \
+    # Without /config: the wizard always appears because terminal needs \
+    # to be told which server to use on first run. \
+    WIN_CFG="${WINEPREFIX}/drive_c/mt5-firstrun.ini"; \
+    printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+      > "${WIN_CFG}" 2>/dev/null || true; \
+    echo "Wrote first-run config: ${WIN_CFG}"; \
     echo "Launching terminal for first-run AppData initialisation..."; \
     WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
-      wine "${TERM_EXE}" > /tmp/mt5-firstrun.log 2>&1 & \
+      wine "${TERM_EXE}" /config:"C:\\mt5-firstrun.ini" > /tmp/mt5-firstrun.log 2>&1 & \
     TERM_PID=$!; \
     \
     # Dismiss LiveUpdate and first-run wizards for up to 3 minutes. \
