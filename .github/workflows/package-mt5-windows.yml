@@ -41,11 +41,20 @@ jobs:
           du -sh mt5setup.exe
 
       - name: Run MT5 installer silently
-        shell: cmd
+        shell: powershell
         run: |
-          echo Starting MT5 installer with /auto flag...
-          start "" /wait mt5setup.exe /auto
-          echo Installer process exited.
+          Write-Host "Starting MT5 installer with /auto flag..."
+          # Use Start-Process -Wait so we get the desktop session context.
+          # Don't throw on non-zero exit: the stub may return 1 even on success.
+          $proc = Start-Process -FilePath "$env:GITHUB_WORKSPACE\mt5setup.exe" `
+                                -ArgumentList "/auto" `
+                                -PassThru `
+                                -Wait
+          Write-Host "Installer exited with code: $($proc.ExitCode)"
+          Write-Host "=== C:\Program Files after installer ==="
+          Get-ChildItem "C:\Program Files\" -ErrorAction SilentlyContinue | Format-Table Name
+          Write-Host "=== AppData\Roaming ==="
+          Get-ChildItem "$env:APPDATA\" -ErrorAction SilentlyContinue | Format-Table Name
 
       - name: Poll until terminal64.exe appears (up to 10 min)
         shell: bash
