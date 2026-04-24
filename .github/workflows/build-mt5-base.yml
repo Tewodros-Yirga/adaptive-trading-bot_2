@@ -16,7 +16,7 @@ on:
       mt5_url:
         description: "MT5 setup.exe URL (leave empty to skip terminal install)"
         required: false
-        default: "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+        default: "https://github.com/loriloha/adaptive-trading-bot/releases/download/mt5-portable-5005817/mt5-portable.zip"
       wine_base:
         description: "Wine base image tag (e.g. scottyhardy/docker-wine:latest)"
         required: false
