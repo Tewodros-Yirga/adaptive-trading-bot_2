@@ -31,7 +31,7 @@ ENV WINEFSYNC=0
 # ---------------------------------------------------------------------------
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        openbox xdotool \
+        openbox xdotool p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -90,48 +90,67 @@ RUN set -eux; \
       || echo "WARNING: mt5linux verification failed"; \
     \
     # -- Install MT5 terminal (only if HAS_MT5=true) -- \
-    # Strategy: \
-    #  1. Run installer with /auto to suppress welcome/EULA dialogs while \
-    #     the file download happens in the background (may take 60-120s). \
-    #  2. Wait 120s before any keyboard interaction so the download phase \
-    #     finishes before we touch anything (early Return = Cancel abort). \
-    #  3. Use Windows Alt+key accelerators (Alt+N=Next, Alt+F=Finish, \
-    #     Alt+A=Agree) — these target named button labels, not focus order, \
-    #     so they cannot accidentally hit the close-button or Cancel. \
+    # mt5setup.exe is an NSIS-family self-extracting archive.  We first try \
+    # to extract it with 7-Zip (fast, no GUI needed); only if that doesn't \
+    # yield terminal64.exe do we fall back to running the GUI installer. \
     if [ "${HAS_MT5}" = "true" ]; then \
-      DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
-      OPENBOX_INSTALL_PID=$!; \
-      sleep 2; \
-      ( \
-        sleep 120; \
-        for _try in $(seq 1 60); do \
-          _W=$(DISPLAY=:99 xdotool getactivewindow 2>/dev/null) || true; \
-          if [ -n "${_W}" ]; then \
-            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+n 2>/dev/null || true; \
-            sleep 0.5; \
-            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+a 2>/dev/null || true; \
-            sleep 0.5; \
-            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+i 2>/dev/null || true; \
-            sleep 0.5; \
-            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+f 2>/dev/null || true; \
-            sleep 0.5; \
-            DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers Return 2>/dev/null || true; \
-          fi; \
-          sleep 8; \
-        done; \
-      ) & \
-      INSTALLER_DISMISS_PID=$!; \
-      timeout 900 wine /tmp/mt5setup.exe /auto || true; \
-      kill "${INSTALLER_DISMISS_PID}" 2>/dev/null || true; \
-      kill "${OPENBOX_INSTALL_PID:-}" 2>/dev/null || true; \
-      sleep 5; \
-      # Diagnostic: show what was installed so we can debug path issues. \
+      TERM_EXE=""; \
+      \
+      # --- Method A: 7-Zip extraction (no Wine, no GUI) ------------------- \
+      echo "=== Trying 7-Zip extraction of mt5setup.exe ==="; \
+      7z x /tmp/mt5setup.exe -o/tmp/mt5_extr -y > /tmp/7z-extract.log 2>&1 || true; \
+      echo "=== 7z extraction log (last 20 lines) ==="; \
+      tail -20 /tmp/7z-extract.log 2>/dev/null || true; \
+      echo "=== Files extracted from mt5setup.exe ==="; \
+      find /tmp/mt5_extr -maxdepth 4 -type f 2>/dev/null | head -40 || true; \
+      TERM_EXE=$(find /tmp/mt5_extr -name "terminal64.exe" 2>/dev/null | head -1) || true; \
+      if [ -n "${TERM_EXE}" ]; then \
+        echo "Found terminal64.exe via 7z: ${TERM_EXE}"; \
+        _MT5_DEST="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5"; \
+        mkdir -p "${_MT5_DEST}"; \
+        cp -r /tmp/mt5_extr/. "${_MT5_DEST}/" 2>/dev/null || true; \
+        TERM_EXE="${_MT5_DEST}/terminal64.exe"; \
+      fi; \
+      rm -rf /tmp/mt5_extr; \
+      \
+      # --- Method B: GUI installer fallback (only if 7z found nothing) ---- \
+      if [ -z "${TERM_EXE}" ]; then \
+        echo "7z extraction did not yield terminal64.exe — falling back to GUI installer"; \
+        DISPLAY=:99 openbox --sm-disable > /tmp/openbox-install.log 2>&1 & \
+        OPENBOX_INSTALL_PID=$!; \
+        sleep 2; \
+        ( \
+          sleep 120; \
+          for _try in $(seq 1 60); do \
+            _W=$(DISPLAY=:99 xdotool getactivewindow 2>/dev/null) || true; \
+            if [ -n "${_W}" ]; then \
+              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+n 2>/dev/null || true; \
+              sleep 0.5; \
+              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+a 2>/dev/null || true; \
+              sleep 0.5; \
+              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+i 2>/dev/null || true; \
+              sleep 0.5; \
+              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers alt+f 2>/dev/null || true; \
+              sleep 0.5; \
+              DISPLAY=:99 xdotool key --window "${_W}" --clearmodifiers Return 2>/dev/null || true; \
+            fi; \
+            sleep 8; \
+          done; \
+        ) & \
+        INSTALLER_DISMISS_PID=$!; \
+        timeout 900 wine /tmp/mt5setup.exe /auto || true; \
+        kill "${INSTALLER_DISMISS_PID}" 2>/dev/null || true; \
+        kill "${OPENBOX_INSTALL_PID:-}" 2>/dev/null || true; \
+        sleep 5; \
+        TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
+          -name "terminal64.exe" 2>/dev/null | head -1) || true; \
+      fi; \
+      \
+      # --- Diagnostics ----------------------------------------------------- \
       echo "=== drive_c top-level ==="; \
       ls "${WINEPREFIX}/drive_c/" 2>/dev/null || true; \
       echo "=== Program Files ==="; \
       ls "${WINEPREFIX}/drive_c/Program Files/" 2>/dev/null || true; \
-      TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
-        -name "terminal64.exe" 2>/dev/null | head -1) || true; \
       echo "terminal64.exe: ${TERM_EXE:-NOT FOUND}"; \
       if [ -n "${TERM_EXE}" ]; then \
         echo "${TERM_EXE}" > /opt/mt5_terminal_exe.path; \
