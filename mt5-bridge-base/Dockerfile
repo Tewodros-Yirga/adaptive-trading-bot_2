@@ -100,24 +100,39 @@ RUN set -eux; \
       OPENBOX_INSTALL_PID=$!; \
       sleep 2; \
       ( \
-        sleep 15; \
+        sleep 20; \
         for _try in $(seq 1 180); do \
-          # Use plain search (not --onlyvisible) because without a WM all \
-          # Wine windows appear invisible to xdotool but are still clickable. \
-          _IDS=$(DISPLAY=:99 xdotool search --name "" 2>/dev/null \
-            | awk 'NF' | sort -n -u) || true; \
-          for _wid in ${_IDS}; do \
-            DISPLAY=:99 xdotool windowfocus --sync "${_wid}" 2>/dev/null || true; \
+          # Use the active/focused window first — keyboard Return advances \
+          # all installer pages (Next, Accept, Install, Finish). \
+          _ACTIVE=$(DISPLAY=:99 xdotool getactivewindow 2>/dev/null) || true; \
+          if [ -n "${_ACTIVE}" ]; then \
+            DISPLAY=:99 xdotool key --window "${_ACTIVE}" \
+              --clearmodifiers Return 2>/dev/null || true; \
+            sleep 0.4; \
+            DISPLAY=:99 xdotool key --window "${_ACTIVE}" \
+              --clearmodifiers space 2>/dev/null || true; \
+            sleep 0.4; \
+            DISPLAY=:99 xdotool key --window "${_ACTIVE}" \
+              --clearmodifiers Tab Return 2>/dev/null || true; \
+          fi; \
+          # Also find named windows (real dialogs, skip Wine internal ones). \
+          # IMPORTANT: only click left/center of window — rightside coords \
+          # (x>500) hit the WM close-button and abort the installer! \
+          while IFS= read -r _wid; do \
+            _NAME=$(DISPLAY=:99 xdotool getwindowname "${_wid}" 2>/dev/null) \
+              || continue; \
+            [ -z "${_NAME}" ] && continue; \
+            DISPLAY=:99 xdotool windowfocus --sync "${_wid}" 2>/dev/null \
+              || continue; \
             sleep 0.2; \
-            for _xy in "400 300" "500 300" "640 350" \
-                       "400 380" "500 400" "640 400" \
-                       "360 450" "500 450" "640 450"; do \
+            for _xy in "300 380" "350 400" "280 420" "200 400"; do \
               set -- ${_xy}; \
               DISPLAY=:99 xdotool mousemove --window "${_wid}" \
                 --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
             done; \
-            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
-          done; \
+            DISPLAY=:99 xdotool key --window "${_wid}" \
+              --clearmodifiers Return 2>/dev/null || true; \
+          done < <(DISPLAY=:99 xdotool search --name "" 2>/dev/null || true); \
           sleep 5; \
         done; \
       ) & \
