@@ -72,9 +72,11 @@ find "${APPDATA_MT5}" -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null
   | while IFS= read -r _hcfg; do _write_cfg "${_hcfg}"; done || true
 unset -f _write_cfg
 
-WIN_CFG_LINUX="${WINEPREFIX}/drive_c/mt5-headless.ini"
-printf '[Common]\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
-  > "${WIN_CFG_LINUX}" 2>/dev/null || true
+# Also patch the portable install-dir config for /portable mode.
+_write_cfg "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config"
+printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+  > "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal.ini" 2>/dev/null || true
+echo "Wrote portable terminal.ini stub"
 
 # ---------------------------------------------------------------------------
 # Start Xvfb + openbox
@@ -106,8 +108,11 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Launch terminal
 # ---------------------------------------------------------------------------
+# Launch in portable mode — same technique that fixed the build phase.
+# /portable stores all state in the install dir; LiveUpdate dialog appears
+# but the main thread (IPC pump) is NOT blocked by it in portable mode.
 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
-  wine "${TERM_EXE}" /config:"C:\\mt5-headless.ini" \
+  wine "${TERM_EXE}" /portable \
   > "${LOGDIR}/terminal.log" 2>&1 &
 TERM_PID=$!
 echo "Terminal PID: ${TERM_PID} — waiting 90 s for initial startup..."
@@ -146,17 +151,16 @@ echo "GATE 1 PASS: terminal64.exe is alive after 90 s (PID ${TERM_PID})"
       WIN_NAME=$(_xd getwindowname "${_wid}" || echo "?")
       echo "[smoke-dismiss iter=${_iter}] wid=${_wid} name=${WIN_NAME}"
       _xd windowactivate --sync "${_wid}"; sleep 0.2
-      # Escape = cancel login dialog → offline mode → IPC pump free
-      _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
-      _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
-      # For company-selection wizard: also try clicking Cancel area
-      WIN_GEOM=$(_xd getwindowgeometry --shell "${_wid}" || true)
-      eval "${WIN_GEOM}" 2>/dev/null || true
-      WIN_W="${WIDTH:-800}"; WIN_H="${HEIGHT:-600}"; WIN_X="${X:-240}"; WIN_Y="${Y:-60}"
-      # Click Cancel (lower-left quadrant)
-      _xd mousemove --clearmodifiers \
-        "$(( WIN_X + WIN_W / 4 ))" "$(( WIN_Y + WIN_H * 7 / 8 ))" click 1; sleep 0.1
-      _xd key --window "${_wid}" --clearmodifiers Escape
+      # LiveUpdate: use windowclose (WM_DELETE_WINDOW) — Escape was causing
+      # the terminal itself to exit rather than just closing the dialog.
+      _name=$(echo "${WIN_NAME}" | tr '[:upper:]' '[:lower:]')
+      if echo "${_name}" | grep -q 'liveupdate'; then
+        _xd windowclose "${_wid}" 2>/dev/null || true; sleep 0.3
+      else
+        # Login/company-select: Escape → offline mode → IPC pump free
+        _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
+        _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
+      fi
     done
     sleep 3
   done
