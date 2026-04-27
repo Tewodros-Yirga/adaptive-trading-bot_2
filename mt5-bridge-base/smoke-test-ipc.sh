@@ -62,7 +62,7 @@ fi
 _write_cfg() {
   local _d="$1"
   mkdir -p "${_d}" 2>/dev/null || return
-  printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+  printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
     > "${_d}/common.ini" 2>/dev/null || true
   echo "Wrote server config: ${_d}/common.ini"
 }
@@ -72,10 +72,10 @@ find "${APPDATA_MT5}" -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null
   | while IFS= read -r _hcfg; do _write_cfg "${_hcfg}"; done || true
 unset -f _write_cfg
 
-# Write portable terminal.ini stub (suppresses first-run wizard).
-printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+# Write portable terminal.ini stub (suppresses first-run wizard + LiveUpdate).
+printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
   > "${TERM_DIR}/terminal.ini" 2>/dev/null || true
-echo "Wrote portable terminal.ini stub"
+echo "Wrote portable terminal.ini stub (LiveUpdate disabled)"
 
 # Block update domains at Linux OS level (belt-and-suspenders with Wine hosts).
 for _upd in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
@@ -136,6 +136,16 @@ trap cleanup EXIT
   done
 ) &
 LIVEME_PID=$!
+
+# Write LiveUpdate=disabled into Wine registry before terminal launch.
+# Belt-and-suspenders alongside terminal.ini settings.
+WINEDEBUG="-all" WINEESYNC=0 WINEFSYNC=0 \
+  wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
+    /v "LiveUpdate" /t REG_DWORD /d 0 /f 2>/dev/null || true
+WINEDEBUG="-all" WINEESYNC=0 WINEFSYNC=0 \
+  wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5\\Settings" \
+    /v "LiveUpdate" /t REG_DWORD /d 0 /f 2>/dev/null || true
+echo "Registry: LiveUpdate=0 written"
 
 # ---------------------------------------------------------------------------
 # Launch terminal in /portable mode

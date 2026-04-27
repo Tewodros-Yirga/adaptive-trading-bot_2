@@ -222,10 +222,13 @@ RUN set -eux; \
     \
     # Pre-write portable config and terminal.ini so the first-run wizard \
     # is skipped and broker login is attempted automatically on startup. \
+    # AutoUpdate=0 and [LiveUpdate] Enabled=0 prevent MT5 from running its \
+    # built-in LiveUpdate thread, which otherwise calls DialogBox() on the \
+    # main thread and blocks the IPC message pump indefinitely. \
     mkdir -p "${TERM_DIR}/config" 2>/dev/null || true; \
-    printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+    printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n' \
       > "${TERM_DIR}/config/common.ini" 2>/dev/null || true; \
-    printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+    printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
       > "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
     echo "Pre-wrote portable terminal.ini and config/common.ini"; \
     \
@@ -284,14 +287,22 @@ RUN set -eux; \
           grep -q '\[Experts\]' "${_hdir}/terminal.ini" 2>/dev/null \
             || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
                  >> "${_hdir}/terminal.ini" 2>/dev/null || true; \
+          # Also add LiveUpdate=0 to suppress update dialog in AppData hash dirs. \
+          grep -q '\[LiveUpdate\]' "${_hdir}/terminal.ini" 2>/dev/null \
+            || printf '\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
+                 >> "${_hdir}/terminal.ini" 2>/dev/null || true; \
           echo "Patched AppData hash-dir: ${_hdir}"; \
         done; \
     \
-    # Bake Allow-Algo-Trading into Wine registry. \
+    # Bake Allow-Algo-Trading + LiveUpdate=disabled into Wine registry. \
     wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
       /v "ExpertAdvisors" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
     wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
       /v "AlgoTradingEnabled" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
+    wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
+      /v "LiveUpdate" /t REG_DWORD /d 0 /f 2>/dev/null || true; \
+    wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5\\Settings" \
+      /v "LiveUpdate" /t REG_DWORD /d 0 /f 2>/dev/null || true; \
     \
     echo "=== Install dir files ==="; \
     find "${TERM_DIR}" -maxdepth 1 -type f 2>/dev/null | head -20 || true; \
