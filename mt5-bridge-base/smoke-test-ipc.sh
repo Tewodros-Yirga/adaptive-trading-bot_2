@@ -86,6 +86,19 @@ done
 echo "Linux /etc/hosts patched for update domain blocking"
 
 # ---------------------------------------------------------------------------
+# Remove liveme.exe from the MT5 install directory.
+# MT5 calls CreateProcess(liveme.exe) + WaitForSingleObject on startup,
+# which blocks the main thread (and IPC pump) until liveme.exe exits.
+# Since liveme.exe shows a GUI dialog that requires user input, it never
+# exits — causing -10005 indefinitely. Removing the file causes CreateProcess
+# to fail instantly, freeing the main thread for IPC.
+# ---------------------------------------------------------------------------
+find "${TERM_DIR}" -maxdepth 1 -iname "liveme*.exe" -delete 2>/dev/null || true
+ls -la "${TERM_DIR}/liveme.exe" 2>/dev/null \
+  && echo "WARNING: liveme.exe still present!" \
+  || echo "liveme.exe removed (or was never present)"
+
+# ---------------------------------------------------------------------------
 # Start Xvfb + openbox
 # ---------------------------------------------------------------------------
 rm -f /tmp/.X99-lock || true
@@ -103,7 +116,9 @@ fi
 
 TERM_PID=""
 DISMISS_PID=""
+LIVEME_PID=""
 cleanup() {
+  kill "${LIVEME_PID:-}"  2>/dev/null || true
   kill "${TERM_PID:-}"    2>/dev/null || true
   kill "${DISMISS_PID:-}" 2>/dev/null || true
   kill "${OPENBOX_PID:-}" 2>/dev/null || true
@@ -111,6 +126,16 @@ cleanup() {
   wineserver -k 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Background loop: aggressively kill any liveme.exe wine process that appears.
+# Belt-and-suspenders in case MT5 re-downloads liveme.exe at runtime.
+(
+  while true; do
+    pkill -f -i 'liveme' 2>/dev/null || true
+    sleep 1
+  done
+) &
+LIVEME_PID=$!
 
 # ---------------------------------------------------------------------------
 # Launch terminal in /portable mode

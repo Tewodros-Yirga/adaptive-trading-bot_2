@@ -230,12 +230,20 @@ RUN set -eux; \
     echo "Pre-wrote portable terminal.ini and config/common.ini"; \
     \
     # -----------------------------------------------------------------------\
-    # Launch in PORTABLE mode (technique from mobjoy0/mt5-bridge, GitHub).\
-    # /portable stores ALL state inside the install directory, not AppData.\
-    # The LiveUpdate dialog appears but is irrelevant — we just wait for\
-    # the terminal to finish writing MQL5/ dirs, then kill it cleanly.\
-    # No xdotool dialog dismissal is required.\
+    # CRITICAL: remove liveme.exe before launching the terminal.\
+    # MT5 calls CreateProcess(liveme.exe) + WaitForSingleObject on startup,\
+    # blocking the main thread (and therefore the IPC message pump) until\
+    # liveme.exe exits. Since liveme.exe shows a dialog that needs user input,\
+    # it never exits on its own — causing -10005 indefinitely.\
+    # Without liveme.exe, CreateProcess fails instantly, the Wait returns,\
+    # and the main thread is free to service IPC requests.\
     # -----------------------------------------------------------------------\
+    echo "Removing liveme.exe (LiveUpdate child process — blocks IPC if present)..."; \
+    find "${TERM_DIR}" -maxdepth 1 -iname "liveme*.exe" -delete 2>/dev/null || true; \
+    ls -la "${TERM_DIR}/liveme.exe" 2>/dev/null \
+      && echo "WARNING: liveme.exe still present!" \
+      || echo "liveme.exe removed (or was never present)"; \
+    \
     echo "Launching terminal in portable mode..."; \
     DISPLAY=:99 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
       wine "${TERM_EXE}" /portable > /tmp/mt5-firstrun.log 2>&1 & \
