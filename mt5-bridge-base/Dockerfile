@@ -229,20 +229,19 @@ RUN set -eux; \
     done; \
     echo "Wine-side hosts file written"; \
     \
-    # Pre-write MetaQuotes-Demo server config to both candidate config paths. \
-    # This tells the terminal which server to pre-select, converting the \
-    # "Select a company" wizard into a simpler Login form. \
+    # Pre-write Exness broker config so the terminal auto-logs in during \
+    # first-run init, writes terminal.ini, and bypasses all wizard dialogs. \
     for _cfg_dir in \
       "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config" \
       "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"; do \
       mkdir -p "${_cfg_dir}" 2>/dev/null || true; \
-      printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+      printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
         > "${_cfg_dir}/common.ini" 2>/dev/null || true; \
       echo "Pre-wrote server config: ${_cfg_dir}/common.ini"; \
     done; \
     \
     WIN_CFG="${WINEPREFIX}/drive_c/mt5-firstrun.ini"; \
-    printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+    printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
       > "${WIN_CFG}" 2>/dev/null || true; \
     echo "Wrote first-run config: ${WIN_CFG}"; \
     echo "Launching terminal for first-run AppData initialisation..."; \
@@ -370,7 +369,7 @@ RUN set -eux; \
           _bn=$(basename "${_hdir}"); \
           if [ "${_bn}" = "Common" ] || [ "${_bn}" = "Community" ] || [ "${_bn}" = "Help" ]; then continue; fi; \
           if [ ! -f "${_hdir}/terminal.ini" ]; then \
-            printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nServer=MetaQuotes-Demo\r\nLogin=\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+            printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
               > "${_hdir}/terminal.ini" 2>/dev/null || true; \
             echo "Wrote synthetic terminal.ini: ${_hdir}/terminal.ini"; \
             INIT_DONE=true; \
@@ -401,7 +400,7 @@ RUN set -eux; \
           _basename=$(basename "${_hdir}"); \
           if [ "${_basename}" = "Common" ] || [ "${_basename}" = "Community" ]; then continue; fi; \
           mkdir -p "${_hdir}/config" 2>/dev/null || true; \
-          printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+          printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
             > "${_hdir}/config/common.ini" 2>/dev/null || true; \
           echo "Wrote hash-dir config: ${_hdir}/config/common.ini"; \
         done; \

@@ -62,7 +62,7 @@ fi
 _write_cfg() {
   local _d="$1"
   mkdir -p "${_d}" 2>/dev/null || return
-  printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+  printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
     > "${_d}/common.ini" 2>/dev/null || true
   echo "Wrote server config: ${_d}/common.ini"
 }
@@ -175,11 +175,15 @@ PROBE_SCRIPT='
 import sys, time
 try:
     import MetaTrader5 as mt5
-    ok = mt5.initialize(timeout=12000)
+    ok = mt5.initialize(
+        login=435609450,
+        password="Mznxbcv12#",
+        server="Exness-MT5Trial9",
+        timeout=12000
+    )
     err = mt5.last_error()
     mt5.shutdown()
     print("ok=%s err=%s" % (ok, err))
-    # Exit 0 = pass, 2 = -10003 (pipe not found), 3 = -10005 (timeout/retry)
     if ok:
         sys.exit(0)
     elif err[0] == -10003:
