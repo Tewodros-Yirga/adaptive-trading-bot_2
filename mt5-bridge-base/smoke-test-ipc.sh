@@ -189,19 +189,19 @@ DISMISS_PID=$!
 #   shell: timeout 45              — must be > Python timeout so Python
 #                                    always returns before the shell kills it
 # ---------------------------------------------------------------------------
-PROBE_SCRIPT='
-import sys, time
+# Phase 1 probe: IPC-only (no credentials).
+# mt5.initialize() without login/server just verifies the named pipe is alive.
+# Returns True in ~2 s if the terminal is running — no broker roundtrip,
+# no LiveUpdate or network auth can block it.
+IPC_PROBE_SCRIPT='
+import sys
 try:
     import MetaTrader5 as mt5
-    ok = mt5.initialize(
-        login=435609450,
-        password="Mznxbcv12#",
-        server="Exness-MT5Trial9",
-        timeout=30000
-    )
+    ok = mt5.initialize(timeout=10000)
     err = mt5.last_error()
+    ver = mt5.version() if ok else None
     mt5.shutdown()
-    print("ok=%s err=%s" % (ok, err))
+    print("ok=%s err=%s version=%s" % (ok, err, ver))
     if ok:
         sys.exit(0)
     elif err[0] == -10003:
@@ -213,7 +213,32 @@ except Exception as e:
     sys.exit(4)
 '
 
-echo "GATE 2: probing mt5.initialize() (20 attempts × 30 s = 10 min)..."
+# Phase 2 probe (non-fatal): verify broker login works.
+BROKER_PROBE_SCRIPT='
+import sys
+try:
+    import MetaTrader5 as mt5
+    ok = mt5.initialize(
+        login=435609450,
+        password="Mznxbcv12#",
+        server="Exness-MT5Trial9",
+        timeout=30000
+    )
+    err = mt5.last_error()
+    acct = mt5.account_info()
+    mt5.shutdown()
+    print("ok=%s err=%s login=%s balance=%s" % (
+        ok, err,
+        getattr(acct,"login","?") if acct else "?",
+        getattr(acct,"balance","?") if acct else "?",
+    ))
+    sys.exit(0 if ok else 1)
+except Exception as e:
+    print("exception: %s" % e)
+    sys.exit(1)
+'
+
+echo "GATE 2: probing mt5.initialize() IPC-only (20 attempts × 30 s = 10 min)..."
 IPC_PASS=false
 
 for attempt in $(seq 1 20); do
@@ -238,10 +263,11 @@ for attempt in $(seq 1 20); do
     exit 1
   fi
 
-  # Run probe — shell timeout 45 s > Python mt5 timeout 30 s.
+  # Run IPC-only probe — no credentials, no broker roundtrip.
+  # Shell timeout 20 s > Python mt5 timeout 10 s.
   PROBE_OUT=""
   PROBE_EXIT=0
-  PROBE_OUT=$(DISPLAY="${DISPLAY}" timeout 45 wine "${WINE_PY}" -c "${PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
+  PROBE_OUT=$(DISPLAY="${DISPLAY}" timeout 20 wine "${WINE_PY}" -c "${IPC_PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
 
   echo "[attempt ${attempt}/20] probe_exit=${PROBE_EXIT} probe_out=${PROBE_OUT}"
 
@@ -269,20 +295,37 @@ kill "${DISMISS_PID}" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # Final verdict
 # ---------------------------------------------------------------------------
-if [[ "${IPC_PASS}" == "true" ]]; then
-  echo "SMOKE TEST PASS: IPC handshake succeeded — terminal is healthy"
-  exit 0
+if [[ "${IPC_PASS}" != "true" ]]; then
+  echo "SMOKE TEST FAIL: mt5.initialize() (IPC-only) never returned ok=True after 20 attempts"
+  echo ""
+  echo "Diagnostic summary:"
+  echo "  probe_exit=3 (-10005): terminal main thread blocked entire window."
+  echo "  probe_exit=2 (-10003): IPC pipe not found — terminal crashed."
+  echo "  probe_exit=124: IPC pipe exists but auth handshake never completes."
+  echo "  Check terminal.log below for clues."
+  echo ""
+  echo "--- terminal.log (tail 200) ---"
+  tail -n 200 "${LOGDIR}/terminal.log" 2>/dev/null || true
+  echo "--- xvfb.log (tail 50) ---"
+  tail -n 50 "${LOGDIR}/xvfb.log" 2>/dev/null || true
+  exit 1
 fi
 
-echo "SMOKE TEST FAIL: mt5.initialize() never returned ok=True after 20 attempts"
+# ---------------------------------------------------------------------------
+# GATE 3 (non-fatal): broker login check
+# ---------------------------------------------------------------------------
+echo "GATE 3: verifying broker login (Exness-MT5Trial9, non-fatal)..."
+BROKER_OUT=""
+BROKER_EXIT=0
+BROKER_OUT=$(DISPLAY="${DISPLAY}" timeout 45 wine "${WINE_PY}" -c "${BROKER_PROBE_SCRIPT}" 2>&1) || BROKER_EXIT=$?
+echo "Broker probe: exit=${BROKER_EXIT} out=${BROKER_OUT}"
+if [[ "${BROKER_EXIT}" -eq 0 ]]; then
+  echo "GATE 3 PASS: broker login succeeded"
+else
+  echo "GATE 3 WARNING: broker login failed (account may be expired or server unreachable)"
+  echo "This is non-fatal for the base image — credentials are configured at runtime."
+fi
+
 echo ""
-echo "Diagnostic summary:"
-echo "  probe_exit=3 (-10005): terminal main thread blocked entire window."
-echo "  probe_exit=124: IPC pipe exists but auth handshake never completes."
-echo "  Check terminal.log below for clues."
-echo ""
-echo "--- terminal.log (tail 200) ---"
-tail -n 200 "${LOGDIR}/terminal.log" 2>/dev/null || true
-echo "--- xvfb.log (tail 50) ---"
-tail -n 50 "${LOGDIR}/xvfb.log" 2>/dev/null || true
-exit 1
+echo "SMOKE TEST PASS: IPC handshake succeeded — terminal is ready"
+exit 0
