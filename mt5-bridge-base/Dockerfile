@@ -248,7 +248,7 @@ time.sleep(600); \
 " 2>/dev/null & \
     FAKE_SRV_PID=$!; \
     sleep 0.5; \
-    echo "Fake TCP-closer PID=${FAKE_SRV_PID} — LiveUpdate will fail fast";
+    echo "Fake TCP-closer PID=${FAKE_SRV_PID} — LiveUpdate will fail fast"; \
     \
     # Pre-write Exness broker config so the terminal auto-logs in during \
     # first-run init, writes terminal.ini, and bypasses all wizard dialogs. \
