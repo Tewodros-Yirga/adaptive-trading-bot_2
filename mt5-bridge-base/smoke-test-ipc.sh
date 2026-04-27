@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# smoke-test-ipc.sh — validates the baked MT5 base image via mt5-bridge REST API
-#
-# Architecture (mt5-bridge approach):
-#   terminal64.exe   ← Wine/X11
-#       ↑ MetaTrader5 named-pipe IPC (same Wine process space — no cross-OS problem)
-#   mt5-bridge server (wine python mt5-bridge server --host 0.0.0.0 --port 8000)
-#       ↑ HTTP REST (plain TCP — works from any OS)
-#   THIS SCRIPT → curl http://127.0.0.1:8000/health
+# smoke-test-ipc.sh — validates the baked MT5 base image
 #
 # Pass criteria (in order):
-#   GATE 1: terminal64.exe starts and stays alive for 120 s.
-#   GATE 2: mt5-bridge /health returns HTTP 200 within 20 probes × 20 s = 6.7 min.
-#   GATE 3: /account returns a valid JSON account object.
+#   GATE 1: terminal64.exe starts and stays alive for 120 s (crash detection).
+#   GATE 2: mt5.initialize() returns ok=True within 20 probes × 30 s = 10 min.
+#
+# Key design notes:
+#   - Terminal is launched with /portable to suppress the first-run wizard.
+#   - LiveUpdate dialog dismissed with Alt+F4 (targets focused child only —
+#     windowclose/WM_DELETE_WINDOW propagates to root and kills the terminal).
+#   - Shell probe timeout (45 s) > mt5 timeout (30 s) so the Python process
+#     always returns before the shell kills it.
+#   - "MetaTrader" / "MetaTrader 5" NOT in the dismiss search list — those
+#     patterns match the healthy main window and Escape disrupts the terminal.
 set -euo pipefail
 
 export DISPLAY="${DISPLAY:-:99}"
@@ -25,9 +26,6 @@ export WINEFSYNC=0
 
 LOGDIR="/tmp/mt5-ipc-smoke"
 mkdir -p "${LOGDIR}"
-
-BRIDGE_PORT=8000
-BRIDGE_URL="http://127.0.0.1:${BRIDGE_PORT}"
 
 # ---------------------------------------------------------------------------
 # Validate pre-baked paths
@@ -74,12 +72,12 @@ find "${APPDATA_MT5}" -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null
   | while IFS= read -r _hcfg; do _write_cfg "${_hcfg}"; done || true
 unset -f _write_cfg
 
-# Write portable terminal.ini stub (for /portable mode launch).
+# Write portable terminal.ini stub (suppresses first-run wizard).
 printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
   > "${TERM_DIR}/terminal.ini" 2>/dev/null || true
 echo "Wrote portable terminal.ini stub"
 
-# Block update domains at Linux OS level.
+# Block update domains at Linux OS level (belt-and-suspenders with Wine hosts).
 for _upd in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
             cdn.mql5.com update.metatrader5.com updates.metatrader5.com \
             mt5-update.metaquotes.net; do
@@ -104,22 +102,21 @@ if command -v openbox > /dev/null 2>&1; then
 fi
 
 TERM_PID=""
-BRIDGE_PID=""
 DISMISS_PID=""
 cleanup() {
-  kill "${BRIDGE_PID:-}"   2>/dev/null || true
-  kill "${TERM_PID:-}"     2>/dev/null || true
-  kill "${DISMISS_PID:-}"  2>/dev/null || true
-  kill "${OPENBOX_PID:-}"  2>/dev/null || true
-  kill "${XVFB_PID:-}"     2>/dev/null || true
+  kill "${TERM_PID:-}"    2>/dev/null || true
+  kill "${DISMISS_PID:-}" 2>/dev/null || true
+  kill "${OPENBOX_PID:-}" 2>/dev/null || true
+  kill "${XVFB_PID:-}"   2>/dev/null || true
   wineserver -k 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# Launch terminal in portable mode
+# Launch terminal in /portable mode
+# /portable = MT5 stores all state in the install dir, not AppData.
+# This bypasses the first-run wizard that blocks the main thread.
 # ---------------------------------------------------------------------------
-echo "Launching terminal in portable mode..."
 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
   wine "${TERM_EXE}" /portable \
   > "${LOGDIR}/terminal.log" 2>&1 &
@@ -139,18 +136,21 @@ fi
 echo "GATE 1 PASS: terminal64.exe is alive after 120 s (PID ${TERM_PID})"
 
 # ---------------------------------------------------------------------------
-# Background dialog dismisser (LiveUpdate only — Alt+F4 on dialog window)
+# Background dialog dismisser
+# Only targets known dialog names — NOT "MetaTrader"/"MetaTrader 5" which
+# match the healthy main window. Uses Alt+F4 for LiveUpdate (closes only the
+# focused child dialog; windowclose kills the parent terminal process).
 # ---------------------------------------------------------------------------
 (
   _xd() { DISPLAY="${DISPLAY}" xdotool "$@" 2>/dev/null || true; }
-  for _iter in $(seq 1 120); do
+  for _iter in $(seq 1 200); do
     IDS=$(
       { _xd search --onlyvisible --name "LiveUpdate";
         _xd search --onlyvisible --name "Select a company";
         _xd search --onlyvisible --name "Welcome to";
         _xd search --onlyvisible --name "Login";
         _xd search --onlyvisible --name "Setup";
-        # NOTE: NOT searching "MetaTrader" — it matches the healthy main window
+        # DO NOT add "MetaTrader" or "MetaTrader 5" — matches the main window.
       } | awk 'NF' | sort -n -u
     )
     for _wid in ${IDS:-}; do
@@ -159,12 +159,15 @@ echo "GATE 1 PASS: terminal64.exe is alive after 120 s (PID ${TERM_PID})"
       _xd windowactivate --sync "${_wid}"; sleep 0.3
       _name=$(echo "${WIN_NAME}" | tr '[:upper:]' '[:lower:]')
       if echo "${_name}" | grep -q 'liveupdate'; then
-        # Alt+F4 targets only the focused child dialog, NOT the parent terminal.
-        _xd key --window "${_wid}" --clearmodifiers alt+F4; sleep 0.4
-        # Fallback: Tab → 'Later' button, Space activates it.
+        # Alt+F4: sends WM_SYSCOMMAND SC_CLOSE to the focused child only.
+        # This differs from windowclose (WM_DELETE_WINDOW) which propagates
+        # up to the root window and kills the entire terminal process.
+        _xd key --window "${_wid}" --clearmodifiers alt+F4; sleep 0.5
+        # Belt-and-suspenders: Tab → 'Later' button, Space clicks it.
         _xd key --window "${_wid}" --clearmodifiers Tab; sleep 0.2
         _xd key --window "${_wid}" --clearmodifiers space; sleep 0.3
       else
+        # Login / company-select: Escape → offline mode → IPC pump free.
         _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
       fi
     done
@@ -174,77 +177,112 @@ echo "GATE 1 PASS: terminal64.exe is alive after 120 s (PID ${TERM_PID})"
 DISMISS_PID=$!
 
 # ---------------------------------------------------------------------------
-# Launch mt5-bridge server inside Wine
-# mt5-bridge talks to the running terminal via MetaTrader5 named-pipe IPC
-# (same Wine process space → no cross-OS timeout issues).
-# External callers reach it via plain HTTP on port 8000.
+# GATE 2: mt5.initialize() probe — 20 attempts × 30 s = 10 min
+#
+# Error codes:
+#   -10003 → IPC pipe not found → terminal dead → FAIL immediately
+#   -10005 → IPC pipe found but main thread still busy → retry
+#   True   → IPC handshake complete → PASS
+#
+# IMPORTANT timeouts:
+#   mt5.initialize(timeout=30000)  — 30 s inside Python
+#   shell: timeout 45              — must be > Python timeout so Python
+#                                    always returns before the shell kills it
 # ---------------------------------------------------------------------------
-echo "Starting mt5-bridge server (wine python -m mt5_bridge server)..."
-WINEDEBUG="-all" WINEESYNC=0 WINEFSYNC=0 \
-  wine "${WINE_PY}" -m mt5_bridge server \
-    --host 0.0.0.0 \
-    --port "${BRIDGE_PORT}" \
-    --mt5-path "$(echo "${TERM_EXE}" | sed 's|/opt/wineprefix/drive_c/|C:\\\\|;s|/|\\\\|g')" \
-  > "${LOGDIR}/bridge.log" 2>&1 &
-BRIDGE_PID=$!
-echo "mt5-bridge server PID: ${BRIDGE_PID}"
+PROBE_SCRIPT='
+import sys, time
+try:
+    import MetaTrader5 as mt5
+    ok = mt5.initialize(
+        login=435609450,
+        password="Mznxbcv12#",
+        server="Exness-MT5Trial9",
+        timeout=30000
+    )
+    err = mt5.last_error()
+    mt5.shutdown()
+    print("ok=%s err=%s" % (ok, err))
+    if ok:
+        sys.exit(0)
+    elif err[0] == -10003:
+        sys.exit(2)
+    else:
+        sys.exit(3)
+except Exception as e:
+    print("exception: %s" % e)
+    sys.exit(4)
+'
 
-# ---------------------------------------------------------------------------
-# GATE 2: /health returns HTTP 200 within 20 probes × 20 s = ~6.7 min
-# ---------------------------------------------------------------------------
-echo "GATE 2: probing ${BRIDGE_URL}/health (20 attempts × 20 s)..."
+echo "GATE 2: probing mt5.initialize() (20 attempts × 30 s = 10 min)..."
 IPC_PASS=false
 
 for attempt in $(seq 1 20); do
-  sleep 20
+  # Show visible windows for diagnostics.
+  WIN_TITLES=""
+  if command -v xdotool > /dev/null 2>&1; then
+    WIN_TITLES=$(
+      DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
+        | while IFS= read -r _wid; do
+            DISPLAY="${DISPLAY}" xdotool getwindowname "${_wid}" 2>/dev/null || true
+          done | paste -sd'|' -
+    ) || WIN_TITLES=""
+  fi
+  echo "[attempt ${attempt}/20] windows=${WIN_TITLES}"
 
-  # Crash checks
+  # Crash check.
   if ! kill -0 "${TERM_PID}" 2>/dev/null; then
     echo "SMOKE TEST FAIL: terminal64.exe died during probe (attempt ${attempt})"
-    echo "--- terminal.log (tail 50) ---"
-    tail -n 50 "${LOGDIR}/terminal.log" 2>/dev/null || true
-    exit 1
-  fi
-  if ! kill -0 "${BRIDGE_PID}" 2>/dev/null; then
-    echo "SMOKE TEST FAIL: mt5-bridge server died (attempt ${attempt})"
-    echo "--- bridge.log (tail 50) ---"
-    tail -n 50 "${LOGDIR}/bridge.log" 2>/dev/null || true
+    echo "--- terminal.log (tail 100) ---"
+    tail -n 100 "${LOGDIR}/terminal.log" 2>/dev/null || true
+    kill "${DISMISS_PID}" 2>/dev/null || true
     exit 1
   fi
 
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    --max-time 10 "${BRIDGE_URL}/health" 2>/dev/null) || HTTP_CODE="000"
-  echo "[attempt ${attempt}/20] /health HTTP ${HTTP_CODE}"
+  # Run probe — shell timeout 45 s > Python mt5 timeout 30 s.
+  PROBE_OUT=""
+  PROBE_EXIT=0
+  PROBE_OUT=$(DISPLAY="${DISPLAY}" timeout 45 wine "${WINE_PY}" -c "${PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
 
-  if [[ "${HTTP_CODE}" == "200" ]]; then
-    echo "GATE 2 PASS: mt5-bridge /health returned 200 (attempt ${attempt})"
+  echo "[attempt ${attempt}/20] probe_exit=${PROBE_EXIT} probe_out=${PROBE_OUT}"
+
+  if [[ "${PROBE_EXIT}" -eq 0 ]]; then
+    echo "GATE 2 PASS: mt5.initialize() returned ok=True (attempt ${attempt})"
     IPC_PASS=true
     break
+  elif [[ "${PROBE_EXIT}" -eq 2 ]]; then
+    echo "SMOKE TEST FAIL: -10003 (IPC pipe not found) — terminal is not creating the pipe"
+    echo "--- terminal.log (tail 100) ---"
+    tail -n 100 "${LOGDIR}/terminal.log" 2>/dev/null || true
+    kill "${DISMISS_PID}" 2>/dev/null || true
+    exit 1
+  elif [[ "${PROBE_EXIT}" -eq 124 ]]; then
+    echo "[attempt ${attempt}/20] probe timed out (shell 45 s) — terminal pipe exists but hung; retrying..."
+  else
+    echo "[attempt ${attempt}/20] -10005 or other error — main thread busy, retrying in 30 s..."
   fi
+
+  sleep 30
 done
 
-if [[ "${IPC_PASS}" != "true" ]]; then
-  echo "SMOKE TEST FAIL: /health never returned 200 after 20 attempts"
-  echo "--- bridge.log (tail 100) ---"
-  tail -n 100 "${LOGDIR}/bridge.log" 2>/dev/null || true
-  echo "--- terminal.log (tail 50) ---"
-  tail -n 50 "${LOGDIR}/terminal.log" 2>/dev/null || true
-  exit 1
-fi
+kill "${DISMISS_PID}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# GATE 3: /account returns valid JSON
+# Final verdict
 # ---------------------------------------------------------------------------
-echo "GATE 3: verifying /account returns valid JSON..."
-ACCT=$(curl -s --max-time 10 "${BRIDGE_URL}/account" 2>/dev/null) || ACCT=""
-echo "Account response: ${ACCT}"
-if echo "${ACCT}" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'balance' in d or 'login' in d" 2>/dev/null; then
-  echo "GATE 3 PASS: /account returned valid account JSON"
-else
-  echo "WARNING: /account did not return expected JSON — terminal may not be logged in yet"
-  echo "(This is non-fatal; the bridge is up and IPC is working)"
+if [[ "${IPC_PASS}" == "true" ]]; then
+  echo "SMOKE TEST PASS: IPC handshake succeeded — terminal is healthy"
+  exit 0
 fi
 
+echo "SMOKE TEST FAIL: mt5.initialize() never returned ok=True after 20 attempts"
 echo ""
-echo "SMOKE TEST PASS: mt5-bridge REST API is healthy — terminal is ready"
-exit 0
+echo "Diagnostic summary:"
+echo "  probe_exit=3 (-10005): terminal main thread blocked entire window."
+echo "  probe_exit=124: IPC pipe exists but auth handshake never completes."
+echo "  Check terminal.log below for clues."
+echo ""
+echo "--- terminal.log (tail 200) ---"
+tail -n 200 "${LOGDIR}/terminal.log" 2>/dev/null || true
+echo "--- xvfb.log (tail 50) ---"
+tail -n 50 "${LOGDIR}/xvfb.log" 2>/dev/null || true
+exit 1
