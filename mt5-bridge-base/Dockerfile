@@ -210,19 +210,13 @@ RUN set -eux; \
     sleep 2; \
     \
     # -----------------------------------------------------------------------\
-    # Block LiveUpdate via Windows Internet proxy settings in the Wine registry.\
-    # /etc/hosts is READ-ONLY inside Docker BuildKit on GitHub Actions runners,\
-    # so that approach silently fails.  Setting a proxy to 127.0.0.1:1 (nothing\
-    # listening) causes WinHTTP/WinINet to fail fast instead of timing out,\
-    # preventing the terminal from downloading updates during build.\
-    # -----------------------------------------------------------------------\
-    wine reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
-      /v "ProxyEnable" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
-    wine reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
-      /v "ProxyServer" /t REG_SZ /d "127.0.0.1:1" /f 2>/dev/null || true; \
-    wine reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
-      /v "ProxyOverride" /t REG_SZ /d "<local>" /f 2>/dev/null || true; \
-    echo "LiveUpdate proxy block set (127.0.0.1:1)"; \
+    # Block LiveUpdate CDN domains via Wine-side hosts file.\
+    # NOTE: We intentionally do NOT set a WinHTTP proxy here — a proxy\
+    # blocks ALL WinHTTP traffic including the terminal's broker TCP\
+    # handshake, which causes the terminal to stall invisibly with no\
+    # X11 window and never write terminal.ini.\
+    # The Wine-side hosts file is sufficient to prevent update downloads.\
+    # -----------------------------------------------------------------------
     \
     # Also write to Wine-side hosts file for belt-and-suspenders coverage. \
     WINE_HOSTS="${WINEPREFIX}/drive_c/windows/system32/drivers/etc/hosts"; \
@@ -354,6 +348,26 @@ RUN set -eux; \
     \
     # Give the terminal 15 more seconds to flush remaining AppData files. \
     sleep 15; \
+    \
+    # -----------------------------------------------------------------------\
+    # Write terminal.ini manually to every hash dir the terminal created.\
+    # The terminal only writes terminal.ini after a successful broker login,\
+    # which may not happen during a headless build (no real account).\
+    # A manually-written terminal.ini is sufficient to prevent the first-run\
+    # wizard from re-appearing on subsequent container starts.\
+    # -----------------------------------------------------------------------\
+    find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+      -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | while IFS= read -r _hdir; do \
+          _bn=$(basename "${_hdir}"); \
+          if [ "${_bn}" = "Common" ] || [ "${_bn}" = "Community" ] || [ "${_bn}" = "Help" ]; then continue; fi; \
+          if [ ! -f "${_hdir}/terminal.ini" ]; then \
+            printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nServer=MetaQuotes-Demo\r\nLogin=\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+              > "${_hdir}/terminal.ini" 2>/dev/null || true; \
+            echo "Wrote synthetic terminal.ini: ${_hdir}/terminal.ini"; \
+            INIT_DONE=true; \
+          fi; \
+        done; \
     \
     # Bake "Allow Algorithmic Trading" into Wine registry. \
     echo "Baking 'Allow Algorithmic Trading' into Wine registry..."; \
