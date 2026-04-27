@@ -87,15 +87,18 @@ RUN set -eux; \
     fi; \
     echo "${WINE_PY}" > /opt/wine_python_exe.path; \
     \
-    # -- pip install MetaTrader5 + mt5linux -- \
+    # -- pip install MetaTrader5 + mt5-bridge (REST server) -- \
     timeout 300 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir pip || true; \
     timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
     timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir "mt5linux>=0.1.9" || true; \
     timeout 300 wine "${WINE_PY}" -m pip install --no-cache-dir python-dateutil || true; \
+    timeout 300 wine "${WINE_PY}" -m pip install --no-cache-dir "mt5-bridge>=1.7.1" || true; \
     wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
       || echo "WARNING: MetaTrader5 verification failed"; \
     wine "${WINE_PY}" -c "import mt5linux; print('mt5linux OK')" \
       || echo "WARNING: mt5linux verification failed"; \
+    wine "${WINE_PY}" -c "import mt5_bridge; print('mt5-bridge OK')" \
+      || echo "WARNING: mt5-bridge verification failed"; \
     \
     # -- Install MT5 terminal (only if HAS_MT5=true) -- \
     # \
