@@ -150,6 +150,32 @@ rm -f "${_PIP_TMP}" 2>/dev/null || true
 
 **Verified:** `-10005` is the standard IPC timeout error. The `timeout` parameter in `mt5.initialize()` controls how long Python waits for the IPC server.
 
+## Updated Diagnostic Rule
+
+- `-10005` + **no** `WINEDEBUG=+pipe` `pipe:` lines means the probe likely failed before pipe open/read/write.
+- Treat this as a pre-pipe discovery or compatibility problem (executable/build/package resolution), not a pipe transport failure.
+- Use wineserver PID timeline logs to detect reset/restart events that can invalidate IPC context.
+
+## Readiness Gates (current)
+
+- **GATE 1 (fatal):** terminal process remains alive.
+- **GATE 2 (fatal):** terminal establishes external broker TCP connections.
+- **GATE 3 (diagnostic):** `mt5.initialize()` probe with version/build logging.
+
+## Quick Decision Tree
+
+```mermaid
+flowchart TD
+  probe[ProbeRun] --> wsPid[WineserverPidChanged]
+  wsPid -->|Yes| wsIssue[InvestigateWineserverRestart]
+  wsPid -->|No| pipeSeen[PipeEventsSeen]
+  pipeSeen -->|No| prePipe[CheckPathBuildPackageMismatch]
+  pipeSeen -->|Yes| pipeStage[InvestigateIPCStageTimeout]
+  wsIssue --> gateDecision[Gate1AndGate2ControlOutcome]
+  prePipe --> gateDecision
+  pipeStage --> gateDecision
+```
+
 - Previously: `timeout=15000` (15s) — too short for a cold terminal with an update dialog.  
 - **Current:** `timeout=60000` (60s) — safe buffer for cold-start scenarios.  
 - Outer shell `timeout 75` wraps the entire Wine process to guarantee it terminates.

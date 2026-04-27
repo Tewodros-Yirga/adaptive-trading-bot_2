@@ -15,6 +15,23 @@ export LOGDIR=${LOGDIR:-${HOME}/.mt5-bridge-logs}
 export MT5_CONTEXT_MODE="${MT5_CONTEXT_MODE:-default}"
 export MT5_CONTEXT_DIR="${MT5_CONTEXT_DIR:-${WINEPREFIX}/drive_c/mt5-data}"
 mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
+WINESERVER_TIMELINE="${LOGDIR}/wineserver-timeline.log"
+
+_ws_pids() {
+  pgrep -fa wineserver 2>/dev/null | awk '{print $1}' | tr '\n' ',' | sed 's/,$//'
+}
+
+_log_ws() {
+  local _tag="$1"
+  local _stamp
+  _stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local _pids
+  _pids="$(_ws_pids)"
+  echo "[${_stamp}] tag=${_tag} wineserver_pids=${_pids:-none}" >> "${WINESERVER_TIMELINE}" 2>/dev/null || true
+}
+
+echo "[start] wineserver_version=$(wineserver -v 2>/dev/null || echo unknown)"
+_log_ws "start_sh_entry"
 
 # ── Block MT5 LiveUpdate domains NOW — before Xvfb/Wine process any DNS ──────
 # Must run here (before any subprocess) so the terminal binary never resolves
@@ -312,8 +329,11 @@ fi
       > "${LOGDIR}/mt5-terminal.log" 2>&1 &
     TERMINAL_PID=$!
     echo "[mt5-terminal] terminal pid=${TERMINAL_PID}"
+    _log_ws "terminal_launch_pid_${TERMINAL_PID}"
   }
   _launch_terminal
+  LAST_WS_PIDS="$(_ws_pids)"
+  echo "[mt5-terminal] wineserver_initial_pids=${LAST_WS_PIDS:-none}"
   IPC_TIMEOUT_STREAK=0
   IPC_RESTART_COUNT=0
 
@@ -505,6 +525,13 @@ fi
     ATTEMPT=0
     while (( ATTEMPT < MAX_ATTEMPTS )); do
       ATTEMPT=$((ATTEMPT + 1))
+      CUR_WS_PIDS="$(_ws_pids)"
+      _log_ws "probe_attempt_${ATTEMPT}"
+      if [[ "${CUR_WS_PIDS:-}" != "${LAST_WS_PIDS:-}" ]]; then
+        echo "[mt5-probe] WINESERVER_RESTART_DETECTED previous=${LAST_WS_PIDS:-none} current=${CUR_WS_PIDS:-none}" \
+          >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+        LAST_WS_PIDS="${CUR_WS_PIDS:-}"
+      fi
       # Snapshot visible X11 window titles — written BEFORE the probe fires so
       # the wrapper log shows what was on screen at each attempt.
       _WIN_SNAP=$(DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
@@ -542,8 +569,12 @@ try:
 except Exception:
     ok = False
 err = mt5.last_error()
+try:
+    term_ver = mt5.version()
+except Exception:
+    term_ver = None
 mt5.shutdown()
-print(f'mt5_pkg={mt5_ver} mode={MODE} ok={ok} err={err}')
+print(f'mt5_pkg={mt5_ver} term_path={TERM_PATH} mode={MODE} ok={ok} err={err} terminal_version={term_ver}')
 PYEOF
 )
       set -x
