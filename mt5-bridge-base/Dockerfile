@@ -283,6 +283,14 @@ RUN set -eux; \
           CX=$(( WIN_X + WIN_W / 2 )); \
           CY=$(( WIN_Y + WIN_H / 2 )); \
           \
+          # ---------------------------------------------------------------\
+          # Escape cancels login/wizard dialogs and puts the terminal in\
+          # offline mode where the main thread (IPC pump) is NOT blocked.\
+          # Return/Tab would try to submit an empty login → error loop.\
+          # ---------------------------------------------------------------\
+          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
+          sleep 0.2; \
+          \
           # Click broker list rows (upper-center of dialog body). \
           for _row_off in -100 -60 -30 0; do \
             DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY + _row_off ))" click 1 2>/dev/null || true; \
@@ -312,7 +320,7 @@ RUN set -eux; \
               "$(( WIN_X + $1 ))" "$(( WIN_Y + $2 ))" click 1 2>/dev/null || true; \
             sleep 0.06; \
           done; \
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
+          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
         done; \
         sleep 5; \
       done; \
