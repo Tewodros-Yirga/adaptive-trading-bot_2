@@ -114,19 +114,19 @@ WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
   wine "${TERM_EXE}" /portable \
   > "${LOGDIR}/terminal.log" 2>&1 &
 TERM_PID=$!
-echo "Terminal PID: ${TERM_PID} — waiting 90 s for initial startup..."
-sleep 90
+echo "Terminal PID: ${TERM_PID} — waiting 120 s for initial startup + broker login..."
+sleep 120
 
 # ---------------------------------------------------------------------------
 # GATE 1: terminal must still be alive after 90 s
 # ---------------------------------------------------------------------------
 if ! kill -0 "${TERM_PID}" 2>/dev/null; then
-  echo "SMOKE TEST FAIL: terminal64.exe exited within 90 s (crashed)"
+  echo "SMOKE TEST FAIL: terminal64.exe exited within 120 s (crashed)"
   echo "--- terminal.log ---"
   cat "${LOGDIR}/terminal.log" 2>/dev/null || true
   exit 1
 fi
-echo "GATE 1 PASS: terminal64.exe is alive after 90 s (PID ${TERM_PID})"
+echo "GATE 1 PASS: terminal64.exe is alive after 120 s (PID ${TERM_PID})"
 
 # ---------------------------------------------------------------------------
 # Background dialog dismisser
@@ -141,9 +141,10 @@ echo "GATE 1 PASS: terminal64.exe is alive after 90 s (PID ${TERM_PID})"
         _xd search --onlyvisible --name "Select a company";
         _xd search --onlyvisible --name "Welcome to";
         _xd search --onlyvisible --name "Login";
-        _xd search --onlyvisible --name "MetaTrader 5";
-        _xd search --onlyvisible --name "MetaTrader";
         _xd search --onlyvisible --name "Setup";
+        # NOTE: do NOT search --name "MetaTrader" or "MetaTrader 5" here —
+        # those patterns match the MAIN terminal window and sending Escape
+        # to it disrupts the running terminal rather than dismissing a dialog.
       } | awk 'NF' | sort -n -u
     )
     for _wid in ${IDS:-}; do
@@ -182,7 +183,7 @@ try:
         login=435609450,
         password="Mznxbcv12#",
         server="Exness-MT5Trial9",
-        timeout=12000
+        timeout=30000
     )
     err = mt5.last_error()
     mt5.shutdown()
