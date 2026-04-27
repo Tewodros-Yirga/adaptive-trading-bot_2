@@ -43,8 +43,17 @@ _log_ws() {
   echo "[${_stamp}] tag=${_tag} wineserver_pids=${_pids:-none}" | tee -a "${WINESERVER_TIMELINE}" >/dev/null
 }
 
+_candidate_window_ids_raw() {
+  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "LiveUpdate" 2>/dev/null || true
+  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "Select a company" 2>/dev/null || true
+  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "Welcome to" 2>/dev/null || true
+  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "Login" 2>/dev/null || true
+  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "Setup" 2>/dev/null || true
+}
+
 _visible_titles() {
-  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "." 2>/dev/null \
+  _candidate_window_ids_raw \
+    | awk '/^[0-9]+$/' | awk 'NF' | sort -n -u \
     | while IFS= read -r _wid; do
         DISPLAY="${DISPLAY}" xdotool getwindowname "${_wid}" 2>/dev/null || true
       done | paste -sd'|' -
@@ -209,15 +218,8 @@ _log_ws "after_gate1"
   for _iter in $(seq 1 200); do
     RAW_IDS=""
     RAW_STATUS=0
-    RAW_IDS=$(
-      { _xd search --onlyvisible --name "LiveUpdate";
-        _xd search --onlyvisible --name "Select a company";
-        _xd search --onlyvisible --name "Welcome to";
-        _xd search --onlyvisible --name "Login";
-        _xd search --onlyvisible --name "Setup";
-        # DO NOT add "MetaTrader" or "MetaTrader 5" — matches the main window.
-      } 2>&1
-    ) || RAW_STATUS=$?
+    # DO NOT add "MetaTrader" or "MetaTrader 5" — matches the main window.
+    RAW_IDS="$(_candidate_window_ids_raw 2>&1)" || RAW_STATUS=$?
     # Keep runtime dependencies minimal: do not require ripgrep in container.
     IDS="$(printf '%s\n' "${RAW_IDS}" | awk '/^[0-9]+$/' | awk 'NF' | sort -n -u || true)"
     IDS_COUNT="$(printf '%s\n' ${IDS:-} | awk 'NF' | wc -l)"
@@ -266,10 +268,8 @@ WINEDEBUG="-all" timeout 15 wine "${WINE_PY}" -c \
   "import MetaTrader5 as m; print('MT5 pkg:', m.__version__)" 2>/dev/null || true
 
 echo "--- Diagnostic: visible X11 windows at 120s ---"
-DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
-  | while IFS= read -r _wid; do
-      echo "  wid=${_wid} name=$(DISPLAY="${DISPLAY}" xdotool getwindowname "${_wid}" 2>/dev/null || echo '?')"
-    done || true
+WIN_TITLES_120="$(_visible_titles || true)"
+echo "  windows=${WIN_TITLES_120:-none}"
 echo "--- Diagnostic: wineserver timeline ---"
 _log_ws "before_gate2_loop"
 
