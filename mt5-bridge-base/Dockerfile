@@ -284,28 +284,29 @@ RUN set -eux; \
           \
           # ---------------------------------------------------------------\
           # IMPORTANT: dialog-type-specific dismissal.\
-          # "Welcome to LiveUpdate": pressing Escape causes the terminal to\
-          # EXIT entirely. Must click the "Later" button (lower-left) so\
-          # the terminal skips the update and proceeds to its main window.\
+          # "Welcome to LiveUpdate": The "Later" button is NOT clickable\
+          # while LiveUpdate is doing its update check — which hangs\
+          # indefinitely because we blocked all update hosts in /etc/hosts.\
+          # Solution: kill the liveupdate.exe process directly.\
+          # After liveupdate.exe exits, the terminal unblocks and continues\
+          # to its main window / login flow.\
           # Login/company dialogs: Escape cancels them safely → offline mode.\
           # ---------------------------------------------------------------\
           _is_liveupdate=0; \
           echo "${WIN_NAME}" | grep -qi "LiveUpdate" && _is_liveupdate=1 || true; \
           \
           if [ "${_is_liveupdate}" -eq 1 ]; then \
-            echo "[firstrun-dismiss] LiveUpdate detected — clicking Later (lower-left)"; \
-            # Later button sits in the lower-left of the dialog. \
-            # Try several candidate positions to be safe. \
-            for _later_off in \
-                "$(( WIN_W / 5 ))     $(( WIN_H - 15 ))" \
-                "$(( WIN_W / 4 ))     $(( WIN_H - 20 ))" \
-                "$(( WIN_W * 3 / 10 )) $(( WIN_H - 15 ))"; do \
-              set -- ${_later_off}; \
-              DISPLAY=:99 xdotool mousemove --clearmodifiers \
-                "$(( WIN_X + $1 ))" "$(( WIN_Y + $2 ))" click 1 2>/dev/null || true; \
-              sleep 0.15; \
-            done; \
-            sleep 0.5; \
+            echo "[firstrun-dismiss] LiveUpdate stuck — killing liveupdate.exe"; \
+            # Primary: wine taskkill (cleanly closes the process). \
+            DISPLAY=:99 wine taskkill /F /IM liveupdate.exe 2>/dev/null || true; \
+            sleep 0.3; \
+            DISPLAY=:99 wine taskkill /F /IM LiveUpdate.exe 2>/dev/null || true; \
+            sleep 0.3; \
+            # Fallback: kill at the Linux process level. \
+            pgrep -a -f -i liveupdate 2>/dev/null \
+              | awk '{print $1}' | head -5 \
+              | xargs -r kill -9 2>/dev/null || true; \
+            sleep 1; \
           else \
             # For login/company-select dialogs: Escape → offline mode. \
             DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
