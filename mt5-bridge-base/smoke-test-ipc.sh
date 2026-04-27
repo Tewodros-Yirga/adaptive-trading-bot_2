@@ -218,7 +218,8 @@ _log_ws "after_gate1"
         # DO NOT add "MetaTrader" or "MetaTrader 5" — matches the main window.
       } 2>&1
     ) || RAW_STATUS=$?
-    IDS="$(printf '%s\n' "${RAW_IDS}" | rg '^[0-9]+$' | awk 'NF' | sort -n -u || true)"
+    # Keep runtime dependencies minimal: do not require ripgrep in container.
+    IDS="$(printf '%s\n' "${RAW_IDS}" | awk '/^[0-9]+$/' | awk 'NF' | sort -n -u || true)"
     IDS_COUNT="$(printf '%s\n' ${IDS:-} | awk 'NF' | wc -l)"
     echo "[smoke-dismiss heartbeat] iter=${_iter} ids=${IDS_COUNT} search_status=${RAW_STATUS}" >> "${DISMISS_LOG}"
     if [ "${RAW_STATUS}" -ne 0 ] && [ -n "${RAW_IDS}" ]; then
