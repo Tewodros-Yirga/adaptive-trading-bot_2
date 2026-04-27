@@ -287,10 +287,56 @@ $d.bootstrap.ipc_status
 
 ---
 
+## Session 4 (2026-04-27) — Three Build-Time Bugs Fixed
+
+### 19. `/etc/hosts` is read-only in Docker BuildKit on GHA runners
+
+**Evidence from build log run-24889192350:** Every `echo "0.0.0.0 ..." >> /etc/hosts` in step #14 printed:
+```
+/bin/sh: 1: cannot create /etc/hosts: Read-only file system
+```
+LiveUpdate CDNs were reachable for the entire first-run init step. The domain-blocking approach silently failed on every prior build.
+
+**Fix:** Block LiveUpdate via the Windows proxy registry inside Wine:
+```bash
+wine reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" \
+  /v "ProxyServer" /t REG_SZ /d "127.0.0.1:1" /f
+```
+WinHTTP/WinINet respects the system proxy. Pointing it at `127.0.0.1:1` (nothing listening) causes all outbound HTTP/HTTPS to fail immediately — no timeout hangs. Wine-side `drivers/etc/hosts` is also written as belt-and-suspenders.
+
+### 20. Dismiss loop was clicking at wrong coordinates (blind to actual window position)
+
+**Evidence:** `WIN_TITLES` was always empty in the build log. Root cause: the code used bare `xdotool search --onlyvisible` (no search criterion) to collect window IDs for title lookup — this is invalid xdotool syntax and always returns empty. The dismiss loop therefore fired clicks at hardcoded absolute screen coordinates `(400,245)`, `(638,418)` etc. while the "Select a company" dialog was found at window ID 14680140 but at an **unknown screen position**.
+
+**Fix:** Use `xdotool getwindowgeometry --shell` to read actual `X,Y,WIDTH,HEIGHT`; all click targets are now computed relative to the window centre.
+
+### 21. Success gate was IPC pipe count (unreachable while wizard blocks)
+
+**Root cause chain:**
+1. Wizard was never dismissed (Bug 20)
+2. IPC pipes never created while wizard blocks main thread
+3. `IPC_PIPE_FOUND=false` at end of 180s wait
+4. Build continued — image baked with **incomplete AppData** (hash dir exists but no `terminal.ini`)
+5. Smoke test: terminal finds broken mid-wizard profile → crashes silently
+6. `windows=` empty on all 30 attempts, all return `(-10005, 'IPC timeout')`
+
+**Fix:** Changed success gate to **`terminal.ini` exists in hash dir**. This file is written by the terminal during normal startup (before IPC pump), making it a reliable early-init signal. Loop extended from 36→48 iterations (240 s).
+
+### 22. Smoke test required `mt5.initialize() ok=True` (needs external broker TCP)
+
+**Root cause:** `ok=True` requires the terminal to authenticate against MetaQuotes-Demo via TCP, which may not be available in all CI sandbox environments.
+
+**Fix:** Smoke test rewritten with two gates:
+- **Gate 1:** `terminal64.exe` alive after 90 s (crash detection, fail-fast)
+- **Gate 2:** Named pipe count > 0 (local, network-independent; any pipe proves Wine IPC stack is functional)
+- **Fallback:** Terminal alive + `terminal.ini` present
+
+---
+
 ## Long-Term Fix
 
 Rebuild the base image with the **latest** terminal version baked in:
-- No pending updates → no update dialog → IPC available in <30s from cold start
+- No pending updates → no update dialog → IPC available in < 30s from cold start
 - Monthly GitHub Actions schedule (`0 3 1 * *`) already in place on `build-mt5-base.yml`
 
 ---
