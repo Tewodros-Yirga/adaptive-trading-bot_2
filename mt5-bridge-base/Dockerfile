@@ -199,7 +199,7 @@ RUN set -eux; \
     fi; \
     \
     TERM_EXE="$(tr -d '\r\n' < /opt/mt5_terminal_exe.path)"; \
-    WINE_PY="$(tr -d '\r\n' < /opt/wine_python_exe.path)"; \
+    TERM_DIR="$(dirname "${TERM_EXE}")"; \
     \
     rm -f /tmp/.X99-lock; \
     Xvfb :99 -screen 0 1280x720x24 & \
@@ -209,16 +209,7 @@ RUN set -eux; \
     OPENBOX_PID=$!; \
     sleep 2; \
     \
-    # -----------------------------------------------------------------------\
-    # Block LiveUpdate CDN domains via Wine-side hosts file.\
-    # NOTE: We intentionally do NOT set a WinHTTP proxy here — a proxy\
-    # blocks ALL WinHTTP traffic including the terminal's broker TCP\
-    # handshake, which causes the terminal to stall invisibly with no\
-    # X11 window and never write terminal.ini.\
-    # The Wine-side hosts file is sufficient to prevent update downloads.\
-    # -----------------------------------------------------------------------
-    \
-    # Also write to Wine-side hosts file for belt-and-suspenders coverage. \
+    # Block LiveUpdate CDN — connection to 127.0.0.1 gives instant ECONNREFUSED. \
     WINE_HOSTS="${WINEPREFIX}/drive_c/windows/system32/drivers/etc/hosts"; \
     mkdir -p "$(dirname "${WINE_HOSTS}")" 2>/dev/null || true; \
     for _d in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
@@ -227,218 +218,79 @@ RUN set -eux; \
                mt5-update.metaquotes.net metaquotes.net; do \
       echo "127.0.0.1 ${_d}" >> "${WINE_HOSTS}" 2>/dev/null || true; \
     done; \
-    echo "Wine-side hosts file written (127.0.0.1 = immediate TCP RST)"; \
+    echo "Wine hosts written (127.0.0.1 = immediate ECONNREFUSED)"; \
     \
-    # Start a minimal TCP-closer on 80 & 443 so Wine's SSL connect gets an \
-    # immediate connection-reset instead of a 30-60s TCP timeout. \
-    # This makes LiveUpdate's check fail in <100ms → 'Later' becomes clickable. \
-    python3 -c " \
-import socket, threading, time; \
-ports = [80, 443, 2087, 2086]; \
-def _accept_loop(s): \
-  while True: \
-    try: c,_ = s.accept(); c.close() \
-    except: pass; \
-for p in ports: \
-  s = socket.socket(); \
-  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); \
-  try: s.bind(('127.0.0.1', p)); s.listen(64); threading.Thread(target=_accept_loop, args=(s,), daemon=True).start(); print('TCP-closer listening on', p) \
-  except Exception as e: print('Could not bind port', p, e); \
-time.sleep(600); \
-" 2>/dev/null & \
-    FAKE_SRV_PID=$!; \
-    sleep 0.5; \
-    echo "Fake TCP-closer PID=${FAKE_SRV_PID} — LiveUpdate will fail fast"; \
-    \
-    # Pre-write Exness broker config so the terminal auto-logs in during \
-    # first-run init, writes terminal.ini, and bypasses all wizard dialogs. \
-    for _cfg_dir in \
-      "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config" \
-      "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"; do \
-      mkdir -p "${_cfg_dir}" 2>/dev/null || true; \
-      printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
-        > "${_cfg_dir}/common.ini" 2>/dev/null || true; \
-      echo "Pre-wrote server config: ${_cfg_dir}/common.ini"; \
-    done; \
-    \
-    WIN_CFG="${WINEPREFIX}/drive_c/mt5-firstrun.ini"; \
+    # Pre-write portable config and terminal.ini so the first-run wizard \
+    # is skipped and broker login is attempted automatically on startup. \
+    mkdir -p "${TERM_DIR}/config" 2>/dev/null || true; \
     printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
-      > "${WIN_CFG}" 2>/dev/null || true; \
-    echo "Wrote first-run config: ${WIN_CFG}"; \
-    echo "Launching terminal for first-run AppData initialisation..."; \
-    WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
-      wine "${TERM_EXE}" /config:"C:\\mt5-firstrun.ini" > /tmp/mt5-firstrun.log 2>&1 & \
+      > "${TERM_DIR}/config/common.ini" 2>/dev/null || true; \
+    printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+      > "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
+    echo "Pre-wrote portable terminal.ini and config/common.ini"; \
+    \
+    # -----------------------------------------------------------------------\
+    # Launch in PORTABLE mode (technique from mobjoy0/mt5-bridge, GitHub).\
+    # /portable stores ALL state inside the install directory, not AppData.\
+    # The LiveUpdate dialog appears but is irrelevant — we just wait for\
+    # the terminal to finish writing MQL5/ dirs, then kill it cleanly.\
+    # No xdotool dialog dismissal is required.\
+    # -----------------------------------------------------------------------\
+    echo "Launching terminal in portable mode..."; \
+    DISPLAY=:99 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
+      wine "${TERM_EXE}" /portable > /tmp/mt5-firstrun.log 2>&1 & \
     TERM_PID=$!; \
     \
-    # -----------------------------------------------------------------------\
-    # Dialog-dismiss loop — runs in a background subshell for the full wait.\
-    #\
-    # KEY FIX: use xdotool getwindowgeometry --shell to read the actual X,Y,\
-    # WIDTH,HEIGHT of each dialog, then click relative to the window centre.\
-    # The previous approach used hardcoded absolute screen coordinates which\
-    # missed a centered dialog whose position was unknown.\
-    # -----------------------------------------------------------------------\
-    ( \
-      sleep 10; \
-      for _try in $(seq 1 48); do \
-        IDS=$( { \
-          DISPLAY=:99 xdotool search --onlyvisible --name "LiveUpdate" 2>/dev/null; \
-          DISPLAY=:99 xdotool search --onlyvisible --name "Select a company" 2>/dev/null; \
-          DISPLAY=:99 xdotool search --onlyvisible --name "Welcome to" 2>/dev/null; \
-          DISPLAY=:99 xdotool search --onlyvisible --name "MetaTrader 5" 2>/dev/null; \
-          DISPLAY=:99 xdotool search --onlyvisible --name "MetaTrader" 2>/dev/null; \
-          DISPLAY=:99 xdotool search --onlyvisible --name "Setup" 2>/dev/null; \
-        } | awk 'NF' | sort -n -u ); \
-        echo "[firstrun-dismiss try=${_try}] found_wids=${IDS:-none}"; \
-        for _wid in ${IDS}; do \
-          WIN_NAME=$(DISPLAY=:99 xdotool getwindowname "${_wid}" 2>/dev/null || echo "unknown"); \
-          echo "[firstrun-dismiss try=${_try}] wid=${_wid} name=${WIN_NAME}"; \
-          DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true; \
-          sleep 0.3; \
-          \
-          # Get the actual window geometry so clicks are relative to the window.\
-          WIN_GEOM=$(DISPLAY=:99 xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null || true); \
-          eval "${WIN_GEOM}" 2>/dev/null || true; \
-          WIN_W="${WIDTH:-800}"; WIN_H="${HEIGHT:-600}"; WIN_X="${X:-240}"; WIN_Y="${Y:-60}"; \
-          CX=$(( WIN_X + WIN_W / 2 )); \
-          CY=$(( WIN_Y + WIN_H / 2 )); \
-          \
-          # ---------------------------------------------------------------\
-          # LiveUpdate dismissal — research findings:\
-          # 1. LiveUpdate is INTERNAL to terminal64.exe (not a sub-process),\
-          #    so wine taskkill /IM liveupdate.exe always fails.\
-          # 2. With 127.0.0.1 in Wine hosts + our fake TCP-closer, the SSL\
-          #    handshake fails in <100ms, so 'Later' is clickable immediately.\
-          # 3. Standard Win32 dialog (450×138): 'Later' button occupies\
-          #    roughly x_offset 8-88 (center ~48), y near the bottom.\
-          #    Previous code was clicking at x_offset 90-135 — too far right.\
-          # Login/company dialogs: Tab×N + Escape for offline mode.\
-          # ---------------------------------------------------------------\
-          _is_liveupdate=0; \
-          echo "${WIN_NAME}" | grep -qi "LiveUpdate" && _is_liveupdate=1 || true; \
-          \
-          if [ "${_is_liveupdate}" -eq 1 ]; then \
-            echo "[firstrun-dismiss] LiveUpdate: clicking Later (left btn) + Tab+Space fallback"; \
-            \
-            # Button row is ~20px from bottom of the window. \
-            # 'Later' (left button) center: x_offset ≈ 45, y_offset ≈ WIN_H-18. \
-            _BTN_Y=$(( WIN_Y + WIN_H - 18 )); \
-            for _bx_off in 30 45 55 70 85; do \
-              DISPLAY=:99 xdotool mousemove --clearmodifiers \
-                "$(( WIN_X + _bx_off ))" "${_BTN_Y}" click 1 2>/dev/null || true; \
-              sleep 0.12; \
-            done; \
-            sleep 0.3; \
-            \
-            # Keyboard fallback: Tab moves focus, Space activates the button. \
-            # In this dialog the default (Return) = Update; Tab → Later; Space = click. \
-            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Tab 2>/dev/null || true; \
-            sleep 0.15; \
-            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers space 2>/dev/null || true; \
-            sleep 0.3; \
-          else \
-            # For login/company-select dialogs: Escape → offline mode. \
-            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
-            sleep 0.2; \
-            \
-            # Click broker list rows (upper-center of dialog body). \
-            for _row_off in -100 -60 -30 0; do \
-              DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY + _row_off ))" click 1 2>/dev/null || true; \
-              sleep 0.06; \
-            done; \
-            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
-          fi; \
-        done; \
-        sleep 5; \
-      done; \
-    ) & \
-    DISMISS_PID=$!; \
-    \
-    # -----------------------------------------------------------------------\
-    # Wait for terminal.ini to appear in the AppData hash dir (up to 4 min).\
-    #\
-    # terminal.ini is written by the terminal during normal startup — it\
-    # records window layout, server settings, etc.  Its existence confirms the\
-    # terminal completed at least the post-wizard initialisation phase.\
-    # This is a far more reliable gate than IPC pipe count, which stays at 0\
-    # while the wizard blocks the main thread.\
-    # -----------------------------------------------------------------------\
-    echo "Waiting for terminal.ini in AppData hash dir (up to 240 s)..."; \
+    # Wait up to 3 min for the terminal to create MQL5/Experts (portable). \
+    echo "Waiting for portable MQL5/Experts dir (up to 180 s)..."; \
     INIT_WAITED=0; \
-    INIT_DONE=false; \
-    while [ "${INIT_WAITED}" -lt 240 ]; do \
-      TINI=$(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
-        -mindepth 2 -maxdepth 2 -name "terminal.ini" 2>/dev/null | head -1) || true; \
-      if [ -n "${TINI}" ]; then \
-        echo "terminal.ini found: ${TINI} (after ${INIT_WAITED}s)"; \
-        INIT_DONE=true; \
+    while [ "${INIT_WAITED}" -lt 180 ]; do \
+      if [ -d "${TERM_DIR}/MQL5/Experts" ]; then \
+        echo "MQL5/Experts present after ${INIT_WAITED}s — portable init done"; \
         break; \
       fi; \
-      HASH_FILES=$(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
-        -mindepth 2 -maxdepth 2 -type f 2>/dev/null | wc -l) || HASH_FILES=0; \
-      echo "Waiting for init (${INIT_WAITED}s elapsed, hash_files=${HASH_FILES})..."; \
+      PFILES=$(find "${TERM_DIR}" -maxdepth 1 -type f 2>/dev/null | wc -l) || PFILES=0; \
+      echo "Waiting for portable init (${INIT_WAITED}s, install_files=${PFILES})..."; \
       sleep 5; \
-      INIT_WAITED=$((INIT_WAITED + 5)); \
+      INIT_WAITED=$(( INIT_WAITED + 5 )); \
     done; \
     \
-    # Give the terminal 15 more seconds to flush remaining AppData files. \
-    sleep 15; \
+    # Extra settle time for config dirs to flush. \
+    sleep 10; \
     \
-    # -----------------------------------------------------------------------\
-    # Write terminal.ini manually to every hash dir the terminal created.\
-    # The terminal only writes terminal.ini after a successful broker login,\
-    # which may not happen during a headless build (no real account).\
-    # A manually-written terminal.ini is sufficient to prevent the first-run\
-    # wizard from re-appearing on subsequent container starts.\
-    # -----------------------------------------------------------------------\
+    # Ensure [Experts] section is in terminal.ini. \
+    grep -q '\[Experts\]' "${TERM_DIR}/terminal.ini" 2>/dev/null \
+      || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+           >> "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
+    echo "Patched portable terminal.ini with [Experts]"; \
+    \
+    # Mirror config into AppData hash dirs for non-portable runtime. \
     find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
       -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
       | while IFS= read -r _hdir; do \
           _bn=$(basename "${_hdir}"); \
-          if [ "${_bn}" = "Common" ] || [ "${_bn}" = "Community" ] || [ "${_bn}" = "Help" ]; then continue; fi; \
-          if [ ! -f "${_hdir}/terminal.ini" ]; then \
-            printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
-              > "${_hdir}/terminal.ini" 2>/dev/null || true; \
-            echo "Wrote synthetic terminal.ini: ${_hdir}/terminal.ini"; \
-            INIT_DONE=true; \
-          fi; \
+          case "${_bn}" in Common|Community|Help) continue ;; esac; \
+          mkdir -p "${_hdir}/config" 2>/dev/null || true; \
+          printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
+            > "${_hdir}/config/common.ini" 2>/dev/null || true; \
+          grep -q '\[Experts\]' "${_hdir}/terminal.ini" 2>/dev/null \
+            || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+                 >> "${_hdir}/terminal.ini" 2>/dev/null || true; \
+          echo "Patched AppData hash-dir: ${_hdir}"; \
         done; \
     \
-    # Bake "Allow Algorithmic Trading" into Wine registry. \
-    echo "Baking 'Allow Algorithmic Trading' into Wine registry..."; \
+    # Bake Allow-Algo-Trading into Wine registry. \
     wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
       /v "ExpertAdvisors" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
     wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
       /v "AlgoTradingEnabled" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
     \
-    # Write terminal.ini with Experts settings if the file exists. \
-    find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
-      -maxdepth 3 -name "terminal.ini" 2>/dev/null \
-      | while IFS= read -r _tini; do \
-          grep -q "\[Experts\]" "${_tini}" 2>/dev/null \
-            || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' >> "${_tini}" 2>/dev/null || true; \
-          echo "Patched ${_tini}"; \
-        done; \
-    \
-    # Write common.ini into every terminal hash sub-directory the terminal \
-    # created during this first run, so subsequent startups skip the wizard. \
-    find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
-      -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-      | while IFS= read -r _hdir; do \
-          _basename=$(basename "${_hdir}"); \
-          if [ "${_basename}" = "Common" ] || [ "${_basename}" = "Community" ]; then continue; fi; \
-          mkdir -p "${_hdir}/config" 2>/dev/null || true; \
-          printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
-            > "${_hdir}/config/common.ini" 2>/dev/null || true; \
-          echo "Wrote hash-dir config: ${_hdir}/config/common.ini"; \
-        done; \
-    \
-    echo "=== AppData directories created ==="; \
+    echo "=== Install dir files ==="; \
+    find "${TERM_DIR}" -maxdepth 1 -type f 2>/dev/null | head -20 || true; \
+    echo "=== AppData dirs ==="; \
     find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes" \
-      -maxdepth 4 -type d 2>/dev/null | head -40 || true; \
-    echo "=== INIT_DONE=${INIT_DONE} ==="; \
+      -maxdepth 4 -type d 2>/dev/null | head -20 || true; \
     \
-    kill "${DISMISS_PID}" 2>/dev/null || true; \
     kill "${TERM_PID}" 2>/dev/null || true; \
     sleep 5; \
     wineserver -k 2>/dev/null || true; \
@@ -448,7 +300,7 @@ time.sleep(600); \
     kill "${XVFB_PID}" 2>/dev/null || pkill Xvfb || true; \
     rm -f /tmp/.X99-lock /tmp/mt5-firstrun.log /tmp/openbox-init.log; \
     \
-    echo "Terminal first-run initialisation complete."
+    echo "Terminal first-run initialisation complete (portable mode)."
 
 WORKDIR /bridge
 EXPOSE 5555
