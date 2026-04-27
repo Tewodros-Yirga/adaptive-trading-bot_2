@@ -194,13 +194,20 @@ echo "GATE 1 PASS: terminal64.exe is alive after 120 s (PID ${TERM_PID})"
       _xd windowactivate --sync "${_wid}"; sleep 0.3
       _name=$(echo "${WIN_NAME}" | tr '[:upper:]' '[:lower:]')
       if echo "${_name}" | grep -q 'liveupdate'; then
-        # Alt+F4: sends WM_SYSCOMMAND SC_CLOSE to the focused child only.
-        # This differs from windowclose (WM_DELETE_WINDOW) which propagates
-        # up to the root window and kills the entire terminal process.
-        _xd key --window "${_wid}" --clearmodifiers alt+F4; sleep 0.5
-        # Belt-and-suspenders: Tab → 'Later' button, Space clicks it.
-        _xd key --window "${_wid}" --clearmodifiers Tab; sleep 0.2
-        _xd key --window "${_wid}" --clearmodifiers space; sleep 0.3
+        # Escape = default cancel action in Win32 modal dialogs (maps to
+        # IDCANCEL / "Later"). More reliable than Alt+F4 which Wine may
+        # not route correctly through WM_SYSCOMMAND SC_CLOSE.
+        _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.3
+        # Belt-and-suspenders: Return activates the focused/default button.
+        _xd key --window "${_wid}" --clearmodifiers Return; sleep 0.3
+        # Also try clicking at the lower-right quadrant where 'Later' typically is.
+        eval "$(DISPLAY="${DISPLAY}" xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null || true)"
+        if [ -n "${WIDTH:-}" ] && [ -n "${HEIGHT:-}" ]; then
+          _bx=$(( X + WIDTH  * 75 / 100 ))
+          _by=$(( Y + HEIGHT * 85 / 100 ))
+          DISPLAY="${DISPLAY}" xdotool mousemove "${_bx}" "${_by}" click 1 2>/dev/null || true
+          sleep 0.3
+        fi
       else
         # Login / company-select: Escape → offline mode → IPC pump free.
         _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
@@ -224,19 +231,22 @@ DISMISS_PID=$!
 #   shell: timeout 45              — must be > Python timeout so Python
 #                                    always returns before the shell kills it
 # ---------------------------------------------------------------------------
-# Phase 1 probe: IPC-only (no credentials).
-# mt5.initialize() without login/server just verifies the named pipe is alive.
-# Returns True in ~2 s if the terminal is running — no broker roundtrip,
-# no LiveUpdate or network auth can block it.
-IPC_PROBE_SCRIPT='
+# Phase 1 probe: IPC-only (no credentials, explicit terminal path).
+# path= is critical: without it, MetaTrader5 searches the Windows registry
+# for terminal64.exe — which may be empty or wrong in Wine, so it can't
+# find the pipe at all. Explicit path bypasses registry lookup.
+TERM_WIN_PATH=$(echo "${TERM_EXE}" \
+  | sed 's|/opt/wineprefix/drive_c/|C:\\\\|' \
+  | sed 's|/|\\\\|g')
+IPC_PROBE_SCRIPT="
 import sys
 try:
     import MetaTrader5 as mt5
-    ok = mt5.initialize(timeout=10000)
+    ok = mt5.initialize(path=r'${TERM_WIN_PATH}', timeout=10000)
     err = mt5.last_error()
     ver = mt5.version() if ok else None
     mt5.shutdown()
-    print("ok=%s err=%s version=%s" % (ok, err, ver))
+    print('ok=%s err=%s version=%s' % (ok, err, ver))
     if ok:
         sys.exit(0)
     elif err[0] == -10003:
@@ -244,9 +254,9 @@ try:
     else:
         sys.exit(3)
 except Exception as e:
-    print("exception: %s" % e)
+    print('exception: %s' % e)
     sys.exit(4)
-'
+"
 
 # Phase 2 probe (non-fatal): verify broker login works.
 BROKER_PROBE_SCRIPT='
@@ -274,6 +284,7 @@ except Exception as e:
 '
 
 echo "GATE 2: probing mt5.initialize() IPC-only (20 attempts × 30 s = 10 min)..."
+echo "TERM_WIN_PATH resolved to: ${TERM_WIN_PATH}"
 IPC_PASS=false
 
 for attempt in $(seq 1 20); do
@@ -298,11 +309,12 @@ for attempt in $(seq 1 20); do
     exit 1
   fi
 
-  # Run IPC-only probe — no credentials, no broker roundtrip.
+  # Run IPC-only probe — explicit path, no credentials, no broker roundtrip.
+  # WINEDEBUG=+pipe shows pipe open/read/write operations for diagnostics.
   # Shell timeout 20 s > Python mt5 timeout 10 s.
   PROBE_OUT=""
   PROBE_EXIT=0
-  PROBE_OUT=$(DISPLAY="${DISPLAY}" timeout 20 wine "${WINE_PY}" -c "${IPC_PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
+  PROBE_OUT=$(DISPLAY="${DISPLAY}" WINEDEBUG="+pipe" timeout 20 wine "${WINE_PY}" -c "${IPC_PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
 
   echo "[attempt ${attempt}/20] probe_exit=${PROBE_EXIT} probe_out=${PROBE_OUT}"
 
