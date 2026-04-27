@@ -259,8 +259,9 @@ fi
   IPC_FAILED_FILE="${LOGDIR}/mt5_ipc.failed"
   IPC_STATUS_FILE="${LOGDIR}/mt5_ipc.status"
   IPC_PROBE_LOG="${LOGDIR}/mt5-ipc-probe.log"
+  DISMISS_LOG="${LOGDIR}/mt5-dismiss.log"
   CONTEXT_STATUS_FILE="${LOGDIR}/mt5_context.status"
-  rm -f "${IPC_READY_FILE}" "${IPC_FAILED_FILE}" "${IPC_STATUS_FILE}" "${IPC_PROBE_LOG}" "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
+  rm -f "${IPC_READY_FILE}" "${IPC_FAILED_FILE}" "${IPC_STATUS_FILE}" "${IPC_PROBE_LOG}" "${DISMISS_LOG}" "${CONTEXT_STATUS_FILE}" 2>/dev/null || true
   echo "pending" > "${IPC_STATUS_FILE}" 2>/dev/null || true
 
   CONTEXT_ARGS=()
@@ -346,6 +347,7 @@ fi
   (
     _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
     _uniq_ids() { awk 'NF' | sort -n -u; }
+    trap 'echo "[dismiss-loop] exit code=$?" >> "${DISMISS_LOG}"' EXIT
     sleep 8
     for _try in $(seq 1 120); do
       LIVE_IDS=$(
@@ -363,7 +365,12 @@ fi
       )
       WINIDS=$(_xd search --onlyvisible | _uniq_ids)
       ALL_IDS=$(printf '%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${WINIDS}" | _uniq_ids)
+      ALL_COUNT=$(printf '%s\n' ${ALL_IDS:-} | awk 'NF' | wc -l)
+      echo "[dismiss-heartbeat] iter=${_try} ids=${ALL_COUNT}" >> "${DISMISS_LOG}"
       for _wid in ${ALL_IDS}; do
+        _GEO=$(DISPLAY=:99 xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null | tr '\n' ',' || true)
+        _NAME=$(_xd getwindowname "${_wid}" || echo "?")
+        echo "[dismiss-action] iter=${_try} wid=${_wid} name=${_NAME} geometry=${_GEO}" >> "${DISMISS_LOG}"
         _xd windowactivate --sync "${_wid}"
         sleep 0.25
         # Click bands: LiveUpdate Restart/Later rows, legacy wizard Next rows,
@@ -540,6 +547,10 @@ fi
           done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
       { echo "[pre-probe ${ATTEMPT}/${MAX_ATTEMPTS}] windows=${_WIN_SNAP}"; } \
         >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+      if [[ "${_WIN_SNAP:-}" == *"LiveUpdate"* ]] || [[ "${_WIN_SNAP:-}" == *"Welcome to"* ]]; then
+        { echo "[pre-probe ${ATTEMPT}/${MAX_ATTEMPTS}] UI_BLOCK_SUSPECTED liveupdate_visible=true"; } \
+          >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+      fi
       unset _WIN_SNAP _wsid
       # Skip the terminal-pid liveness check: the terminal may restart itself
       # after applying a LiveUpdate. The probe will detect the new process.
@@ -642,6 +653,14 @@ PYEOF
 
     if [[ ! -f "${IPC_READY_FILE}" ]]; then
       echo "failed: attempts_exhausted output=$(tail -n 1 "${IPC_PROBE_LOG}" 2>/dev/null || echo none)" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      {
+        echo "=== diagnostics: dismiss tail ==="
+        tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
+        echo "=== diagnostics: probe tail ==="
+        tail -n 80 "${IPC_PROBE_LOG}" 2>/dev/null || true
+        echo "=== diagnostics: wineserver timeline tail ==="
+        tail -n 40 "${WINESERVER_TIMELINE}" 2>/dev/null || true
+      } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
       touch "${IPC_FAILED_FILE}" 2>/dev/null || true
     fi
   fi

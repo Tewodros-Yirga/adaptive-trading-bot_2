@@ -27,6 +27,8 @@ export WINEFSYNC=0
 LOGDIR="/tmp/mt5-ipc-smoke"
 mkdir -p "${LOGDIR}"
 WINESERVER_TIMELINE="${LOGDIR}/wineserver-timeline.log"
+DISMISS_LOG="${LOGDIR}/dismiss.log"
+WINDOW_SNAP_LOG="${LOGDIR}/window-snapshots.log"
 
 _ws_pids() {
   pgrep -fa wineserver 2>/dev/null | awk '{print $1}' | tr '\n' ',' | sed 's/,$//'
@@ -39,6 +41,13 @@ _log_ws() {
   local _pids
   _pids="$(_ws_pids)"
   echo "[${_stamp}] tag=${_tag} wineserver_pids=${_pids:-none}" | tee -a "${WINESERVER_TIMELINE}" >/dev/null
+}
+
+_visible_titles() {
+  DISPLAY="${DISPLAY}" xdotool search --onlyvisible --name "." 2>/dev/null \
+    | while IFS= read -r _wid; do
+        DISPLAY="${DISPLAY}" xdotool getwindowname "${_wid}" 2>/dev/null || true
+      done | paste -sd'|' -
 }
 
 # ---------------------------------------------------------------------------
@@ -195,40 +204,50 @@ _log_ws "after_gate1"
 # focused child dialog; windowclose kills the parent terminal process).
 # ---------------------------------------------------------------------------
 (
-  _xd() { DISPLAY="${DISPLAY}" xdotool "$@" 2>/dev/null || true; }
+  _xd() { DISPLAY="${DISPLAY}" xdotool "$@" 2>/dev/null; }
+  trap 'echo "[smoke-dismiss] loop_exit code=$?" >> "${DISMISS_LOG}"' EXIT
   for _iter in $(seq 1 200); do
-    IDS=$(
+    RAW_IDS=""
+    RAW_STATUS=0
+    RAW_IDS=$(
       { _xd search --onlyvisible --name "LiveUpdate";
         _xd search --onlyvisible --name "Select a company";
         _xd search --onlyvisible --name "Welcome to";
         _xd search --onlyvisible --name "Login";
         _xd search --onlyvisible --name "Setup";
         # DO NOT add "MetaTrader" or "MetaTrader 5" — matches the main window.
-      } | awk 'NF' | sort -n -u
-    )
+      } 2>&1
+    ) || RAW_STATUS=$?
+    IDS="$(printf '%s\n' "${RAW_IDS}" | rg '^[0-9]+$' | awk 'NF' | sort -n -u || true)"
+    IDS_COUNT="$(printf '%s\n' ${IDS:-} | awk 'NF' | wc -l)"
+    echo "[smoke-dismiss heartbeat] iter=${_iter} ids=${IDS_COUNT} search_status=${RAW_STATUS}" >> "${DISMISS_LOG}"
+    if [ "${RAW_STATUS}" -ne 0 ] && [ -n "${RAW_IDS}" ]; then
+      echo "[smoke-dismiss search_output] iter=${_iter} out=${RAW_IDS}" >> "${DISMISS_LOG}"
+    fi
     for _wid in ${IDS:-}; do
       WIN_NAME=$(_xd getwindowname "${_wid}" || echo "?")
-      echo "[smoke-dismiss iter=${_iter}] wid=${_wid} name=${WIN_NAME}"
+      echo "[smoke-dismiss iter=${_iter}] wid=${_wid} name=${WIN_NAME}" | tee -a "${DISMISS_LOG}" >/dev/null
       _xd windowactivate --sync "${_wid}"; sleep 0.3
       _name=$(echo "${WIN_NAME}" | tr '[:upper:]' '[:lower:]')
       if echo "${_name}" | grep -q 'liveupdate'; then
         # Escape = default cancel action in Win32 modal dialogs (maps to
         # IDCANCEL / "Later"). More reliable than Alt+F4 which Wine may
         # not route correctly through WM_SYSCOMMAND SC_CLOSE.
-        _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.3
+        _xd key --window "${_wid}" --clearmodifiers Escape || true; sleep 0.3
         # Belt-and-suspenders: Return activates the focused/default button.
-        _xd key --window "${_wid}" --clearmodifiers Return; sleep 0.3
+        _xd key --window "${_wid}" --clearmodifiers Return || true; sleep 0.3
         # Also try clicking at the lower-right quadrant where 'Later' typically is.
         eval "$(DISPLAY="${DISPLAY}" xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null || true)"
         if [ -n "${WIDTH:-}" ] && [ -n "${HEIGHT:-}" ]; then
           _bx=$(( X + WIDTH  * 75 / 100 ))
           _by=$(( Y + HEIGHT * 85 / 100 ))
+          echo "[smoke-dismiss action] iter=${_iter} wid=${_wid} geom=${X},${Y},${WIDTH},${HEIGHT} click=${_bx},${_by}" >> "${DISMISS_LOG}"
           DISPLAY="${DISPLAY}" xdotool mousemove "${_bx}" "${_by}" click 1 2>/dev/null || true
           sleep 0.3
         fi
       else
         # Login / company-select: Escape → offline mode → IPC pump free.
-        _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
+        _xd key --window "${_wid}" --clearmodifiers Escape || true; sleep 0.2
       fi
     done
     sleep 3
@@ -277,6 +296,15 @@ for attempt in $(seq 1 20); do
     LAST_WS_PIDS="${CUR_WS_PIDS:-}"
   fi
 
+  WIN_TITLES="$(_visible_titles || true)"
+  echo "[attempt ${attempt}/20] windows=${WIN_TITLES:-none}" | tee -a "${WINDOW_SNAP_LOG}" >/dev/null
+  if [[ "${WIN_TITLES:-}" == *"LiveUpdate"* ]] || [[ "${WIN_TITLES:-}" == *"Welcome to"* ]]; then
+    echo "[attempt ${attempt}/20] liveupdate_visible=true"
+    if [ "${attempt}" -ge 3 ]; then
+      echo "UI_BLOCK_SUSPECTED: liveupdate dialog still visible at attempt=${attempt}"
+    fi
+  fi
+
   # Crash check.
   if ! kill -0 "${TERM_PID}" 2>/dev/null; then
     echo "SMOKE TEST FAIL: terminal64.exe died during TCP check (attempt ${attempt})"
@@ -316,6 +344,12 @@ kill "${LIVEME_PID}"  2>/dev/null || true
 
 if [[ "${TCP_PASS}" != "true" ]]; then
   echo "SMOKE TEST FAIL: terminal never established external TCP connections after 10 min"
+  echo "--- dismiss.log (tail 80) ---"
+  tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
+  echo "--- window-snapshots.log (tail 40) ---"
+  tail -n 40 "${WINDOW_SNAP_LOG}" 2>/dev/null || true
+  echo "--- wineserver-timeline.log (tail 40) ---"
+  tail -n 40 "${WINESERVER_TIMELINE}" 2>/dev/null || true
   echo "--- terminal.log (tail 100) ---"
   tail -n 100 "${LOGDIR}/terminal.log" 2>/dev/null || true
   exit 1
