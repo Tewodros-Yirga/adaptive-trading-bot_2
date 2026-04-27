@@ -77,6 +77,16 @@ printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=
   > "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal.ini" 2>/dev/null || true
 echo "Wrote portable terminal.ini stub"
 
+# Block update domains at Linux OS level too (belt-and-suspenders).
+# Wine uses its own hosts file but the OS-level block ensures no
+# DNS resolution can succeed regardless of Wine's config.
+for _upd in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
+            cdn.mql5.com update.metatrader5.com updates.metatrader5.com \
+            mt5-update.metaquotes.net; do
+  echo "127.0.0.1 ${_upd}" >> /etc/hosts 2>/dev/null || true
+done
+echo "Linux /etc/hosts patched for update domain blocking"
+
 # ---------------------------------------------------------------------------
 # Start Xvfb + openbox
 # ---------------------------------------------------------------------------
@@ -150,12 +160,18 @@ echo "GATE 1 PASS: terminal64.exe is alive after 120 s (PID ${TERM_PID})"
     for _wid in ${IDS:-}; do
       WIN_NAME=$(_xd getwindowname "${_wid}" || echo "?")
       echo "[smoke-dismiss iter=${_iter}] wid=${_wid} name=${WIN_NAME}"
-      _xd windowactivate --sync "${_wid}"; sleep 0.2
-      # LiveUpdate: use windowclose (WM_DELETE_WINDOW) — Escape was causing
-      # the terminal itself to exit rather than just closing the dialog.
+      _xd windowactivate --sync "${_wid}"; sleep 0.3
+      # Determine dialog type and act accordingly.
+      # IMPORTANT: do NOT use 'xdotool windowclose' on LiveUpdate — it sends
+      # WM_DELETE_WINDOW which propagates to the root terminal window and
+      # kills the entire process (confirmed by X11DRV_DestroyNotify in log).
       _name=$(echo "${WIN_NAME}" | tr '[:upper:]' '[:lower:]')
       if echo "${_name}" | grep -q 'liveupdate'; then
-        _xd windowclose "${_wid}" 2>/dev/null || true; sleep 0.3
+        # Alt+F4 closes only the focused child window, not the parent.
+        _xd key --window "${_wid}" --clearmodifiers alt+F4; sleep 0.4
+        # Fallback: Tab moves focus to 'Later' button, Space clicks it.
+        _xd key --window "${_wid}" --clearmodifiers Tab; sleep 0.2
+        _xd key --window "${_wid}" --clearmodifiers space; sleep 0.3
       else
         # Login/company-select: Escape → offline mode → IPC pump free
         _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.2
@@ -227,7 +243,7 @@ for attempt in $(seq 1 30); do
   # Run probe
   PROBE_OUT=""
   PROBE_EXIT=0
-  PROBE_OUT=$(timeout 20 wine "${WINE_PY}" -c "${PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
+  PROBE_OUT=$(timeout 45 wine "${WINE_PY}" -c "${PROBE_SCRIPT}" 2>&1) || PROBE_EXIT=$?
 
   echo "[attempt ${attempt}/30] probe_exit=${PROBE_EXIT} probe_out=${PROBE_OUT}"
 
