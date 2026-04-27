@@ -72,8 +72,7 @@ find "${APPDATA_MT5}" -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null
   | while IFS= read -r _hcfg; do _write_cfg "${_hcfg}"; done || true
 unset -f _write_cfg
 
-# Also patch the portable install-dir config for /portable mode.
-_write_cfg "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config"
+# Write portable terminal.ini stub (for /portable mode launch).
 printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
   > "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal.ini" 2>/dev/null || true
 echo "Wrote portable terminal.ini stub"
