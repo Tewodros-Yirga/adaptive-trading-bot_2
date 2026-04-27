@@ -283,43 +283,41 @@ RUN set -eux; \
           CY=$(( WIN_Y + WIN_H / 2 )); \
           \
           # ---------------------------------------------------------------\
-          # Escape cancels login/wizard dialogs and puts the terminal in\
-          # offline mode where the main thread (IPC pump) is NOT blocked.\
-          # Return/Tab would try to submit an empty login → error loop.\
+          # IMPORTANT: dialog-type-specific dismissal.\
+          # "Welcome to LiveUpdate": pressing Escape causes the terminal to\
+          # EXIT entirely. Must click the "Later" button (lower-left) so\
+          # the terminal skips the update and proceeds to its main window.\
+          # Login/company dialogs: Escape cancels them safely → offline mode.\
           # ---------------------------------------------------------------\
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
-          sleep 0.2; \
+          _is_liveupdate=0; \
+          echo "${WIN_NAME}" | grep -qi "LiveUpdate" && _is_liveupdate=1 || true; \
           \
-          # Click broker list rows (upper-center of dialog body). \
-          for _row_off in -100 -60 -30 0; do \
-            DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY + _row_off ))" click 1 2>/dev/null || true; \
-            sleep 0.06; \
-          done; \
-          # Double-click the first list entry to select it (enables Next). \
-          DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY - 60 ))" click 1 2>/dev/null || true; \
-          sleep 0.05; \
-          DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY - 60 ))" click 1 2>/dev/null || true; \
-          sleep 0.1; \
-          \
-          # Tab × 2 then Return to reach and activate the default button. \
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Tab 2>/dev/null || true; \
-          sleep 0.05; \
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Tab 2>/dev/null || true; \
-          sleep 0.05; \
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
-          sleep 0.1; \
-          \
-          # Also click the bottom-right quadrant where Next/OK/Later live. \
-          for _btn_off in \
-              "$(( WIN_W * 3 / 4 )) $(( WIN_H * 3 / 4 ))" \
-              "$(( WIN_W * 4 / 5 )) $(( WIN_H * 7 / 8 ))" \
-              "$(( WIN_W / 2 ))    $(( WIN_H - 40 ))"; do \
-            set -- ${_btn_off}; \
-            DISPLAY=:99 xdotool mousemove --clearmodifiers \
-              "$(( WIN_X + $1 ))" "$(( WIN_Y + $2 ))" click 1 2>/dev/null || true; \
-            sleep 0.06; \
-          done; \
-          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
+          if [ "${_is_liveupdate}" -eq 1 ]; then \
+            echo "[firstrun-dismiss] LiveUpdate detected — clicking Later (lower-left)"; \
+            # Later button sits in the lower-left of the dialog. \
+            # Try several candidate positions to be safe. \
+            for _later_off in \
+                "$(( WIN_W / 5 ))     $(( WIN_H - 15 ))" \
+                "$(( WIN_W / 4 ))     $(( WIN_H - 20 ))" \
+                "$(( WIN_W * 3 / 10 )) $(( WIN_H - 15 ))"; do \
+              set -- ${_later_off}; \
+              DISPLAY=:99 xdotool mousemove --clearmodifiers \
+                "$(( WIN_X + $1 ))" "$(( WIN_Y + $2 ))" click 1 2>/dev/null || true; \
+              sleep 0.15; \
+            done; \
+            sleep 0.5; \
+          else \
+            # For login/company-select dialogs: Escape → offline mode. \
+            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
+            sleep 0.2; \
+            \
+            # Click broker list rows (upper-center of dialog body). \
+            for _row_off in -100 -60 -30 0; do \
+              DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY + _row_off ))" click 1 2>/dev/null || true; \
+              sleep 0.06; \
+            done; \
+            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
+          fi; \
         done; \
         sleep 5; \
       done; \
