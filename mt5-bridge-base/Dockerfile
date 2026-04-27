@@ -225,9 +225,30 @@ RUN set -eux; \
                cdn.mql5.com ec.mql5.com files.mql5.com www.mql5.com mql5.com \
                update.metatrader5.com updates.metatrader5.com \
                mt5-update.metaquotes.net metaquotes.net; do \
-      echo "0.0.0.0 ${_d}" >> "${WINE_HOSTS}" 2>/dev/null || true; \
+      echo "127.0.0.1 ${_d}" >> "${WINE_HOSTS}" 2>/dev/null || true; \
     done; \
-    echo "Wine-side hosts file written"; \
+    echo "Wine-side hosts file written (127.0.0.1 = immediate TCP RST)"; \
+    \
+    # Start a minimal TCP-closer on 80 & 443 so Wine's SSL connect gets an \
+    # immediate connection-reset instead of a 30-60s TCP timeout. \
+    # This makes LiveUpdate's check fail in <100ms → 'Later' becomes clickable. \
+    python3 -c " \
+import socket, threading, time; \
+ports = [80, 443, 2087, 2086]; \
+def _accept_loop(s): \
+  while True: \
+    try: c,_ = s.accept(); c.close() \
+    except: pass; \
+for p in ports: \
+  s = socket.socket(); \
+  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); \
+  try: s.bind(('127.0.0.1', p)); s.listen(64); threading.Thread(target=_accept_loop, args=(s,), daemon=True).start(); print('TCP-closer listening on', p) \
+  except Exception as e: print('Could not bind port', p, e); \
+time.sleep(600); \
+" 2>/dev/null & \
+    FAKE_SRV_PID=$!; \
+    sleep 0.5; \
+    echo "Fake TCP-closer PID=${FAKE_SRV_PID} — LiveUpdate will fail fast";
     \
     # Pre-write Exness broker config so the terminal auto-logs in during \
     # first-run init, writes terminal.ini, and bypasses all wizard dialogs. \
@@ -283,30 +304,38 @@ RUN set -eux; \
           CY=$(( WIN_Y + WIN_H / 2 )); \
           \
           # ---------------------------------------------------------------\
-          # IMPORTANT: dialog-type-specific dismissal.\
-          # "Welcome to LiveUpdate": The "Later" button is NOT clickable\
-          # while LiveUpdate is doing its update check — which hangs\
-          # indefinitely because we blocked all update hosts in /etc/hosts.\
-          # Solution: kill the liveupdate.exe process directly.\
-          # After liveupdate.exe exits, the terminal unblocks and continues\
-          # to its main window / login flow.\
-          # Login/company dialogs: Escape cancels them safely → offline mode.\
+          # LiveUpdate dismissal — research findings:\
+          # 1. LiveUpdate is INTERNAL to terminal64.exe (not a sub-process),\
+          #    so wine taskkill /IM liveupdate.exe always fails.\
+          # 2. With 127.0.0.1 in Wine hosts + our fake TCP-closer, the SSL\
+          #    handshake fails in <100ms, so 'Later' is clickable immediately.\
+          # 3. Standard Win32 dialog (450×138): 'Later' button occupies\
+          #    roughly x_offset 8-88 (center ~48), y near the bottom.\
+          #    Previous code was clicking at x_offset 90-135 — too far right.\
+          # Login/company dialogs: Tab×N + Escape for offline mode.\
           # ---------------------------------------------------------------\
           _is_liveupdate=0; \
           echo "${WIN_NAME}" | grep -qi "LiveUpdate" && _is_liveupdate=1 || true; \
           \
           if [ "${_is_liveupdate}" -eq 1 ]; then \
-            echo "[firstrun-dismiss] LiveUpdate stuck — killing liveupdate.exe"; \
-            # Primary: wine taskkill (cleanly closes the process). \
-            DISPLAY=:99 wine taskkill /F /IM liveupdate.exe 2>/dev/null || true; \
+            echo "[firstrun-dismiss] LiveUpdate: clicking Later (left btn) + Tab+Space fallback"; \
+            \
+            # Button row is ~20px from bottom of the window. \
+            # 'Later' (left button) center: x_offset ≈ 45, y_offset ≈ WIN_H-18. \
+            _BTN_Y=$(( WIN_Y + WIN_H - 18 )); \
+            for _bx_off in 30 45 55 70 85; do \
+              DISPLAY=:99 xdotool mousemove --clearmodifiers \
+                "$(( WIN_X + _bx_off ))" "${_BTN_Y}" click 1 2>/dev/null || true; \
+              sleep 0.12; \
+            done; \
             sleep 0.3; \
-            DISPLAY=:99 wine taskkill /F /IM LiveUpdate.exe 2>/dev/null || true; \
+            \
+            # Keyboard fallback: Tab moves focus, Space activates the button. \
+            # In this dialog the default (Return) = Update; Tab → Later; Space = click. \
+            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Tab 2>/dev/null || true; \
+            sleep 0.15; \
+            DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers space 2>/dev/null || true; \
             sleep 0.3; \
-            # Fallback: kill at the Linux process level. \
-            pgrep -a -f -i liveupdate 2>/dev/null \
-              | awk '{print $1}' | head -5 \
-              | xargs -r kill -9 2>/dev/null || true; \
-            sleep 1; \
           else \
             # For login/company-select dialogs: Escape → offline mode. \
             DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Escape 2>/dev/null || true; \
