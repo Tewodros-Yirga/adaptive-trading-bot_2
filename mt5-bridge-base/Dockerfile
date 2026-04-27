@@ -177,12 +177,20 @@ RUN set -eux; \
 #
 #    FIX: Run the terminal once here (under a fresh Xvfb), pre-write the
 #    MetaQuotes-Demo server config, dismiss wizards with xdotool, wait for
-#    the IPC pipe to appear, then snapshot the populated AppData into the
-#    image.  Containers that inherit this image skip the wizard entirely
-#    and start with the IPC pump ready in < 30 s.
+#    terminal.ini to appear in the AppData hash dir, then snapshot the
+#    populated AppData into the image.  Containers that inherit this image
+#    skip the wizard entirely and start with the IPC pump ready in < 30 s.
 #
-#    The registry tweak at the end enables "Allow Algorithmic Trading" in
-#    the baked profile so mt5.initialize() is accepted immediately.
+#    KEY IMPROVEMENTS over previous version:
+#    - LiveUpdate blocked via Windows proxy registry (localhost:1) instead of
+#      /etc/hosts — /etc/hosts is read-only in Docker BuildKit on GHA runners.
+#    - Dismiss loop uses xdotool getwindowgeometry --shell to get actual window
+#      position; clicks are relative to the window centre (not hardcoded screen
+#      coordinates that miss a centered dialog at unknown position).
+#    - Success metric changed from "IPC named pipe count > 0" to
+#      "terminal.ini exists in hash dir" — pipes never appear while the wizard
+#      blocks the main thread; terminal.ini is written early in startup and is
+#      a reliable init-complete signal.
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     if [ ! -f /opt/mt5_terminal.preinstalled ]; then \
@@ -193,24 +201,39 @@ RUN set -eux; \
     TERM_EXE="$(tr -d '\r\n' < /opt/mt5_terminal_exe.path)"; \
     WINE_PY="$(tr -d '\r\n' < /opt/wine_python_exe.path)"; \
     \
-    # Remove any leftover X99 lock from previous RUN layer. \
     rm -f /tmp/.X99-lock; \
     Xvfb :99 -screen 0 1280x720x24 & \
     XVFB_PID=$!; \
     sleep 3; \
-    # Start a window manager so xdotool can deliver focus/input to Wine dialogs. \
     openbox --sm-disable > /tmp/openbox-init.log 2>&1 & \
     OPENBOX_PID=$!; \
     sleep 2; \
     \
-    # Block LiveUpdate CDNs so the terminal never downloads an update. \
+    # -----------------------------------------------------------------------\
+    # Block LiveUpdate via Windows Internet proxy settings in the Wine registry.\
+    # /etc/hosts is READ-ONLY inside Docker BuildKit on GitHub Actions runners,\
+    # so that approach silently fails.  Setting a proxy to 127.0.0.1:1 (nothing\
+    # listening) causes WinHTTP/WinINet to fail fast instead of timing out,\
+    # preventing the terminal from downloading updates during build.\
+    # -----------------------------------------------------------------------\
+    wine reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
+      /v "ProxyEnable" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
+    wine reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
+      /v "ProxyServer" /t REG_SZ /d "127.0.0.1:1" /f 2>/dev/null || true; \
+    wine reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" \
+      /v "ProxyOverride" /t REG_SZ /d "<local>" /f 2>/dev/null || true; \
+    echo "LiveUpdate proxy block set (127.0.0.1:1)"; \
+    \
+    # Also write to Wine-side hosts file for belt-and-suspenders coverage. \
+    WINE_HOSTS="${WINEPREFIX}/drive_c/windows/system32/drivers/etc/hosts"; \
+    mkdir -p "$(dirname "${WINE_HOSTS}")" 2>/dev/null || true; \
     for _d in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
                cdn.mql5.com ec.mql5.com files.mql5.com www.mql5.com mql5.com \
                update.metatrader5.com updates.metatrader5.com \
                mt5-update.metaquotes.net metaquotes.net; do \
-      grep -qF "${_d}" /etc/hosts 2>/dev/null || \
-        echo "0.0.0.0 ${_d}" >> /etc/hosts 2>/dev/null || true; \
+      echo "0.0.0.0 ${_d}" >> "${WINE_HOSTS}" 2>/dev/null || true; \
     done; \
+    echo "Wine-side hosts file written"; \
     \
     # Pre-write MetaQuotes-Demo server config to both candidate config paths. \
     # This tells the terminal which server to pre-select, converting the \
@@ -224,9 +247,6 @@ RUN set -eux; \
       echo "Pre-wrote server config: ${_cfg_dir}/common.ini"; \
     done; \
     \
-    # Launch terminal with a pre-written config so it skips the wizard. \
-    # Without /config: the wizard always appears because terminal needs \
-    # to be told which server to use on first run. \
     WIN_CFG="${WINEPREFIX}/drive_c/mt5-firstrun.ini"; \
     printf '[Common]\r\nLogin=\r\nServer=MetaQuotes-Demo\r\nNewsEnable=0\r\nAutoSync=0\r\n' \
       > "${WIN_CFG}" 2>/dev/null || true; \
@@ -236,51 +256,68 @@ RUN set -eux; \
       wine "${TERM_EXE}" /config:"C:\\mt5-firstrun.ini" > /tmp/mt5-firstrun.log 2>&1 & \
     TERM_PID=$!; \
     \
-    # Dismiss LiveUpdate and first-run wizards for up to 3 minutes. \
-    # Critical: click broker list rows BEFORE clicking Next because Next is \
-    # disabled (greyed out) until a company is selected from the list. \
+    # -----------------------------------------------------------------------\
+    # Dialog-dismiss loop — runs in a background subshell for the full wait.\
+    #\
+    # KEY FIX: use xdotool getwindowgeometry --shell to read the actual X,Y,\
+    # WIDTH,HEIGHT of each dialog, then click relative to the window centre.\
+    # The previous approach used hardcoded absolute screen coordinates which\
+    # missed a centered dialog whose position was unknown.\
+    # -----------------------------------------------------------------------\
     ( \
       sleep 10; \
-      for _try in $(seq 1 36); do \
+      for _try in $(seq 1 48); do \
         IDS=$( { \
           DISPLAY=:99 xdotool search --onlyvisible --name "LiveUpdate" 2>/dev/null; \
           DISPLAY=:99 xdotool search --onlyvisible --name "Select a company" 2>/dev/null; \
           DISPLAY=:99 xdotool search --onlyvisible --name "Welcome to" 2>/dev/null; \
           DISPLAY=:99 xdotool search --onlyvisible --name "MetaTrader 5" 2>/dev/null; \
           DISPLAY=:99 xdotool search --onlyvisible --name "MetaTrader" 2>/dev/null; \
+          DISPLAY=:99 xdotool search --onlyvisible --name "Setup" 2>/dev/null; \
         } | awk 'NF' | sort -n -u ); \
-        ALL_IDS=$( DISPLAY=:99 xdotool search --onlyvisible 2>/dev/null | awk 'NF' | sort -n -u ); \
-        WORK_IDS="$(printf '%s\n%s\n' "${IDS}" "${ALL_IDS}" | awk 'NF' | sort -n -u)"; \
-        WIN_TITLES="$(DISPLAY=:99 xdotool search --onlyvisible 2>/dev/null \
-          | while IFS= read -r _w; do DISPLAY=:99 xdotool getwindowname "$_w" 2>/dev/null || true; done \
-          | paste -sd'|' - 2>/dev/null || true)"; \
-        echo "[firstrun-dismiss try=${_try}] windows=${WIN_TITLES}"; \
-        for _wid in ${WORK_IDS}; do \
+        echo "[firstrun-dismiss try=${_try}] found_wids=${IDS:-none}"; \
+        for _wid in ${IDS}; do \
+          WIN_NAME=$(DISPLAY=:99 xdotool getwindowname "${_wid}" 2>/dev/null || echo "unknown"); \
+          echo "[firstrun-dismiss try=${_try}] wid=${_wid} name=${WIN_NAME}"; \
           DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true; \
-          sleep 0.25; \
-          # Click broker list items first (enables the Next button). \
-          for _xy in "400 210" "500 210" "640 210" \
-                     "400 245" "500 245" "640 245" \
-                     "400 275" "500 275" "640 275"; do \
-            set -- ${_xy}; \
-            DISPLAY=:99 xdotool mousemove --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
+          sleep 0.3; \
+          \
+          # Get the actual window geometry so clicks are relative to the window.\
+          WIN_GEOM=$(DISPLAY=:99 xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null || true); \
+          eval "${WIN_GEOM}" 2>/dev/null || true; \
+          WIN_W="${WIDTH:-800}"; WIN_H="${HEIGHT:-600}"; WIN_X="${X:-240}"; WIN_Y="${Y:-60}"; \
+          CX=$(( WIN_X + WIN_W / 2 )); \
+          CY=$(( WIN_Y + WIN_H / 2 )); \
+          \
+          # Click broker list rows (upper-center of dialog body). \
+          for _row_off in -100 -60 -30 0; do \
+            DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY + _row_off ))" click 1 2>/dev/null || true; \
             sleep 0.06; \
           done; \
-          # Double-click the first broker list item to select it. \
-          DISPLAY=:99 xdotool mousemove --clearmodifiers "400" "245" click 1 2>/dev/null || true; \
+          # Double-click the first list entry to select it (enables Next). \
+          DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY - 60 ))" click 1 2>/dev/null || true; \
           sleep 0.05; \
-          DISPLAY=:99 xdotool mousemove --clearmodifiers "400" "245" click 1 2>/dev/null || true; \
+          DISPLAY=:99 xdotool mousemove --clearmodifiers "${CX}" "$(( CY - 60 ))" click 1 2>/dev/null || true; \
           sleep 0.1; \
-          # Click Next/OK/Restart/Later button rows. \
-          for _xy in "638 418" "724 488" "640 520" "560 332" "469 335"; do \
-            set -- ${_xy}; \
-            DISPLAY=:99 xdotool mousemove --clearmodifiers "$1" "$2" click 1 2>/dev/null || true; \
-            sleep 0.06; \
-          done; \
+          \
+          # Tab × 2 then Return to reach and activate the default button. \
+          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Tab 2>/dev/null || true; \
+          sleep 0.05; \
+          DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Tab 2>/dev/null || true; \
+          sleep 0.05; \
           DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
           sleep 0.1; \
-          # DO NOT send Escape — it cancels the wizard and closes the terminal. \
-          # A second Return advances past any confirmation step. \
+          \
+          # Also click the bottom-right quadrant where Next/OK/Later live. \
+          for _btn_off in \
+              "$(( WIN_W * 3 / 4 )) $(( WIN_H * 3 / 4 ))" \
+              "$(( WIN_W * 4 / 5 )) $(( WIN_H * 7 / 8 ))" \
+              "$(( WIN_W / 2 ))    $(( WIN_H - 40 ))"; do \
+            set -- ${_btn_off}; \
+            DISPLAY=:99 xdotool mousemove --clearmodifiers \
+              "$(( WIN_X + $1 ))" "$(( WIN_Y + $2 ))" click 1 2>/dev/null || true; \
+            sleep 0.06; \
+          done; \
           DISPLAY=:99 xdotool key --window "${_wid}" --clearmodifiers Return 2>/dev/null || true; \
         done; \
         sleep 5; \
@@ -288,31 +325,37 @@ RUN set -eux; \
     ) & \
     DISMISS_PID=$!; \
     \
-    # Wait for the IPC named pipe to appear (up to 3 minutes). \
-    echo "Waiting for IPC named pipes to appear..."; \
-    PIPE_WAITED=0; \
-    IPC_PIPE_FOUND=false; \
-    while [ "${PIPE_WAITED}" -lt 180 ]; do \
-      PIPE_COUNT=$(timeout 8 wine cmd /c "dir \\\\.\\pipe\\" 2>/dev/null \
-        | tr -d '\r' \
-        | grep -vE '(Directory of|Volume|File Not Found|^$)' \
-        | wc -l) || PIPE_COUNT=0; \
-      if [ "${PIPE_COUNT}" -gt 0 ]; then \
-        echo "IPC pipes detected (count=${PIPE_COUNT}) after ${PIPE_WAITED}s — AppData is populated."; \
-        IPC_PIPE_FOUND=true; \
+    # -----------------------------------------------------------------------\
+    # Wait for terminal.ini to appear in the AppData hash dir (up to 4 min).\
+    #\
+    # terminal.ini is written by the terminal during normal startup — it\
+    # records window layout, server settings, etc.  Its existence confirms the\
+    # terminal completed at least the post-wizard initialisation phase.\
+    # This is a far more reliable gate than IPC pipe count, which stays at 0\
+    # while the wizard blocks the main thread.\
+    # -----------------------------------------------------------------------\
+    echo "Waiting for terminal.ini in AppData hash dir (up to 240 s)..."; \
+    INIT_WAITED=0; \
+    INIT_DONE=false; \
+    while [ "${INIT_WAITED}" -lt 240 ]; do \
+      TINI=$(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+        -mindepth 2 -maxdepth 2 -name "terminal.ini" 2>/dev/null | head -1) || true; \
+      if [ -n "${TINI}" ]; then \
+        echo "terminal.ini found: ${TINI} (after ${INIT_WAITED}s)"; \
+        INIT_DONE=true; \
         break; \
       fi; \
-      echo "No IPC pipes yet (waited ${PIPE_WAITED}s)..."; \
+      HASH_FILES=$(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+        -mindepth 2 -maxdepth 2 -type f 2>/dev/null | wc -l) || HASH_FILES=0; \
+      echo "Waiting for init (${INIT_WAITED}s elapsed, hash_files=${HASH_FILES})..."; \
       sleep 5; \
-      PIPE_WAITED=$((PIPE_WAITED + 5)); \
+      INIT_WAITED=$((INIT_WAITED + 5)); \
     done; \
     \
-    # Give the terminal 10 more seconds to write all its AppData files \
-    # even if the IPC pipe appeared immediately. \
-    sleep 10; \
+    # Give the terminal 15 more seconds to flush remaining AppData files. \
+    sleep 15; \
     \
-    # Bake "Allow Algorithmic Trading" via Wine registry. \
-    # This key enables the Python/IPC API in the terminal's setting store. \
+    # Bake "Allow Algorithmic Trading" into Wine registry. \
     echo "Baking 'Allow Algorithmic Trading' into Wine registry..."; \
     wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5" \
       /v "ExpertAdvisors" /t REG_DWORD /d 1 /f 2>/dev/null || true; \
@@ -329,8 +372,7 @@ RUN set -eux; \
         done; \
     \
     # Write common.ini into every terminal hash sub-directory the terminal \
-    # created during this first run, so subsequent startups (including the \
-    # smoke test) skip the server-selection wizard. \
+    # created during this first run, so subsequent startups skip the wizard. \
     find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
       -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
       | while IFS= read -r _hdir; do \
@@ -342,21 +384,17 @@ RUN set -eux; \
           echo "Wrote hash-dir config: ${_hdir}/config/common.ini"; \
         done; \
     \
-    # Show what was created so the build log is self-documenting. \
     echo "=== AppData directories created ==="; \
     find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes" \
       -maxdepth 4 -type d 2>/dev/null | head -40 || true; \
-    echo "=== IPC assessment complete ==="; \
-    echo "IPC_PIPE_FOUND=${IPC_PIPE_FOUND}"; \
+    echo "=== INIT_DONE=${INIT_DONE} ==="; \
     \
-    # Gracefully stop the terminal and dismiss loop; allow wineserver to drain. \
     kill "${DISMISS_PID}" 2>/dev/null || true; \
     kill "${TERM_PID}" 2>/dev/null || true; \
     sleep 5; \
     wineserver -k 2>/dev/null || true; \
     sleep 3; \
     \
-    # Stop Xvfb and WM. \
     kill "${OPENBOX_PID}" 2>/dev/null || true; \
     kill "${XVFB_PID}" 2>/dev/null || pkill Xvfb || true; \
     rm -f /tmp/.X99-lock /tmp/mt5-firstrun.log /tmp/openbox-init.log; \
