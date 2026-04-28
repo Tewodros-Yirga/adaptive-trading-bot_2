@@ -255,7 +255,7 @@ RUN set -eux; \
     # Background dismiss loop: actively dismiss wizard/LiveUpdate dialogs that
     # appear during the first run. Without this, any dialog blocks the wait loop
     # indefinitely because nothing is pressing buttons.
-    (
+    ( \
       while true; do \
         for _name in "Select a company" "Welcome to" "LiveUpdate" "Setup" "Login"; do \
           _wids=$(DISPLAY=:99 xdotool search --onlyvisible --name "${_name}" 2>/dev/null || true); \
