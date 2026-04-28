@@ -74,13 +74,19 @@ for _ in $(seq 1 30); do
 done
 echo "GATE 3: mt5linux port ${BRIDGE_PORT} open=${RPC_OK}"
 
-RPC_OUT="$(timeout 45 python3 - <<'PY' 2>&1 || true
+RPC_OUT="$(timeout 60 wine "${WINE_PY}" - <<'PY' 2>&1 || true
 from mt5linux import MetaTrader5
 import os
+
 port = int(os.environ.get("BRIDGE_PORT", "18812"))
-mt5 = MetaTrader5(host='127.0.0.1', port=port)
+mt5 = MetaTrader5(host="127.0.0.1", port=port)
 ok = mt5.initialize()
 print(f"initialize_ok={ok}")
+if ok:
+    try:
+        print(f"account_info={mt5.account_info()}")
+    finally:
+        mt5.shutdown()
 PY
 )"
 echo "GATE 3 RPC output: ${RPC_OUT}"

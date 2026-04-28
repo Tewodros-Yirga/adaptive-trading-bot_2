@@ -1,4 +1,5 @@
-FROM ghcr.io/loriloha/mt5-bridge-base:latest
+ARG BASE_IMAGE=ghcr.io/loriloha/mt5-bridge-base:latest
+FROM ${BASE_IMAGE}
 
 USER root
 
