@@ -18,7 +18,7 @@ mkdir -p "${WINEPREFIX}" "${MT5_WORKDIR}" "${LOGDIR}"
 WINESERVER_TIMELINE="${LOGDIR}/wineserver-timeline.log"
 
 _ws_pids() {
-  pgrep -fa wineserver 2>/dev/null | awk '{print $1}' | tr '\n' ',' | sed 's/,$//'
+  pgrep -fa wineserver 2>/dev/null | awk '{print $1}' | tr '\n' ',' | sed 's/,$//' || true
 }
 
 _log_ws() {
