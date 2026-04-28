@@ -176,8 +176,8 @@ if command -v wine > /dev/null 2>&1; then
         break
       fi
       if [[ -f "${LOGDIR}/mt5_ipc.failed" ]]; then
-        echo "[mt5linux-launcher] mt5_ipc.failed detected — terminal TCP gate failed. Aborting." >&2
-        exit 1
+        echo "[mt5linux-launcher] mt5_ipc.failed detected — TCP gate timed out. Starting RPyC server anyway (adapter will retry)." >&2
+        break
       fi
       sleep 5
       MT5LINUX_WAIT_IPC=$(( MT5LINUX_WAIT_IPC + 5 ))
@@ -622,6 +622,6 @@ fi
 
   # Keep wrapper attached to terminal lifecycle.
   wait "${TERMINAL_PID}" || true
-) > /tmp/mt5-launch-wrapper.log 2>&1 &
+) 2>&1 | tee /tmp/mt5-launch-wrapper.log &
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"
