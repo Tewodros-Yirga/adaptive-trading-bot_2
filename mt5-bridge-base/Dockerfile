@@ -252,19 +252,53 @@ RUN set -eux; \
       wine "${TERM_EXE}" /portable > /tmp/mt5-firstrun.log 2>&1 & \
     TERM_PID=$!; \
     \
-    # Wait up to 3 min for the terminal to create MQL5/Experts (portable). \
-    echo "Waiting for portable MQL5/Experts dir (up to 180 s)..."; \
+    # Background dismiss loop: actively dismiss wizard/LiveUpdate dialogs that
+    # appear during the first run. Without this, any dialog blocks the wait loop
+    # indefinitely because nothing is pressing buttons.
+    (
+      while true; do \
+        for _name in "Select a company" "Welcome to" "LiveUpdate" "Setup" "Login"; do \
+          _wids=$(DISPLAY=:99 xdotool search --onlyvisible --name "${_name}" 2>/dev/null || true); \
+          for _wid in ${_wids}; do \
+            eval "$(DISPLAY=:99 xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null || true)"; \
+            if [ -n "${WIDTH:-}" ] && [ -n "${HEIGHT:-}" ]; then \
+              _cx=$(( X + WIDTH  / 2 )); \
+              _by=$(( Y + HEIGHT * 75 / 100 )); \
+              DISPLAY=:99 xdotool windowactivate --sync "${_wid}" 2>/dev/null || true; \
+              DISPLAY=:99 xdotool mousemove "${_cx}" "${_by}" click 1 2>/dev/null || true; \
+              DISPLAY=:99 xdotool key --window "${_wid}" Escape 2>/dev/null || true; \
+              DISPLAY=:99 xdotool key --window "${_wid}" Return 2>/dev/null || true; \
+            fi; \
+          done; \
+        done; \
+        sleep 5; \
+      done \
+    ) & \
+    DISMISS_PID=$!; \
+    \
+    # Measure pre-written terminal.ini size so we can detect when the terminal
+    # overwrites it (healthy startup rewrites it from ~300B to >1KB).
+    PRE_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
+    \
+    # Wait up to 4 min: terminal.ini grown OR MQL5/Experts appeared.
+    echo "Waiting for portable init (terminal.ini size change or MQL5/Experts, up to 240 s)..."; \
     INIT_WAITED=0; \
-    while [ "${INIT_WAITED}" -lt 180 ]; do \
+    while [ "${INIT_WAITED}" -lt 240 ]; do \
+      CUR_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
+      if [ "${CUR_TINI_SIZE}" -gt "${PRE_TINI_SIZE}" ]; then \
+        echo "terminal.ini grown: ${PRE_TINI_SIZE}->${CUR_TINI_SIZE} bytes after ${INIT_WAITED}s — terminal rewrote config"; \
+        break; \
+      fi; \
       if [ -d "${TERM_DIR}/MQL5/Experts" ]; then \
         echo "MQL5/Experts present after ${INIT_WAITED}s — portable init done"; \
         break; \
       fi; \
       PFILES=$(find "${TERM_DIR}" -maxdepth 1 -type f 2>/dev/null | wc -l) || PFILES=0; \
-      echo "Waiting for portable init (${INIT_WAITED}s, install_files=${PFILES})..."; \
+      echo "Waiting for portable init (${INIT_WAITED}s, install_files=${PFILES}, tini=${CUR_TINI_SIZE}B)..."; \
       sleep 5; \
       INIT_WAITED=$(( INIT_WAITED + 5 )); \
     done; \
+    kill "${DISMISS_PID}" 2>/dev/null || true; \
     \
     # Extra settle time for config dirs to flush. \
     sleep 10; \

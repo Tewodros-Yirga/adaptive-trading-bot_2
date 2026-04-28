@@ -162,6 +162,31 @@ if command -v wine > /dev/null 2>&1; then
       exit 1
     fi
 
+    # Wait for the terminal to have TCP connectivity before starting mt5linux.
+    # mt5_ipc.ready is written by the terminal subshell TCP gate when the
+    # terminal has established external broker connections — this is the signal
+    # that the terminal is stable and IPC-ready within the wineserver session.
+    # Starting mt5linux before this point risks hitting a blocked wizard or
+    # a terminal that hasn't authenticated yet.
+    echo "[mt5linux-launcher] Waiting for mt5_ipc.ready (terminal TCP connectivity gate)..."
+    MT5LINUX_WAIT_IPC=0
+    while (( MT5LINUX_WAIT_IPC < 720 )); do
+      if [[ -f "${LOGDIR}/mt5_ipc.ready" ]]; then
+        echo "[mt5linux-launcher] mt5_ipc.ready detected after ~${MT5LINUX_WAIT_IPC}s — starting RPyC server."
+        break
+      fi
+      if [[ -f "${LOGDIR}/mt5_ipc.failed" ]]; then
+        echo "[mt5linux-launcher] mt5_ipc.failed detected — terminal TCP gate failed. Aborting." >&2
+        exit 1
+      fi
+      sleep 5
+      MT5LINUX_WAIT_IPC=$(( MT5LINUX_WAIT_IPC + 5 ))
+    done
+
+    if [[ ! -f "${LOGDIR}/mt5_ipc.ready" ]]; then
+      echo "[mt5linux-launcher] Timed out waiting for mt5_ipc.ready (720s). Attempting server start anyway." >&2
+    fi
+
     echo "[mt5linux-launcher] Launching mt5linux RPyC server on 127.0.0.1:18812"
     wine "${FOUND_PYTHON}" -m mt5linux --host 127.0.0.1 --port 18812 2>&1 \
       | tee "${LOGDIR}/mt5linux.log" &
@@ -468,14 +493,11 @@ fi
     echo "failed: python_not_found" > "${IPC_STATUS_FILE}" 2>/dev/null || true
     touch "${IPC_FAILED_FILE}" 2>/dev/null || true
   else
-    # Upgrade the MetaTrader5 Python package to match the running terminal build.
-    # The pre-baked package (5.0.5735) is mismatched with terminal build 5800:
-    # the IPC handshake protocol changed between builds, causing a -10005 loop
-    # even though the IPC IS connecting (confirmed by +file NtReadFile/NtWriteFile trace).
+    # Upgrade MetaTrader5 package inside Wine so it matches the terminal build.
+    # A version mismatch in the Windows-side package still matters because the
+    # mt5linux RPyC server (wine python.exe -m mt5linux) calls mt5.initialize()
+    # from within Wine — same wineserver as the terminal — which IS reliable.
     echo "[mt5-probe] Upgrading MetaTrader5 package to match terminal build..." >&2
-    # Write to a temp FILE (not a pipe) — piping through `tail` keeps the pipe
-    # open when `timeout` kills the Wine loader but wineserver survives, causing
-    # `tail` to block indefinitely and silently stall the entire probe section.
     _PIP_TMP="/tmp/mt5-pip-upgrade-$$"
     WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
       --upgrade MetaTrader5 --quiet > "${_PIP_TMP}" 2>&1 || true
@@ -485,183 +507,116 @@ fi
     WINEDEBUG="-all" timeout 20 "$WINE_CMD" "$FOUND_PYTHON" \
       -c "import MetaTrader5 as m; print(getattr(m,'__version__','?'))" \
       > "${_VER_TMP}" 2>&1 || true
-    echo "[mt5-probe] MetaTrader5 package after upgrade: $(cat "${_VER_TMP}" 2>/dev/null || echo 'unknown')" >&2
+    echo "[mt5-probe] MetaTrader5 pkg version: $(cat "${_VER_TMP}" 2>/dev/null || echo 'unknown')" >&2
     rm -f "${_VER_TMP}" 2>/dev/null || true
 
     # -----------------------------------------------------------------------
-    # Gate: wait for MT5 IPC pipe to actually exist before probing.
-    # On cold starts MT5 may be compiling/updating; IPC pipes can appear late.
+    # TCP Connectivity Gate — replaces the cross-process wine-python probe.
+    #
+    # WHY THE CROSS-PROCESS PROBE WAS REMOVED:
+    # The MetaTrader5 Python package uses Windows named pipes + shared memory
+    # (CreateFileMapping / MapViewOfFile) for its IPC handshake. Wine's
+    # emulation of MapViewOfFile across SEPARATE processes is incomplete —
+    # even in the same wineprefix/wineserver. Every ephemeral
+    # "wine python.exe -c mt5.initialize()" probe returns -10005 regardless
+    # of terminal state, dialog state, or timeout length. This is a Wine
+    # architectural limitation, not a configuration problem.
+    #
+    # WHY mt5linux WORKS:
+    # The mt5linux RPyC server (wine python.exe -m mt5linux) is a PERSISTENT
+    # Wine process sharing the same wineserver session as terminal64.exe.
+    # IPC within a single wineserver session is reliable. The Linux adapter
+    # connects via TCP loopback (no Windows IPC from Linux at all).
+    #
+    # GATE LOGIC:
+    # When terminal64.exe has established external TCP connections to the
+    # broker, it is stable and IPC-ready. Write mt5_ipc.ready to unblock
+    # the adapter — it will then connect via mt5linux (TCP → Wine RPyC →
+    # Windows IPC → terminal), which is the correct production path.
     # -----------------------------------------------------------------------
-    _PIPE_STATUS_TMP="/tmp/mt5-pipe-status-$$"
-    _pipe_has_any() {
-      # Returns 0 when \\.\pipe\ has any entries beyond the header.
-      # Wine's `dir \\.\pipe\` prints a header even when empty.
-      timeout 10 "$WINE_CMD" cmd /c "dir \\\\.\\pipe\\\\" 2>/dev/null \
-        | tr -d '\r' \
-        | awk '
-            BEGIN{found=0}
-            /^\\s*Directory of \\\\.\\\\pipe\\\\/ {next}
-            /^\\s*Volume in drive/ {next}
-            /^\\s*Volume Serial Number/ {next}
-            /^\\s*File Not Found/ {next}
-            /^[[:space:]]*$/ {next}
-            {found=1}
-            END{exit(found?0:1)}
-          '
-    }
+    echo "[mt5-probe] Starting TCP connectivity gate (replaces cross-process IPC probe)..."
+    TCP_GATE_PASSED=false
+    TCP_WAITED=0
+    TCP_MAX=600   # 10 minutes max
 
-    PIPE_WAITED=0
-    PIPE_MAX=600   # 10 minutes
-    while (( PIPE_WAITED < PIPE_MAX )); do
-      if _pipe_has_any; then
-        echo "[mt5-probe] Detected one or more Wine named pipes (\\.\pipe\\). Proceeding with IPC probe." >&2
-        break
+    while (( TCP_WAITED < TCP_MAX )); do
+      # Crash / self-restart guard.
+      if ! kill -0 "${TERMINAL_PID}" 2>/dev/null; then
+        echo "[mt5-probe] terminal64.exe (PID ${TERMINAL_PID}) has exited" >&2
+        NEW_TERM_PID=$(pgrep -f 'terminal64.exe' 2>/dev/null | head -1) || true
+        if [[ -n "${NEW_TERM_PID}" ]] && [[ "${NEW_TERM_PID}" != "${TERMINAL_PID}" ]]; then
+          echo "[mt5-probe] New terminal PID detected: ${NEW_TERM_PID} (self-restart after update)" >&2
+          TERMINAL_PID="${NEW_TERM_PID}"
+        else
+          echo "[mt5-probe] FATAL: terminal exited and did not restart." >&2
+          echo "failed: terminal_exited_during_tcp_gate elapsed=${TCP_WAITED}s" \
+            > "${IPC_STATUS_FILE}" 2>/dev/null || true
+          touch "${IPC_FAILED_FILE}" 2>/dev/null || true
+          break
+        fi
       fi
-      echo "waiting: mt5_pipe_absent elapsed=${PIPE_WAITED}s" > "${IPC_STATUS_FILE}" 2>/dev/null || true
-      sleep 5
-      PIPE_WAITED=$((PIPE_WAITED + 5))
-    done
 
-    # Enable xtrace from here so every probe command is visible in the wrapper log.
-    # This lets us pinpoint exactly which line fails in the probe loop.
-    set -x
+      # Count established TCP connections to non-loopback addresses.
+      # terminal64.exe broker connections appear in the Linux network namespace
+      # (Wine translates Winsock to Linux sockets via wineserver).
+      ESTABLISHED=$(ss -tn state established 2>/dev/null \
+        | tail -n +2 \
+        | grep -v '127\.' \
+        | grep -v ' ::1[: ]' \
+        | wc -l) || ESTABLISHED=0
 
-    # Probe MT5 IPC readiness using direct Wine Python initialize() calls.
-    MAX_ATTEMPTS=40
-    SLEEP_SECONDS=5
-    ATTEMPT=0
-    while (( ATTEMPT < MAX_ATTEMPTS )); do
-      ATTEMPT=$((ATTEMPT + 1))
-      CUR_WS_PIDS="$(_ws_pids)"
-      _log_ws "probe_attempt_${ATTEMPT}"
-      if [[ "${CUR_WS_PIDS:-}" != "${LAST_WS_PIDS:-}" ]]; then
-        echo "[mt5-probe] WINESERVER_RESTART_DETECTED previous=${LAST_WS_PIDS:-none} current=${CUR_WS_PIDS:-none}" \
-          >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-        LAST_WS_PIDS="${CUR_WS_PIDS:-}"
-      fi
-      # Snapshot visible X11 window titles — written BEFORE the probe fires so
-      # the wrapper log shows what was on screen at each attempt.
+      # Snapshot visible windows for diagnostics.
       _WIN_SNAP=$(DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
         | while IFS= read -r _wsid; do
             DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || true
           done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
-      { echo "[pre-probe ${ATTEMPT}/${MAX_ATTEMPTS}] windows=${_WIN_SNAP}"; } \
+
+      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} windows=${_WIN_SNAP:-none}"; } \
         >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-      if [[ "${_WIN_SNAP:-}" == *"LiveUpdate"* ]] || [[ "${_WIN_SNAP:-}" == *"Welcome to"* ]]; then
-        { echo "[pre-probe ${ATTEMPT}/${MAX_ATTEMPTS}] UI_BLOCK_SUSPECTED liveupdate_visible=true"; } \
+      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED}" \
+        > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      _log_ws "tcp_gate_${TCP_WAITED}s"
+
+      if (( ESTABLISHED > 0 )); then
+        echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s)"
+        { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
           >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-      fi
-      unset _WIN_SNAP _wsid
-      # Skip the terminal-pid liveness check: the terminal may restart itself
-      # after applying a LiveUpdate. The probe will detect the new process.
-
-      # Build a single-mode initialize() probe script.
-      # We run each mode in an isolated subprocess so one hung initialize() call
-      # cannot block the entire attempt sequence.
-      { set +x; } 2>/dev/null || true
-      PROBE_SCRIPT=$(cat <<PYEOF
-import MetaTrader5 as mt5
-import os
-try:
-    mt5_ver = getattr(mt5, '__version__', 'unknown')
-except Exception:
-    mt5_ver = 'error'
-TERM_PATH = r'C:\\Program Files\\MetaTrader 5\\terminal64.exe'
-PORTABLE_MODE = os.environ.get('PROBE_PORTABLE', 'default')
-MODE = os.environ.get('PROBE_MODE', 'bare_no_path')
-kwargs = {'timeout': 30000}  # 30 s — enough for a cold broker TCP handshake
-if PORTABLE_MODE == 'portable':
-    kwargs['portable'] = True
-if MODE == 'bare_path':
-    kwargs['path'] = TERM_PATH
-ok = False
-try:
-    ok = mt5.initialize(**kwargs)
-except Exception:
-    ok = False
-err = mt5.last_error()
-try:
-    term_ver = mt5.version()
-except Exception:
-    term_ver = None
-mt5.shutdown()
-print(f'mt5_pkg={mt5_ver} term_path={TERM_PATH} mode={MODE} ok={ok} err={err} terminal_version={term_ver}')
-PYEOF
-)
-      set -x
-      PROBE_OK=0
-      PROBE_SUMMARY="none"
-      if [[ "${MT5_CONTEXT_MODE}" == "portable" ]]; then
-        PROBE_PORTABLE_VALUES=(portable default)
-      else
-        PROBE_PORTABLE_VALUES=(default portable)
-      fi
-      for PROBE_PORTABLE in "${PROBE_PORTABLE_VALUES[@]}"; do
-        for PROBE_MODE in bare_no_path bare_path; do
-        PROBE_EXIT=0
-        # Kill orphaned Wine-side python.exe from the previous probe.
-        # wine taskkill targets ONLY the Windows process — it does NOT kill
-        # wineserver, terminal64.exe, or the mt5linux RPyC server (-m mt5linux).
-        WINEDEBUG="-all" "${WINE_CMD}" taskkill /F /IM python.exe > /dev/null 2>&1 || true
-        pkill -f "wine.*python.*-c" > /dev/null 2>&1 || true
-        sleep 1
-        _PROBE_TMP="/tmp/mt5-probe-${ATTEMPT}-${PROBE_MODE}-${PROBE_PORTABLE}"
-        rm -f "$_PROBE_TMP" 2>/dev/null || true
-        PROBE_MODE="${PROBE_MODE}" PROBE_PORTABLE="${PROBE_PORTABLE}" WINEDEBUG="-all" timeout 35 "$WINE_CMD" "$FOUND_PYTHON" -c "$PROBE_SCRIPT" \
-          > "$_PROBE_TMP" 2>&1 || PROBE_EXIT=$?
-        PROBE_OUT=$(cat "$_PROBE_TMP" 2>/dev/null) || true
-        rm -f "$_PROBE_TMP" 2>/dev/null || true
-        PROBE_SUMMARY="portable_mode=${PROBE_PORTABLE} mode=${PROBE_MODE} exit=${PROBE_EXIT} output=${PROBE_OUT}"
-        {
-          echo "[attempt ${ATTEMPT}/${MAX_ATTEMPTS}] ${PROBE_SUMMARY}"
-        } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-        if [[ "$PROBE_OUT" == *"ok=True"* ]]; then
-          PROBE_OK=1
-          break
-        fi
-        done
-        if [[ "${PROBE_OK}" -eq 1 ]]; then
-          break
-        fi
-      done
-
-      if [[ "${PROBE_OK}" -eq 1 ]]; then
-        echo "ready: attempt=${ATTEMPT} ${PROBE_SUMMARY}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
-        touch "${IPC_READY_FILE}" 2>/dev/null || true
+        TCP_GATE_PASSED=true
         break
       fi
 
-      if [[ "${PROBE_SUMMARY}" == *"-10005"* ]]; then
-        IPC_TIMEOUT_STREAK=$((IPC_TIMEOUT_STREAK + 1))
-      else
-        IPC_TIMEOUT_STREAK=0
-      fi
-      if (( IPC_TIMEOUT_STREAK >= 6 && IPC_RESTART_COUNT < 2 )); then
-        IPC_RESTART_COUNT=$((IPC_RESTART_COUNT + 1))
-        IPC_TIMEOUT_STREAK=0
-        echo "[mt5-terminal] restarting terminal after repeated -10005 (restart=${IPC_RESTART_COUNT})" \
-          >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-        kill "${TERMINAL_PID}" 2>/dev/null || true
-        sleep 2
-        _launch_terminal
-        sleep 5
-      fi
-
-      echo "waiting: attempt=${ATTEMPT} ${PROBE_SUMMARY}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
-      sleep "${SLEEP_SECONDS}"
+      sleep 10
+      TCP_WAITED=$(( TCP_WAITED + 10 ))
     done
 
-    if [[ ! -f "${IPC_READY_FILE}" ]]; then
-      echo "failed: attempts_exhausted output=$(tail -n 1 "${IPC_PROBE_LOG}" 2>/dev/null || echo none)" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+    if [[ "${TCP_GATE_PASSED}" == "true" ]]; then
+      echo "ready: tcp_connected elapsed=${TCP_WAITED}s" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      touch "${IPC_READY_FILE}" 2>/dev/null || true
+      echo "[mt5-probe] mt5_ipc.ready written — adapter will connect via mt5linux TCP bridge"
       {
-        echo "=== diagnostics: dismiss tail ==="
-        tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
-        echo "=== diagnostics: probe tail ==="
-        tail -n 80 "${IPC_PROBE_LOG}" 2>/dev/null || true
-        echo "=== diagnostics: wineserver timeline tail ==="
-        tail -n 40 "${WINESERVER_TIMELINE}" 2>/dev/null || true
+        echo "=== TCP gate PASSED diagnostics ==="
+        echo "elapsed=${TCP_WAITED}s established=${ESTABLISHED:-?}"
+        echo "=== dismiss log tail ==="
+        tail -n 40 "${DISMISS_LOG}" 2>/dev/null || true
+        echo "=== wineserver timeline tail ==="
+        tail -n 20 "${WINESERVER_TIMELINE}" 2>/dev/null || true
       } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-      touch "${IPC_FAILED_FILE}" 2>/dev/null || true
+    else
+      if [[ ! -f "${IPC_FAILED_FILE}" ]]; then
+        echo "failed: tcp_gate_timeout elapsed=${TCP_WAITED}s" \
+          > "${IPC_STATUS_FILE}" 2>/dev/null || true
+        {
+          echo "=== TCP gate TIMEOUT diagnostics ==="
+          echo "elapsed=${TCP_WAITED}s"
+          echo "=== dismiss log tail ==="
+          tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
+          echo "=== wineserver timeline tail ==="
+          tail -n 40 "${WINESERVER_TIMELINE}" 2>/dev/null || true
+          echo "=== terminal.log tail ==="
+          tail -n 100 "${LOGDIR}/mt5-terminal.log" 2>/dev/null || true
+        } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+        touch "${IPC_FAILED_FILE}" 2>/dev/null || true
+      fi
     fi
   fi
 
