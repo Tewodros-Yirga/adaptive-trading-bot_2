@@ -154,9 +154,11 @@ class MT5Adapter:
                 raise RuntimeError(self.last_error)
             return
 
-        # 1) Try native MetaTrader5 (only works when the python bindings are
-        #    actually usable in-container, which is rare on Linux).
-        if mt5_native is not None:
+        # 1) Try native MetaTrader5 — Windows only.
+        #    The native package uses Windows DLLs (CreateFileMapping / named pipes)
+        #    that cannot work in a Linux process. Skip entirely on non-Windows so the
+        #    adapter proceeds immediately to the mt5linux TCP bridge (backend #2).
+        if os.name == "nt" and mt5_native is not None:
             try:
                 ok = mt5_native.initialize(
                     path=terminal_exe,

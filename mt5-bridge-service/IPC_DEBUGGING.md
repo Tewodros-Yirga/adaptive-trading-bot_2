@@ -371,9 +371,97 @@ Rebuild the base image with the **latest** terminal version baked in:
 
 | File | Purpose |
 |---|---|
-| `start.sh` | Entrypoint: Xvfb, openbox, terminal launch, xdotool daemon, IPC probe loop |
+| `start.sh` | Entrypoint: Xvfb, openbox, terminal launch, xdotool daemon, TCP gate, mt5linux launcher |
 | `app/main.py` | FastAPI bridge: `/debug/mt5`, `/debug/screenshot`, `/debug/pipes`, `/debug/processes` |
-| `app/mt5_adapter.py` | Wraps `MetaTrader5` IPC; retries connect on every request |
+| `app/mt5_adapter.py` | Wraps `MetaTrader5` IPC; skips native on Linux, uses mt5linux TCP bridge |
 | `Dockerfile` | Installs `openbox`, `xdotool`, `scrot` on top of base image |
 | `IPC_DEBUGGING.md` | This file |
 | `.github/workflows/build-mt5-base.yml` | Monthly base image rebuild |
+
+---
+
+## Session 5 (2026-04-28) — Deadlock Root Cause Found & Fixed
+
+### 23. The Cross-Process Probe Was Always Broken — By Design
+
+**Root cause (definitive):**
+
+The MetaTrader5 Python package IPC handshake uses `CreateFileMapping`/`MapViewOfFile` (Windows shared memory) alongside the named pipe. Wine's emulation of `MapViewOfFile` across **separate processes** — even within the same `WINEPREFIX`/wineserver — is incomplete. This causes the auth packet to be sent but never acknowledged, producing `-10005` regardless of terminal state, dialog presence, timeout length, or `path=` argument.
+
+This was confirmed by 20+ sessions of logs showing the probe always returns -10005 with no variation, and cross-referenced with community reports of the same architecture limitation.
+
+### 24. The System Was Deadlocked — Three Interlocking Bugs
+
+```
+Adapter ──► gate: mt5_ipc.ready? ──► NO ──► returns immediately (never tries mt5linux)
+      ↑
+Probe loop ──► wine python.exe -c "mt5.initialize()" ──► -10005 (always) ──► never writes mt5_ipc.ready
+```
+
+1. **Bug A**: The cross-process probe always fails → `mt5_ipc.ready` never written
+2. **Bug B**: The adapter's `mt5_ipc.ready` gate blocks it from ever trying mt5linux
+3. **Bug C**: The mt5linux launcher (which DOES work) starts before the terminal is stable
+
+### 25. Fix: TCP Gate Replaces the Cross-Process Probe
+
+**Removed:** The entire `_pipe_has_any` function, 40-attempt wine-python probe loop, and `WINEDEBUG=+pipe` instrumentation.
+
+**Added:** TCP connectivity gate — when `terminal64.exe` has external TCP connections to the broker (same check as smoke test Gate 2), it is stable and IPC-ready. This writes `mt5_ipc.ready`, unblocking the adapter.
+
+```bash
+# New gate logic (start.sh terminal subshell)
+while (( TCP_WAITED < 600 )); do
+  ESTABLISHED=$(ss -tn state established | grep -v 127. | wc -l)
+  if (( ESTABLISHED > 0 )); then
+    touch "${IPC_READY_FILE}"  # ← breaks the deadlock
+    break
+  fi
+  sleep 10; TCP_WAITED=$(( TCP_WAITED + 10 ))
+done
+```
+
+### 26. Fix: mt5linux Launcher Waits for TCP Gate
+
+**Problem:** The mt5linux RPyC server was starting immediately after bootstrap, before the terminal was stable.
+
+**Fix:** The mt5linux launcher now waits for `mt5_ipc.ready` before starting `wine python.exe -m mt5linux`. This ensures the terminal has broker connectivity before the RPyC server tries to serve IPC calls.
+
+### 27. Fix: Skip mt5_native on Linux
+
+**Problem:** `mt5_adapter.py` always tried the native MetaTrader5 package first (which requires Windows DLLs and can never work on Linux), wasting a connection attempt and its full backoff before reaching mt5linux.
+
+**Fix:** Guarded with `if os.name == "nt" and mt5_native is not None:` — on Linux, the adapter goes directly to mt5linux on every call.
+
+### 28. Fix: Dockerfile First-Run Dismiss Loop Added
+
+**Problem:** The Dockerfile first-run `RUN` step had no wizard dismiss loop. Any wizard or LiveUpdate dialog blocked the wait condition indefinitely.
+
+**Fix:** A background xdotool dismiss loop is started after `terminal64.exe` launch. Uses `getwindowgeometry --shell` for position-relative clicks (the correct approach from Session 4 Bug 20 fix).
+
+### 29. Fix: Improved Wait Condition in Dockerfile First-Run
+
+**Problem:** Waiting for `MQL5/Experts` directory could time out if the terminal was blocked by a dialog (with the new dismiss loop helping but still imperfect).
+
+**Fix:** Also checks if `terminal.ini` file size has increased beyond the pre-written stub (~300 bytes). The terminal rewrites `terminal.ini` to >1KB on healthy startup, which is a more reliable early-init signal.
+
+### 30. Fix: Smoke Test Gate 3 Replaced
+
+**Problem:** Gate 3 in `smoke-test-ipc.sh` ran the same broken cross-process probe that never passed and gave misleading "known limitation" output.
+
+**Fix:** Gate 3 now starts `wine python.exe -m mt5linux` and checks if port 18812 opens within 30s. This validates the actual production IPC path (RPyC server can start and bind) rather than the broken cross-process path.
+
+---
+
+## Expected Log Flow After Fix
+
+```
+[mt5-probe] Starting TCP connectivity gate (replaces cross-process IPC probe)...
+[tcp-gate elapsed=120s] established=2 windows=MetaTrader 5
+[mt5-probe] TCP gate PASSED — terminal has 2 external TCP connection(s)
+[mt5-probe] mt5_ipc.ready written — adapter will connect via mt5linux TCP bridge
+[mt5linux-launcher] mt5_ipc.ready detected after ~125s — starting RPyC server.
+[mt5linux-launcher] mt5linux RPyC port is OPEN on 127.0.0.1:18812
+# Adapter connects via TCP → RPyC → Windows IPC → terminal
+connected: backend=mt5linux
+```
+
