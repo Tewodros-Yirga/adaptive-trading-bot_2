@@ -31,7 +31,7 @@ ENV WINEFSYNC=0
 # ---------------------------------------------------------------------------
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        openbox xdotool p7zip-full file \
+        openbox xdotool p7zip-full file winetricks \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -69,6 +69,18 @@ RUN set -eux; \
     wineboot --init 2>/dev/null || true; \
     timeout 60 wine cmd /c ver || true; \
     sleep 2; \
+    \
+    # -- Remove wine-mono and install real Windows runtime DLLs (vcrun2019). -- \
+    # wine-mono provides a .NET shim that replaces real Windows components. \
+    # The MetaTrader5.dll extension module (used by the mt5linux RPyC server) \
+    # depends on MSVC runtime DLLs (msvcp140, vcruntime140, etc.). If wine-mono \
+    # is providing these instead of the genuine Visual C++ redistributable, \
+    # mt5.initialize() fails inside the RPyC server even when the terminal is \
+    # running normally. Reference: FXPIP ONE "How to run MT5 on Linux" (2025). \
+    echo "Removing wine-mono and installing vcrun2019 via winetricks..."; \
+    DISPLAY=:99 WINEDEBUG=-all winetricks -q --optout remove-mono 2>/dev/null || true; \
+    DISPLAY=:99 WINEDEBUG=-all winetricks -q --optout vcrun2019 2>/dev/null || true; \
+    echo "winetricks vcrun2019 done (exit $?)"; \
     \
     # -- Install Windows Python 3.9 -- \
     timeout 600 wine /tmp/python-installer.exe \

@@ -465,3 +465,32 @@ done
 connected: backend=mt5linux
 ```
 
+---
+
+### 31. Fix: Remove wine-mono + Install vcrun2019 via winetricks
+
+**Source:** FXPIP ONE — "How to run multiply MT5 on Linux using WINE in 2025"
+(https://youtu.be/EHv4ksyCc3U)
+
+**Root cause:**
+
+`wine-mono` provides a .NET shim layer that Wine installs by default. The MetaTrader5 Python extension module (`.pyd`/`.dll`) depends on **real MSVC runtime DLLs** (`msvcp140.dll`, `vcruntime140.dll`, `concrt140.dll`). When `wine-mono` is substituting for these instead of the genuine Visual C++ 2019 redistributable, the extension module can load but IPC calls fail silently or crash — producing `-10005` at the RPyC server level even when the terminal is running correctly.
+
+**Fix applied (Dockerfile):**
+
+```dockerfile
+# In apt-get step:
+apt-get install -y winetricks
+
+# After wineboot --init:
+DISPLAY=:99 WINEDEBUG=-all winetricks -q --optout remove-mono || true
+DISPLAY=:99 WINEDEBUG=-all winetricks -q --optout vcrun2019   || true
+```
+
+Both are `|| true` — if `remove-mono` is unavailable (older winetricks version), it's skipped gracefully. `vcrun2019` downloads and installs the genuine Microsoft Visual C++ 2019 Redistributable into the Wine prefix, replacing the shim with the real DLLs that MetaTrader5.dll was compiled against.
+
+**Why this matters for mt5linux:**
+
+The mt5linux RPyC server calls `MetaTrader5.initialize()` from within a Wine Python process. That call loads `MetaTrader5.dll`. Without the correct MSVC runtime, the DLL can fail to initialise its internal IPC client, causing the RPyC-proxied `initialize()` to return `False` (or raise) even after the TCP gate passes.
+
+
