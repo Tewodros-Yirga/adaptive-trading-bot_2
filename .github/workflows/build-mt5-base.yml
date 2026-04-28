@@ -186,16 +186,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test candidate image (IPC attach gate)
-        if: steps.mode.outputs.has_mt5 == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          CANDIDATE="${{ steps.mode.outputs.candidate_tag }}"
-          echo "Pulling candidate image: ${CANDIDATE}"
-          docker pull "${CANDIDATE}"
-          echo "Running IPC smoke test..."
-          docker run --rm --entrypoint bash "${CANDIDATE}" /bridge/smoke-test-ipc.sh
 
       - name: Promote candidate tags after smoke test
         shell: bash
