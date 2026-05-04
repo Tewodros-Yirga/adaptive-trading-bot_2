@@ -388,8 +388,17 @@ fi
           _xd search --onlyvisible --name "Setup"
         } | _uniq_ids
       )
+      # The MT5 IPC "Login" authorization dialog appears when
+      # mt5.initialize(login, password, server) is called from
+      # the Wine Python (mt5linux) process. It must be dismissed
+      # by clicking OK for the API connection to proceed.
+      LOGIN_IDS=$(
+        { _xd search --onlyvisible --name "Login"
+          _xd search --onlyvisible --name "Authorization"
+        } | _uniq_ids
+      )
       WINIDS=$(_xd search --onlyvisible | _uniq_ids)
-      ALL_IDS=$(printf '%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${WINIDS}" | _uniq_ids)
+      ALL_IDS=$(printf '%s\n%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${LOGIN_IDS}" "${WINIDS}" | _uniq_ids)
       ALL_COUNT=$(printf '%s\n' ${ALL_IDS:-} | awk 'NF' | wc -l)
       echo "[dismiss-heartbeat] iter=${_try} ids=${ALL_COUNT}" >> "${DISMISS_LOG}"
       for _wid in ${ALL_IDS}; do
@@ -410,7 +419,8 @@ fi
           "400 210" "500 210" "640 210" \
           "400 245" "500 245" "640 245" \
           "400 275" "500 275" "640 275" \
-          "640 520" "700 520" "640 540"; do
+          "640 520" "700 520" "640 540" \
+          "511 308" "512 308" "510 308"; do
           set -- ${_xy}
           _xd mousemove --clearmodifiers "$1" "$2" click 1
           sleep 0.06
@@ -442,6 +452,21 @@ fi
             sleep 0.3
             _xd key --window "${_wid}" --clearmodifiers Return
             sleep 0.2
+            _xd key --window "${_wid}" --clearmodifiers Return
+            break
+          fi
+        done
+        # If this window is the Login/Authorization dialog: explicitly click
+        # the OK button (center of dialog ~511,308) and press Return.
+        for _lid in ${LOGIN_IDS:-}; do
+          if [[ "${_wid}" == "${_lid}" ]]; then
+            echo "[dismiss-action] clicking OK on Login/Authorization dialog wid=${_wid}" >> "${DISMISS_LOG}"
+            _xd windowactivate --sync "${_wid}"
+            sleep 0.2
+            _xd mousemove --clearmodifiers 511 308
+            sleep 0.1
+            _xd click 1
+            sleep 0.1
             _xd key --window "${_wid}" --clearmodifiers Return
             break
           fi
