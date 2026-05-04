@@ -48,6 +48,17 @@ for _d in \
 done
 unset _d
 
+# ── Disable Wine UAC elevation prompts ────────────────────────────────────────
+# LiveUpdate tries to run with admin privileges → Wine shows a UAC dialog
+# ("For updating, LiveUpdate needs administration"). Deny all elevation
+# requests by setting Wine's security policy to always run as user.
+WINEDEBUG=-all wine reg add \
+  'HKCU\Software\Wine\DllOverrides' /v 'winebus.sys' /t REG_SZ /d '' /f \
+  2>/dev/null || true
+# Kill LiveUpdate client if already running
+WINEDEBUG=-all wineserver -k 2>/dev/null || true
+sleep 1
+
 # Render free-tier limits /tmp to ~2GB. Some Wine/MT5 output is redirected to
 # `/tmp/mt5-launch-wrapper.log`, so symlink it into our persistent LOGDIR.
 rm -f /tmp/mt5-launch-wrapper.log > /dev/null 2>&1 || true
@@ -385,14 +396,27 @@ fi
       done
       _xd key Return; sleep 0.1
       echo "[dismiss-heartbeat] iter=${_try}" >> "${DISMISS_LOG}"
-      # Step 2: LiveUpdate dialogs (windowactivate is safe here — no Login dialog yet).
-      for _wid in $({ _xd search --onlyvisible --name LiveUpdate
+      # Step 2: LiveUpdate dialogs (including UAC elevation prompt).
+      # "Updating MetaTrader 5" = Wine UAC/admin dialog — click CANCEL.
+      for _wid in $({ _xd search --onlyvisible --name "Updating MetaTrader"
+                      _xd search --onlyvisible --name LiveUpdate
                       _xd search --onlyvisible --name "Welcome to"; } | _uniq_ids); do
+        _NAME=$(_xd getwindowname "${_wid}" 2>/dev/null || echo "?")
+        echo "[dismiss-action] iter=${_try} wid=${_wid} name=${_NAME}" >> "${DISMISS_LOG}"
         _xd windowactivate --sync "${_wid}"; sleep 0.2
-        for _xy in "548 418" "638 418" "728 418" "520 402" "600 428"; do
-          set -- ${_xy}; _xd mousemove --clearmodifiers "$1" "$2" click 1; sleep 0.06
-        done
-        _xd key --window "${_wid}" --clearmodifiers Return
+        if echo "${_NAME}" | grep -qi "Updating"; then
+          # Click Cancel button (right button, x≈598 y≈377 on 1280x720)
+          # and press Escape — we do NOT want to authorize the update.
+          _xd mousemove --clearmodifiers 598 377; sleep 0.1
+          _xd click 1; sleep 0.1
+          _xd key --window "${_wid}" --clearmodifiers Escape
+          echo "[dismiss-action] Cancelled LiveUpdate UAC dialog" >> "${DISMISS_LOG}"
+        else
+          for _xy in "548 418" "638 418" "728 418" "520 402" "600 428"; do
+            set -- ${_xy}; _xd mousemove --clearmodifiers "$1" "$2" click 1; sleep 0.06
+          done
+          _xd key --window "${_wid}" --clearmodifiers Return
+        fi
       done
       # Step 3: First-run wizard dialogs.
       for _wid in $({ _xd search --onlyvisible --name "Select a company"
