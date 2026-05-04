@@ -372,124 +372,42 @@ fi
   (
     _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
     _uniq_ids() { awk 'NF' | sort -n -u; }
-    trap 'echo "[dismiss-loop] exit code=$?" >> "${DISMISS_LOG}"' EXIT
+    trap 'echo "[dismiss-loop] exit=$?" >> "${DISMISS_LOG}"' EXIT
     sleep 8
     for _try in $(seq 1 120); do
-      # ── Unconditional Login/OK click ─────────────────────────────────────────
-      # The MT5 IPC authorization dialog may share the main terminal X11 window.
-      # Press Return on whatever window currently has focus first — the modal
-      # dialog retains X11 focus, so this clicks OK without needing coordinates.
-      _xd key Return
-      sleep 0.05
-      # Also sweep click across the OK button area (1280x720 display).
-      # OK button is at x≈490, y≈333-343 (y=307 was wrong: hit Server dropdown).
-      for _ok_coord in "490 337" "490 333" "490 343" "480 337" "500 337" "510 337"; do
-        set -- ${_ok_coord}
-        _xd mousemove --clearmodifiers "$1" "$2"
-        sleep 0.04
-        _xd click 1
-        sleep 0.04
+      # Step 1: Login/Auth dialog — modal, retains X11 focus.
+      # Press Return on focused window BEFORE any windowactivate calls.
+      _xd key Return; sleep 0.1
+      for _ok in "490 333" "490 337" "490 343" "480 337" "500 337"; do
+        set -- ${_ok}
+        _xd mousemove --clearmodifiers "$1" "$2"; sleep 0.04
+        _xd click 1; sleep 0.04
       done
-      _xd key Return
-      sleep 0.1
-      # ─────────────────────────────────────────────────────────────────────────
-      LIVE_IDS=$(
-        { _xd search --onlyvisible --name LiveUpdate
-          _xd search --onlyvisible --name "Welcome to"
-        } | _uniq_ids
-      )
-      WIZ_IDS=$(
-        { _xd search --onlyvisible --name "Select a company"
-          _xd search --onlyvisible --name "open an account"
-          _xd search --onlyvisible --name "MetaTrader 5"
-          _xd search --onlyvisible --name "MetaTrader"
-          _xd search --onlyvisible --name "Setup"
-        } | _uniq_ids
-      )
-      # The MT5 IPC "Login" authorization dialog appears when
-      # mt5.initialize(login, password, server) is called from
-      # the Wine Python (mt5linux) process. It must be dismissed
-      # by clicking OK for the API connection to proceed.
-      LOGIN_IDS=$(
-        { _xd search --onlyvisible --name "Login"
-          _xd search --onlyvisible --name "Authorization"
-        } | _uniq_ids
-      )
-      WINIDS=$(_xd search --onlyvisible | _uniq_ids)
-      ALL_IDS=$(printf '%s\n%s\n%s\n%s\n' "${LIVE_IDS}" "${WIZ_IDS}" "${LOGIN_IDS}" "${WINIDS}" | _uniq_ids)
-      ALL_COUNT=$(printf '%s\n' ${ALL_IDS:-} | awk 'NF' | wc -l)
-      echo "[dismiss-heartbeat] iter=${_try} ids=${ALL_COUNT}" >> "${DISMISS_LOG}"
-      for _wid in ${ALL_IDS}; do
-        _GEO=$(DISPLAY=:99 xdotool getwindowgeometry --shell "${_wid}" 2>/dev/null | tr '\n' ',' || true)
-        _NAME=$(_xd getwindowname "${_wid}" || echo "?")
-        echo "[dismiss-action] iter=${_try} wid=${_wid} name=${_NAME} geometry=${_GEO}" >> "${DISMISS_LOG}"
-        _xd windowactivate --sync "${_wid}"
-        sleep 0.25
-        # Click bands: LiveUpdate Restart/Later rows, legacy wizard Next rows,
-        # and first-run broker-list item rows (critical: Next is disabled until
-        # a company is selected from the list).
-        for _xy in \
-          "548 418" "638 418" "728 418" \
-          "520 402" "600 428" "700 428" \
-          "560 332" "530 330" "585 338" \
-          "469 335" "445 328" \
-          "724 488" "644 488" "972 183" \
-          "400 210" "500 210" "640 210" \
-          "400 245" "500 245" "640 245" \
-          "400 275" "500 275" "640 275" \
-          "640 520" "700 520" "640 540" \
-          "511 308" "512 308" "510 308"; do
-          set -- ${_xy}
-          _xd mousemove --clearmodifiers "$1" "$2" click 1
-          sleep 0.06
+      _xd key Return; sleep 0.1
+      echo "[dismiss-heartbeat] iter=${_try}" >> "${DISMISS_LOG}"
+      # Step 2: LiveUpdate dialogs (windowactivate is safe here — no Login dialog yet).
+      for _wid in $({ _xd search --onlyvisible --name LiveUpdate
+                      _xd search --onlyvisible --name "Welcome to"; } | _uniq_ids); do
+        _xd windowactivate --sync "${_wid}"; sleep 0.2
+        for _xy in "548 418" "638 418" "728 418" "520 402" "600 428"; do
+          set -- ${_xy}; _xd mousemove --clearmodifiers "$1" "$2" click 1; sleep 0.06
         done
-        # Double-click on first broker list item to select + activate it.
-        _xd mousemove --clearmodifiers "400" "245" click 1
-        sleep 0.05
-        _xd mousemove --clearmodifiers "400" "245" click 1
-        sleep 0.1
-        # Keystrokes scoped to this X window (avoids firing on wrong stack order).
-        _xd key --window "${_wid}" --clearmodifiers Escape
-        sleep 0.1
         _xd key --window "${_wid}" --clearmodifiers Return
-        sleep 0.08
-        _xd key --window "${_wid}" --clearmodifiers Tab
-        sleep 0.06
-        _xd key --window "${_wid}" --clearmodifiers Return
-        sleep 0.06
-        _xd key --window "${_wid}" --clearmodifiers Tab
-        sleep 0.06
-        _xd key --window "${_wid}" --clearmodifiers Return
-        sleep 0.06
-        _xd key --window "${_wid}" --clearmodifiers Return
-        # For wizard windows: type the broker server name to filter the list,
-        # then hit Return twice to select + advance.
-        for _wzid in ${WIZ_IDS:-}; do
-          if [[ "${_wid}" == "${_wzid}" ]]; then
-            _xd type --clearmodifiers "${MT_SERVER:-MetaQuotes-Demo}"
-            sleep 0.3
-            _xd key --window "${_wid}" --clearmodifiers Return
-            sleep 0.2
-            _xd key --window "${_wid}" --clearmodifiers Return
-            break
-          fi
-        done
-        # If this window is the Login/Authorization dialog: explicitly click
-        # the OK button (center of dialog ~511,308) and press Return.
-        for _lid in ${LOGIN_IDS:-}; do
-          if [[ "${_wid}" == "${_lid}" ]]; then
-            echo "[dismiss-action] clicking OK on Login/Authorization dialog wid=${_wid}" >> "${DISMISS_LOG}"
-            _xd windowactivate --sync "${_wid}"
-            sleep 0.2
-            _xd mousemove --clearmodifiers 511 308
-            sleep 0.1
-            _xd click 1
-            sleep 0.1
-            _xd key --window "${_wid}" --clearmodifiers Return
-            break
-          fi
-        done
       done
+      # Step 3: First-run wizard dialogs.
+      for _wid in $({ _xd search --onlyvisible --name "Select a company"
+                      _xd search --onlyvisible --name "open an account"
+                      _xd search --onlyvisible --name "Setup"; } | _uniq_ids); do
+        _xd windowactivate --sync "${_wid}"; sleep 0.2
+        _xd type --clearmodifiers "${MT_SERVER:-MetaQuotes-Demo}"; sleep 0.3
+        for _xy in "560 332" "530 330" "400 245" "500 245" "640 245"; do
+          set -- ${_xy}; _xd mousemove --clearmodifiers "$1" "$2" click 1; sleep 0.06
+        done
+        _xd key --window "${_wid}" --clearmodifiers Return; sleep 0.2
+        _xd key --window "${_wid}" --clearmodifiers Return
+      done
+      # Step 4: Re-press Return (catches Login dialog that appeared during steps 2/3).
+      _xd key Return
       sleep 5
     done
   ) &
