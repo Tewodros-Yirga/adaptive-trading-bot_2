@@ -215,17 +215,12 @@ class MT5Adapter:
                         if context_mode == "portable":
                             creds["portable"] = True
 
-                        # Derive Windows path for mt5.initialize(path=...) — skips
-                        # the slow Windows registry search.
-                        import re as _re
-                        win_terminal_path = None
-                        if terminal_exe:
-                            _m = _re.match(r'.*/drive_c/(.*)', terminal_exe)
-                            if _m:
-                                win_terminal_path = 'C:\\' + _m.group(1).replace('/', '\\')
-
                         # MT5 initialize timeout (ms). Must be < RPyC timeout (45s).
                         # 20s is enough for IPC attach; avoids RPyC "result expired".
+                        # NOTE: do NOT pass path= here — the terminal is already
+                        # running (started by start.sh). Passing path= causes the
+                        # MT5 package to try launching a NEW terminal instance,
+                        # which conflicts with the running one → -10005 every time.
                         _MT5_TIMEOUT_MS = 20000
 
                         ok = False
@@ -235,10 +230,7 @@ class MT5Adapter:
                         # This works when the terminal has a pre-baked session and
                         # avoids a 45s hang when the broker is unreachable from HF.
                         for init_attempt in range(1, 4):
-                            _bare_kwargs = {"timeout": _MT5_TIMEOUT_MS}
-                            if win_terminal_path:
-                                _bare_kwargs["path"] = win_terminal_path
-                            ok = client.initialize(**_bare_kwargs)
+                            ok = client.initialize(timeout=_MT5_TIMEOUT_MS)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
@@ -256,8 +248,6 @@ class MT5Adapter:
                             for init_attempt in range(1, 3):
                                 _cred_kwargs = dict(creds)
                                 _cred_kwargs["timeout"] = _MT5_TIMEOUT_MS
-                                if win_terminal_path:
-                                    _cred_kwargs["path"] = win_terminal_path
                                 ok = client.initialize(**_cred_kwargs)
                                 if ok:
                                     break
