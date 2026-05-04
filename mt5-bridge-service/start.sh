@@ -162,38 +162,17 @@ if command -v wine > /dev/null 2>&1; then
       exit 1
     fi
 
-    # Wait for the terminal to have TCP connectivity before starting mt5linux.
-    # mt5_ipc.ready is written by the terminal subshell TCP gate when the
-    # terminal has established external broker connections — this is the signal
-    # that the terminal is stable and IPC-ready within the wineserver session.
-    # Starting mt5linux before this point risks hitting a blocked wizard or
-    # a terminal that hasn't authenticated yet.
-    echo "[mt5linux-launcher] Waiting for mt5_ipc.ready (terminal TCP connectivity gate)..."
-    MT5LINUX_WAIT_IPC=0
-    while (( MT5LINUX_WAIT_IPC < 720 )); do
-      if [[ -f "${LOGDIR}/mt5_ipc.ready" ]]; then
-        echo "[mt5linux-launcher] mt5_ipc.ready detected after ~${MT5LINUX_WAIT_IPC}s — starting RPyC server."
-        break
-      fi
-      if [[ -f "${LOGDIR}/mt5_ipc.failed" ]]; then
-        echo "[mt5linux-launcher] mt5_ipc.failed detected — TCP gate timed out. Starting RPyC server anyway (adapter will retry)." >&2
-        break
-      fi
-      sleep 5
-      MT5LINUX_WAIT_IPC=$(( MT5LINUX_WAIT_IPC + 5 ))
-    done
-
-    if [[ ! -f "${LOGDIR}/mt5_ipc.ready" ]]; then
-      echo "[mt5linux-launcher] Timed out waiting for mt5_ipc.ready (720s). Attempting server start anyway." >&2
-    fi
-
+    # Start mt5linux immediately — do NOT wait for the TCP gate's ipc_ready sentinel.
+    # The TCP gate (terminal launcher subshell) ALSO checks port 18812 to write ipc_ready,
+    # creating a circular deadlock: each waits for the other. Fix: mt5linux starts first,
+    # then the TCP gate (or this launcher) writes ipc_ready once the port is open.
     echo "[mt5linux-launcher] Launching mt5linux RPyC server on 127.0.0.1:18812"
     wine "${FOUND_PYTHON}" -m mt5linux --host 127.0.0.1 --port 18812 2>&1 \
       | tee "${LOGDIR}/mt5linux.log" &
 
-    # Wait for the RPyC port to open (up to 30s).
+    # Wait for the RPyC port to open (up to 60s).
     MT5LINUX_PORT_OPEN=false
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 60); do
       if (echo > /dev/tcp/127.0.0.1/18812) > /dev/null 2>&1; then
         MT5LINUX_PORT_OPEN=true
         break
@@ -203,6 +182,12 @@ if command -v wine > /dev/null 2>&1; then
 
     if [[ "$MT5LINUX_PORT_OPEN" == "true" ]]; then
       echo "[mt5linux-launcher] mt5linux RPyC port is OPEN on 127.0.0.1:18812"
+      # Write ipc_ready directly — this is the definitive signal.
+      # The TCP gate may have already timed out (ipc_failed); clear it and set ready.
+      rm -f "${LOGDIR}/mt5_ipc.failed" 2>/dev/null || true
+      echo "ready: mt5linux_port_open" > "${LOGDIR}/mt5_ipc.status" 2>/dev/null || true
+      touch "${LOGDIR}/mt5_ipc.ready" 2>/dev/null || true
+      echo "[mt5linux-launcher] mt5_ipc.ready written — adapter cleared to connect."
     else
       echo "[mt5linux-launcher] mt5linux RPyC port is NOT open on 127.0.0.1:18812" >&2
       echo "=== bootstrap-mt5.log (last 200 lines) ===" >&2
