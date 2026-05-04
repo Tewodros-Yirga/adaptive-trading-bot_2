@@ -556,9 +556,16 @@ fi
         fi
       fi
 
-      # Count established TCP connections to non-loopback addresses.
-      # terminal64.exe broker connections appear in the Linux network namespace
-      # (Wine translates Winsock to Linux sockets via wineserver).
+      # Primary gate: mt5linux RPyC server on port 18812.
+      # The adapter connects Linux→TCP:18812→Wine RPyC→Windows IPC→terminal.
+      # This port opens once the mt5linux launcher (parallel subshell) starts
+      # wine python.exe -m mt5linux inside the same wineserver as terminal64.exe.
+      MT5LINUX_PORT=0
+      if (echo > /dev/tcp/127.0.0.1/18812) > /dev/null 2>&1; then MT5LINUX_PORT=1; fi
+
+      # Secondary gate: external broker TCP connections (belt + suspenders).
+      # On HF Spaces the broker (MetaQuotes) may be unreachable, so this is
+      # NOT required — mt5linux alone is sufficient.
       ESTABLISHED=$(ss -tn state established 2>/dev/null \
         | tail -n +2 \
         | grep -v '127\.' \
@@ -571,13 +578,13 @@ fi
             DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || true
           done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
 
-      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} windows=${_WIN_SNAP:-none}"; } \
+      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} mt5linux_port=${MT5LINUX_PORT} windows=${_WIN_SNAP:-none}"; } \
         >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED}" \
+      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED} mt5linux=${MT5LINUX_PORT}" \
         > "${IPC_STATUS_FILE}" 2>/dev/null || true
       _log_ws "tcp_gate_${TCP_WAITED}s"
 
-      if (( ESTABLISHED > 0 )); then
+      if (( MT5LINUX_PORT > 0 )) || (( ESTABLISHED > 0 )); then
         echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s)"
         { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
           >> "${IPC_PROBE_LOG}" 2>/dev/null || true
