@@ -96,6 +96,29 @@ fi
 # Start a lightweight window manager so xdotool can deliver focus events
 # to Wine dialogs. Without a WM, windowactivate is a no-op and keyboard/
 # mouse input never reaches Wine's message queue.
+# Configure Openbox to auto-focus new windows — without this, focus-stealing-
+# prevention blocks the Login/Authorization dialog from getting X11 focus,
+# causing xdotool key Return to fire on the wrong window.
+mkdir -p "${HOME}/.config/openbox"
+cat > "${HOME}/.config/openbox/rc.xml" << 'RCEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc" xmlns:xi="http://www.w3.org/2001/XInclude">
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>yes</followMouse>
+    <focusLast>yes</focusLast>
+    <underMouse>no</underMouse>
+    <focusDelay>0</focusDelay>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+  <mouse>
+    <dragThreshold>1</dragThreshold>
+    <doubleClickTime>200</doubleClickTime>
+    <screenEdgeWarpTime>0</screenEdgeWarpTime>
+    <screenEdgeWarpMouse>false</screenEdgeWarpMouse>
+  </mouse>
+</openbox_config>
+RCEOF
 DISPLAY="${DISPLAY}" openbox --sm-disable > "${LOGDIR}/openbox.log" 2>&1 &
 echo "Openbox WM started (PID $!)"
 
@@ -399,7 +422,9 @@ fi
         _xd click 1; sleep 0.04
       done
       _xd key Return; sleep 0.1
-      echo "[dismiss-heartbeat] iter=${_try}" >> "${DISMISS_LOG}"
+      _ACTIVE_WID=$(_xd getactivewindow 2>/dev/null || echo "none")
+      _ACTIVE_NAME=$(DISPLAY=:99 xdotool getwindowname "${_ACTIVE_WID}" 2>/dev/null || echo "?")
+      echo "[dismiss-heartbeat] iter=${_try} focus=${_ACTIVE_WID}(${_ACTIVE_NAME})" >> "${DISMISS_LOG}"
       # Step 2: LiveUpdate dialogs (including UAC elevation prompt).
       # "Updating MetaTrader 5" = Wine UAC/admin dialog — click CANCEL.
       for _wid in $({ _xd search --onlyvisible --name "Updating MetaTrader"

@@ -226,6 +226,7 @@ def debug_mt5():
             "wine-mt5linux-pip-install": _tail_file(logdir / "wine-mt5linux-pip-install.log"),
             "mt5-terminal": _tail_file(logdir / "mt5-terminal.log"),
             "mt5-launch-wrapper": _tail_file(logdir / "mt5-launch-wrapper.log"),
+            "mt5-dismiss": _tail_file(logdir / "mt5-dismiss.log"),
             "mt5-ipc-probe": _tail_file(ipc_probe_log),
         },
     }
