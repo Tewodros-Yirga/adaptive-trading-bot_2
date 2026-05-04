@@ -196,7 +196,7 @@ class MT5Adapter:
                     try:
                         # Broker auth can take 60-90s on first connect from HF.
                         # RPyC timeout must exceed this — set to 120s.
-                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "240"))
+                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "90"))
                         client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=rpc_timeout)
 
                         # Build credential kwargs.
@@ -215,17 +215,23 @@ class MT5Adapter:
                         if context_mode == "portable":
                             creds["portable"] = True
 
-                        # MT5 initialize timeout: must exceed broker auth time.
-                        # Exness auth from HF infra takes ~120-150s on first
-                        # connect. Timeout=180s (3 min) covers the full window.
+                        # MT5 initialize timeout: 60s is sufficient once the
+                        # terminal is already connected to Exness (no new
+                        # broker auth needed — just IPC pipe open + dialog).
+                        # path= tells the package the exact exe so it computes
+                        # the correct IPC pipe hash (avoids -10005 from
+                        # registry-scan mismatches with build 5833).
+                        _mt5_exe = os.environ.get(
+                            "MT_TERMINAL_EXE",
+                            r"C:\Program Files\MetaTrader 5\terminal64.exe",
+                        ).replace("/opt/wineprefix/drive_c/", "C:\\").replace("/", "\\")
 
                         ok = False
                         last_init_error = "unknown"
 
-                        # Strategy 1: credentialed — login+pass+server.
-                        # timeout=180000 (3 min) covers slow broker auth.
+                        # Strategy 1: credentialed + explicit path.
                         for init_attempt in range(1, 3):
-                            ok = client.initialize(**creds, timeout=180000)
+                            ok = client.initialize(**creds, path=_mt5_exe, timeout=60000)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
