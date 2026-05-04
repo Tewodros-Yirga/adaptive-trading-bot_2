@@ -375,6 +375,19 @@ fi
     trap 'echo "[dismiss-loop] exit code=$?" >> "${DISMISS_LOG}"' EXIT
     sleep 8
     for _try in $(seq 1 120); do
+      # ── Unconditional Login/OK click ─────────────────────────────────────────
+      # The MT5 IPC authorization dialog may share the main terminal X11 window,
+      # making xdotool search --name unreliable. Clicking its OK button at
+      # absolute screen coords (1280x720 display) every iteration is harmless
+      # when the dialog is not visible, and dismisses it immediately when shown.
+      # Coords: OK button center ≈ (511, 307) on a 1280x720 Xvfb display.
+      _xd mousemove --clearmodifiers 511 307
+      sleep 0.05
+      _xd click 1
+      sleep 0.1
+      _xd key Return
+      sleep 0.1
+      # ─────────────────────────────────────────────────────────────────────────
       LIVE_IDS=$(
         { _xd search --onlyvisible --name LiveUpdate
           _xd search --onlyvisible --name "Welcome to"
