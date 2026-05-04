@@ -217,13 +217,14 @@ class MT5Adapter:
 
                         ok = False
                         last_init_error = "unknown"
-                        # Reliability-first: retry no-path initialize several times
-                        # because the MT5 terminal GUI can be up before IPC is attachable.
+                        # Strategy 1: bare attach — connect to the already-authenticated
+                        # terminal session without triggering broker re-auth.
+                        # This works when the terminal has a pre-baked session and
+                        # avoids a 45s hang when the broker is unreachable from HF.
                         for init_attempt in range(1, 4):
-                            ok = client.initialize(**creds)
+                            ok = client.initialize()
                             if ok:
                                 break
-
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
                             last_init_error = str(err)
                             err_class = self._classify_error_text(last_init_error)
@@ -231,6 +232,22 @@ class MT5Adapter:
                                 time.sleep(2 + random.random())
                                 continue
                             break
+
+                        # Strategy 2: credentialed initialize — only if bare attach failed.
+                        # Triggers broker re-auth; may hang if broker is unreachable.
+                        if not ok:
+                            client.shutdown() if hasattr(client, "shutdown") else None
+                            for init_attempt in range(1, 3):
+                                ok = client.initialize(**creds)
+                                if ok:
+                                    break
+                                err = client.last_error() if hasattr(client, "last_error") else "unknown"
+                                last_init_error = str(err)
+                                err_class = self._classify_error_text(last_init_error)
+                                if err_class == "ipc_timeout" and init_attempt < 2:
+                                    time.sleep(2 + random.random())
+                                    continue
+                                break
 
                         if not ok:
                             classified = self._classify_error_text(last_init_error)
