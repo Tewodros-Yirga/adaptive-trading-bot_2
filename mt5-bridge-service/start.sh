@@ -380,7 +380,11 @@ fi
   # (e.g. "A|B" looks for a title literally containing a pipe character).
   # LiveUpdate dialogs are often centered; Restart/Later sit lower than
   # older wizard-nested coords (y ~400–430 on 1280x720), not y ~330.
+  DISMISS_LOG="${LOGDIR}/mt5-dismiss.log"
   (
+    # Disable pipefail inside subshell — xdotool exits non-zero when no
+    # windows are found, which would abort the loop under set -e.
+    set +euo pipefail || true
     _xd() { DISPLAY=:99 xdotool "$@" 2>/dev/null || true; }
     _uniq_ids() { awk 'NF' | sort -n -u; }
     trap 'echo "[dismiss-loop] exit=$?" >> "${DISMISS_LOG}"' EXIT
