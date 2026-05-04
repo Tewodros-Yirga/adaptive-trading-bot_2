@@ -14,16 +14,21 @@ app = FastAPI(title="Adaptive MT5 Bridge")
 
 
 async def _background_connect_loop() -> None:
-    """Proactively call ensure_connection every 60 s.
+    """Proactively call ensure_connection in a thread pool every 60 s.
 
     Starts after a 15-second grace period to let Xvfb + Wine + the RPyC server
     come up before the first attempt. Once connected, continues polling to
     detect and recover from disconnections.
+
+    IMPORTANT: ensure_connection() is synchronous and blocks for the full
+    mt5.initialize() timeout (up to 180s). Running it directly in an async
+    coroutine would block the event loop, freezing ALL endpoints. Use
+    asyncio.to_thread so it runs in a thread-pool worker instead.
     """
     await asyncio.sleep(15)
     while True:
         try:
-            adapter.ensure_connection()
+            await asyncio.to_thread(adapter.ensure_connection)
         except Exception:
             pass
         await asyncio.sleep(60)

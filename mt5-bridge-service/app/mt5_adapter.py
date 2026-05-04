@@ -196,7 +196,7 @@ class MT5Adapter:
                     try:
                         # Broker auth can take 60-90s on first connect from HF.
                         # RPyC timeout must exceed this — set to 120s.
-                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "120"))
+                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "240"))
                         client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=rpc_timeout)
 
                         # Build credential kwargs.
@@ -216,17 +216,16 @@ class MT5Adapter:
                             creds["portable"] = True
 
                         # MT5 initialize timeout: must exceed broker auth time.
-                        # Exness auth from HF infra takes ~90s. Default (60s)
-                        # was causing -10005 even after Login dialog dismissed.
-                        # Set to 90s for credentialed call.
+                        # Exness auth from HF infra takes ~120-150s on first
+                        # connect. Timeout=180s (3 min) covers the full window.
 
                         ok = False
                         last_init_error = "unknown"
 
                         # Strategy 1: credentialed — login+pass+server.
-                        # timeout=90000 (90s) allows full broker auth window.
+                        # timeout=180000 (3 min) covers slow broker auth.
                         for init_attempt in range(1, 3):
-                            ok = client.initialize(**creds, timeout=90000)
+                            ok = client.initialize(**creds, timeout=180000)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
