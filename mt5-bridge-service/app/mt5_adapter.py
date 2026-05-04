@@ -194,9 +194,9 @@ class MT5Adapter:
                 client = None
                 for h in host_candidates:
                     try:
-                        # Use a longer timeout for the RPC call itself: MT5 terminal
-                        # can take 60-90s on first launch to connect to the broker.
-                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "45"))
+                        # Broker auth can take 60-90s on first connect from HF.
+                        # RPyC timeout must exceed this — set to 120s.
+                        rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "120"))
                         client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=rpc_timeout)
 
                         # Build credential kwargs.
@@ -215,40 +215,35 @@ class MT5Adapter:
                         if context_mode == "portable":
                             creds["portable"] = True
 
-                        # MT5 initialize timeout (ms). Must be < RPyC timeout (45s).
-                        # 20s is enough for IPC attach; avoids RPyC "result expired".
-                        # NOTE: do NOT pass path= here — the terminal is already
-                        # running (started by start.sh). Passing path= causes the
-                        # MT5 package to try launching a NEW terminal instance,
-                        # which conflicts with the running one → -10005 every time.
-                        _MT5_TIMEOUT_MS = 20000
+                        # MT5 initialize timeout: use MT5's default (60s) — enough
+                        # for broker auth. Do NOT pass path= (causes Wine to launch
+                        # a second terminal instance → -10005). Do NOT cap at 20s
+                        # (too short for Exness auth from HF Spaces).
 
                         ok = False
                         last_init_error = "unknown"
-                        # Strategy 1: bare attach — connect to the already-authenticated
-                        # terminal session without triggering broker re-auth.
-                        # This works when the terminal has a pre-baked session and
-                        # avoids a 45s hang when the broker is unreachable from HF.
-                        for init_attempt in range(1, 4):
-                            ok = client.initialize(timeout=_MT5_TIMEOUT_MS)
+
+                        # Strategy 1: credentialed — login+pass+server. This is
+                        # the call that actually worked in the first session.
+                        # The broker auth takes ~60s which fits within the new
+                        # 120s RPyC timeout.
+                        for init_attempt in range(1, 3):
+                            ok = client.initialize(**creds)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
                             last_init_error = str(err)
                             err_class = self._classify_error_text(last_init_error)
-                            if err_class == "ipc_timeout" and init_attempt < 3:
-                                time.sleep(2 + random.random())
+                            if err_class == "ipc_timeout" and init_attempt < 2:
+                                time.sleep(5)
                                 continue
                             break
 
-                        # Strategy 2: credentialed initialize — only if bare attach failed.
-                        # Triggers broker re-auth; may hang if broker is unreachable.
+                        # Strategy 2: bare attach — no credentials. Faster if the
+                        # terminal is already authenticated (pre-baked session).
                         if not ok:
-                            client.shutdown() if hasattr(client, "shutdown") else None
                             for init_attempt in range(1, 3):
-                                _cred_kwargs = dict(creds)
-                                _cred_kwargs["timeout"] = _MT5_TIMEOUT_MS
-                                ok = client.initialize(**_cred_kwargs)
+                                ok = client.initialize()
                                 if ok:
                                     break
                                 err = client.last_error() if hasattr(client, "last_error") else "unknown"
