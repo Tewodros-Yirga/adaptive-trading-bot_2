@@ -39,6 +39,7 @@ _log_ws "start_sh_entry"
 for _d in \
   live.mql5.com updates.mql5.com update.mql5.com \
   download.mql5.com cdn.mql5.com ec.mql5.com files.mql5.com \
+  cloud.mql5.com gate.mql5.com api.mql5.com \
   www.mql5.com mql5.com \
   update.metatrader5.com updates.metatrader5.com \
   mt5-update.metaquotes.net metaquotes.net; do
@@ -326,6 +327,20 @@ fi
   printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
     "${MT_LOGIN}" "${MT_SERVER}" > "${_WIN_CFG_LINUX}" 2>/dev/null || true
   echo "[mt5-terminal] Wrote Windows-accessible config → ${_WIN_CFG_LINUX}"
+
+  # ── Lock terminal binaries READ-ONLY before launch ──────────────────────────
+  # LiveUpdate can download a newer build (e.g. 5833) that has NO matching
+  # MetaTrader5 Python package on PyPI (latest is 5.0.5735). When the terminal
+  # and Python package build numbers don't match, mt5.initialize() returns
+  # -10005 (IPC timeout) on every call. Locking the .exe/.dll files prevents
+  # LiveUpdate from overwriting them; the terminal runs fine but stays at the
+  # pre-baked build that matches the installed Python package.
+  _TERM_DIR="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5"
+  echo "[mt5-terminal] Locking terminal binaries to prevent LiveUpdate version drift..."
+  find "${_TERM_DIR}" \( -name '*.exe' -o -name '*.dll' \) \
+    -exec chmod a-w {} \; 2>/dev/null || true
+  echo "[mt5-terminal] Terminal binaries locked (read-only)."
+  unset _TERM_DIR
 
   _launch_terminal() {
     echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
