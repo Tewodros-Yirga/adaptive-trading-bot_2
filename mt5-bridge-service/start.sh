@@ -376,15 +376,20 @@ fi
     sleep 8
     for _try in $(seq 1 120); do
       # ── Unconditional Login/OK click ─────────────────────────────────────────
-      # The MT5 IPC authorization dialog may share the main terminal X11 window,
-      # making xdotool search --name unreliable. Clicking its OK button at
-      # absolute screen coords (1280x720 display) every iteration is harmless
-      # when the dialog is not visible, and dismisses it immediately when shown.
-      # Coords: OK button center ≈ (511, 307) on a 1280x720 Xvfb display.
-      _xd mousemove --clearmodifiers 511 307
+      # The MT5 IPC authorization dialog may share the main terminal X11 window.
+      # Press Return on whatever window currently has focus first — the modal
+      # dialog retains X11 focus, so this clicks OK without needing coordinates.
+      _xd key Return
       sleep 0.05
-      _xd click 1
-      sleep 0.1
+      # Also sweep click across the OK button area (1280x720 display).
+      # OK button is at x≈490, y≈333-343 (y=307 was wrong: hit Server dropdown).
+      for _ok_coord in "490 337" "490 333" "490 343" "480 337" "500 337" "510 337"; do
+        set -- ${_ok_coord}
+        _xd mousemove --clearmodifiers "$1" "$2"
+        sleep 0.04
+        _xd click 1
+        sleep 0.04
+      done
       _xd key Return
       sleep 0.1
       # ─────────────────────────────────────────────────────────────────────────
@@ -537,8 +542,23 @@ fi
     # from within Wine — same wineserver as the terminal — which IS reliable.
     echo "[mt5-probe] Upgrading MetaTrader5 package to match terminal build..." >&2
     _PIP_TMP="/tmp/mt5-pip-upgrade-$$"
-    WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
-      --upgrade MetaTrader5 --quiet > "${_PIP_TMP}" 2>&1 || true
+    # Detect the terminal build number from the binary so we can install the
+    # exact matching MetaTrader5 Python package. Build N maps to package 5.0.N.
+    # If that exact version is not on PyPI yet, fall back to --upgrade (latest).
+    _TERM_BUILD=$(strings "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe" \
+      2>/dev/null | grep -oP 'build \K[0-9]{4,5}' | tail -1 || true)
+    if [[ -n "${_TERM_BUILD}" ]]; then
+      _PKG_VER="5.0.${_TERM_BUILD}"
+      echo "[mt5-probe] Terminal build=${_TERM_BUILD} → trying MetaTrader5==${_PKG_VER}" >&2
+      WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
+        "MetaTrader5==${_PKG_VER}" --quiet >"${_PIP_TMP}" 2>&1 \
+        || WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
+             --upgrade MetaTrader5 --quiet >>"${_PIP_TMP}" 2>&1 || true
+    else
+      echo "[mt5-probe] Could not detect terminal build; installing latest MetaTrader5" >&2
+      WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
+        --upgrade MetaTrader5 --quiet >"${_PIP_TMP}" 2>&1 || true
+    fi
     tail -5 "${_PIP_TMP}" >&2 2>/dev/null || true
     rm -f "${_PIP_TMP}" 2>/dev/null || true
     _VER_TMP="/tmp/mt5-ver-$$"
