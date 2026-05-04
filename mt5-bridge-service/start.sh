@@ -413,14 +413,12 @@ fi
     trap 'echo "[dismiss-loop] exit=$?" >> "${DISMISS_LOG}"' EXIT
     sleep 8
     for _try in $(seq 1 120); do
-      # Step 1: Login/Auth dialog — modal, retains X11 focus.
-      # Press Return on focused window BEFORE any windowactivate calls.
-      _xd key Return; sleep 0.1
-      for _ok in "490 333" "490 337" "490 343" "480 337" "500 337"; do
-        set -- ${_ok}
-        _xd mousemove --clearmodifiers "$1" "$2"; sleep 0.04
-        _xd click 1; sleep 0.04
-      done
+      # Step 1: Press Return on the currently focused window.
+      # This dismisses the IPC Login/Auth dialog which is an embedded
+      # Win32 modal inside the MT5 main X11 window (not a separate
+      # X11 window). Do NOT do a coordinate sweep — blind clicks at
+      # fixed coords land inside other dialogs (e.g. 'Select a company')
+      # and accidentally advance through wizards.
       _xd key Return; sleep 0.1
       _ACTIVE_WID=$(_xd getactivewindow 2>/dev/null || echo "none")
       _ACTIVE_NAME=$(DISPLAY=:99 xdotool getwindowname "${_ACTIVE_WID}" 2>/dev/null || echo "?")
@@ -447,17 +445,19 @@ fi
           _xd key --window "${_wid}" --clearmodifiers Return
         fi
       done
-      # Step 3: First-run wizard dialogs.
+      # Step 3: First-run wizard dialogs — press Escape to CANCEL them.
+      # Do NOT type server names or click Next — the terminal's pre-baked
+      # AppData config handles auth automatically. Advancing the wizard
+      # causes a MetaQuotes account setup flow that blocks IPC.
       for _wid in $({ _xd search --onlyvisible --name "Select a company"
                       _xd search --onlyvisible --name "open an account"
-                      _xd search --onlyvisible --name "Setup"; } | _uniq_ids); do
+                      _xd search --onlyvisible --name "Setup"
+                      _xd search --onlyvisible --name "Open an Account"; } | _uniq_ids); do
+        _WIZ_NAME=$(_xd getwindowname "${_wid}" 2>/dev/null || echo "?")
+        echo "[dismiss-action] iter=${_try} Escaping wizard wid=${_wid} name=${_WIZ_NAME}" >> "${DISMISS_LOG}"
         _xd windowactivate --sync "${_wid}"; sleep 0.2
-        _xd type --clearmodifiers "${MT_SERVER:-MetaQuotes-Demo}"; sleep 0.3
-        for _xy in "560 332" "530 330" "400 245" "500 245" "640 245"; do
-          set -- ${_xy}; _xd mousemove --clearmodifiers "$1" "$2" click 1; sleep 0.06
-        done
-        _xd key --window "${_wid}" --clearmodifiers Return; sleep 0.2
-        _xd key --window "${_wid}" --clearmodifiers Return
+        _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.1
+        _xd key --window "${_wid}" --clearmodifiers Escape
       done
       # Step 4: Re-press Return (catches Login dialog that appeared during steps 2/3).
       _xd key Return
