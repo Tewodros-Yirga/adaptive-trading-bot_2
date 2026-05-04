@@ -215,20 +215,18 @@ class MT5Adapter:
                         if context_mode == "portable":
                             creds["portable"] = True
 
-                        # MT5 initialize timeout: use MT5's default (60s) — enough
-                        # for broker auth. Do NOT pass path= (causes Wine to launch
-                        # a second terminal instance → -10005). Do NOT cap at 20s
-                        # (too short for Exness auth from HF Spaces).
+                        # MT5 initialize timeout: must exceed broker auth time.
+                        # Exness auth from HF infra takes ~90s. Default (60s)
+                        # was causing -10005 even after Login dialog dismissed.
+                        # Set to 90s for credentialed call.
 
                         ok = False
                         last_init_error = "unknown"
 
-                        # Strategy 1: credentialed — login+pass+server. This is
-                        # the call that actually worked in the first session.
-                        # The broker auth takes ~60s which fits within the new
-                        # 120s RPyC timeout.
+                        # Strategy 1: credentialed — login+pass+server.
+                        # timeout=90000 (90s) allows full broker auth window.
                         for init_attempt in range(1, 3):
-                            ok = client.initialize(**creds)
+                            ok = client.initialize(**creds, timeout=90000)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
@@ -239,11 +237,10 @@ class MT5Adapter:
                                 continue
                             break
 
-                        # Strategy 2: bare attach — no credentials. Faster if the
-                        # terminal is already authenticated (pre-baked session).
+                        # Strategy 2: bare attach — no credentials.
                         if not ok:
                             for init_attempt in range(1, 3):
-                                ok = client.initialize()
+                                ok = client.initialize(timeout=30000)
                                 if ok:
                                     break
                                 err = client.last_error() if hasattr(client, "last_error") else "unknown"
