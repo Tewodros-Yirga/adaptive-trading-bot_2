@@ -89,7 +89,7 @@ RUN set -eux; \
     \
     # -- pip install MetaTrader5 + mt5linux -- \
     timeout 300 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir pip || true; \
-    timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
+    timeout 600 wine "${WINE_PY}" -m pip install --no-cache-dir MetaTrader5==5.0.5640 || true; \
     timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir "mt5linux>=0.1.9" || true; \
     timeout 300 wine "${WINE_PY}" -m pip install --no-cache-dir python-dateutil || true; \
     wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
@@ -139,8 +139,19 @@ RUN set -eux; \
         7z x /tmp/mt5setup.exe -o"${_MT5_PARENT}" -y > /tmp/7z-extract.log 2>&1 || true; \
         echo "=== 7z extraction log (last 10 lines) ==="; \
         tail -10 /tmp/7z-extract.log 2>/dev/null || true; \
+        # Normalize: rename whatever top-level dir contains terminal64.exe \
+        # to "MetaTrader 5" so start.sh's hardcoded path works. \
         TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
           -name "terminal64.exe" 2>/dev/null | head -1) || true; \
+        if [ -n "${TERM_EXE}" ]; then \
+          _ACTUAL_DIR=$(dirname "${TERM_EXE}"); \
+          _EXPECTED_DIR="${_MT5_PARENT}/MetaTrader 5"; \
+          if [ "${_ACTUAL_DIR}" != "${_EXPECTED_DIR}" ]; then \
+            echo "Renaming '${_ACTUAL_DIR}' -> '${_EXPECTED_DIR}'"; \
+            mv "${_ACTUAL_DIR}" "${_EXPECTED_DIR}" 2>/dev/null || true; \
+            TERM_EXE="${_EXPECTED_DIR}/terminal64.exe"; \
+          fi; \
+        fi; \
       fi; \
       \
       # --- Method B: EXE stub fallback (likely to hang — see comments above) \
