@@ -31,7 +31,8 @@ ENV HOME=/root
 RUN set -eux; \
     apt-get update -qq || true; \
     apt-get install -y --no-install-recommends --fix-missing \
-        supervisor python3-venv scrot xdotool x11-utils openbox curl; \
+        supervisor python3-venv scrot xdotool x11-utils openbox curl \
+        libimage-exiftool-perl; \
     rm -rf /var/lib/apt/lists/*
 
 # Ensure /opt/wineprefix is owned by root (matching runtime user).
