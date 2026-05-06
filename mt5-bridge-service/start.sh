@@ -560,7 +560,7 @@ fi
     _TERM_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
     _TERM_BUILD=""
 
-    # Method 1a: parse "FileVersion: X.Y.Z.BUILD" from exiftool/file.
+    # Method 1a: parse "FileVersion: X.Y.Z.BUILD" from exiftool.
     if [[ -z "${_TERM_BUILD}" ]] && command -v exiftool &>/dev/null; then
       _TERM_BUILD=$(exiftool -FileVersion "${_TERM_EXE}" 2>/dev/null \
         | grep -oE '[0-9]+$' || true)
@@ -568,41 +568,76 @@ fi
         echo "[mt5-probe] Build detected via exiftool: ${_TERM_BUILD}" >&2
     fi
 
-    # Method 1b: strings + portable grep (no PCRE needed).
-    #   The binary contains "MetaTrader 5 x64 build NNNN" or "build NNNN".
+    # Method 1b: strings (ASCII) — look for "build NNNN".
     if [[ -z "${_TERM_BUILD}" ]]; then
       _TERM_BUILD=$(strings "${_TERM_EXE}" 2>/dev/null \
         | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || true)
       [[ -n "${_TERM_BUILD}" ]] && \
-        echo "[mt5-probe] Build detected via strings: ${_TERM_BUILD}" >&2
+        echo "[mt5-probe] Build detected via strings(ASCII): ${_TERM_BUILD}" >&2
     fi
 
-    # Method 2: Scan Journal log files for "build NNNN started".
+    # Method 1c: strings UTF-16LE — Windows PE stores version strings as
+    # wide chars (UTF-16LE). The default `strings` only finds ASCII.
     if [[ -z "${_TERM_BUILD}" ]]; then
-      _JOURNAL_DIR=""
-      # Check portable data dir first, then AppData hash dirs.
-      for _jd in \
-        "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/Logs" \
-        $(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
-          -mindepth 2 -maxdepth 2 -type d -name "Logs" 2>/dev/null || true); do
-        if [[ -d "${_jd}" ]]; then
-          _JOURNAL_DIR="${_jd}"
-          break
-        fi
-      done
-      if [[ -n "${_JOURNAL_DIR}" ]]; then
-        _TERM_BUILD=$(grep -rhoE 'build [0-9]{4,5}' "${_JOURNAL_DIR}" 2>/dev/null \
-          | tail -1 | sed 's/build //' || true)
+      _TERM_BUILD=$(strings -e l "${_TERM_EXE}" 2>/dev/null \
+        | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || true)
+      [[ -n "${_TERM_BUILD}" ]] && \
+        echo "[mt5-probe] Build detected via strings(UTF16LE): ${_TERM_BUILD}" >&2
+    fi
+
+    # Method 1d: strings UTF-16BE fallback.
+    if [[ -z "${_TERM_BUILD}" ]]; then
+      _TERM_BUILD=$(strings -e b "${_TERM_EXE}" 2>/dev/null \
+        | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || true)
+      [[ -n "${_TERM_BUILD}" ]] && \
+        echo "[mt5-probe] Build detected via strings(UTF16BE): ${_TERM_BUILD}" >&2
+    fi
+
+    # Method 2: Wine-based PE version info query.
+    if [[ -z "${_TERM_BUILD}" ]]; then
+      echo "[mt5-probe] Trying Wine PE version query..." >&2
+      _WIN_PATH=$(echo "${_TERM_EXE}" | sed "s|${WINEPREFIX}/drive_c/|C:\\\\|;s|/|\\\\|g")
+      _PE_VER=$(WINEDEBUG="-all" timeout 15 "${WINE_CMD:-wine}" cmd /c \
+        "wmic datafile where \"name='${_WIN_PATH}'\" get version /format:list" \
+        2>/dev/null | tr -d '\r' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+      if [[ -n "${_PE_VER}" ]]; then
+        _TERM_BUILD=$(echo "${_PE_VER}" | awk -F. '{print $NF}')
         [[ -n "${_TERM_BUILD}" ]] && \
-          echo "[mt5-probe] Build detected via Journal: ${_TERM_BUILD}" >&2
+          echo "[mt5-probe] Build detected via Wine wmic: ${_TERM_BUILD} (ver=${_PE_VER})" >&2
       fi
+    fi
+
+    # Method 3: Wait for Journal log (terminal writes it ~10-20s after launch).
+    if [[ -z "${_TERM_BUILD}" ]]; then
+      echo "[mt5-probe] Waiting up to 30s for Journal log entry..." >&2
+      _JOURNAL_FOUND=false
+      for _jw in $(seq 1 6); do
+        for _jd in \
+          "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/Logs" \
+          $(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+            -mindepth 2 -maxdepth 2 -type d -name "Logs" 2>/dev/null || true); do
+          if [[ -d "${_jd}" ]]; then
+            _TERM_BUILD=$(grep -rhoE 'build [0-9]{4,5}' "${_jd}" 2>/dev/null \
+              | tail -1 | sed 's/build //' || true)
+            if [[ -n "${_TERM_BUILD}" ]]; then
+              echo "[mt5-probe] Build detected via Journal: ${_TERM_BUILD} (after ${_jw}x5s)" >&2
+              _JOURNAL_FOUND=true
+              break 2
+            fi
+          fi
+        done
+        sleep 5
+      done
     fi
 
     if [[ -z "${_TERM_BUILD}" ]]; then
       echo "[mt5-probe] WARNING: Could not detect terminal build via any method" >&2
-      echo "[mt5-probe] Files in terminal dir:" >&2
-      ls -la "${_TERM_EXE}" 2>&2 || true
+      echo "[mt5-probe] Dumping first 20 strings from binary for diagnostics:" >&2
+      strings "${_TERM_EXE}" 2>/dev/null | head -20 >&2 || true
+      echo "[mt5-probe] Dumping first 20 UTF-16LE strings:" >&2
+      strings -e l "${_TERM_EXE}" 2>/dev/null | head -20 >&2 || true
     fi
+
 
     # ── Install matching MetaTrader5 Python package ────────────────────────
     if [[ -n "${_TERM_BUILD}" ]]; then
