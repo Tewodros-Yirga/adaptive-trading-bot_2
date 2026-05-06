@@ -316,23 +316,29 @@ RUN set -eux; \
     # overwrites it (healthy startup rewrites it from ~300B to >1KB).
     PRE_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
     \
-    # Wait up to 10 min: terminal.ini grown OR MQL5/Experts appeared.
-    # The terminal needs 3-5 min on first run to download MQL5/ data from CDN.
-    # Previous 240s timeout was too short — bake the full download into the image.
-    echo "Waiting for portable init (terminal.ini size change or MQL5/Experts, up to 600 s)..."; \
+    # Wait up to 120s for terminal to complete initialization.
+    # Success conditions (any one is sufficient):
+    #   1. terminal.ini grew beyond pre-written size (terminal rewrote it)
+    #   2. Recursive file count > 50 (pre-packaged ZIP — MQL5/ data already present)
+    #   3. MQL5/Experts directory exists anywhere under TERM_DIR
+    echo "Waiting for portable init (up to 120 s)..."; \
     INIT_WAITED=0; \
-    while [ "${INIT_WAITED}" -lt 600 ]; do \
+    while [ "${INIT_WAITED}" -lt 120 ]; do \
       CUR_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
+      PFILES=$(find "${TERM_DIR}" -type f 2>/dev/null | wc -l) || PFILES=0; \
+      echo "Waiting for portable init (${INIT_WAITED}s, total_files=${PFILES}, tini=${CUR_TINI_SIZE}B)..."; \
       if [ "${CUR_TINI_SIZE}" -gt "${PRE_TINI_SIZE}" ]; then \
-        echo "terminal.ini grown: ${PRE_TINI_SIZE}->${CUR_TINI_SIZE} bytes after ${INIT_WAITED}s — terminal rewrote config"; \
+        echo "terminal.ini grown: ${PRE_TINI_SIZE}->${CUR_TINI_SIZE} bytes after ${INIT_WAITED}s"; \
         break; \
       fi; \
-      if [ -d "${TERM_DIR}/MQL5/Experts" ]; then \
-        echo "MQL5/Experts present after ${INIT_WAITED}s — portable init done"; \
+      if [ "${PFILES}" -gt 50 ]; then \
+        echo "${PFILES} files present after ${INIT_WAITED}s — pre-packaged ZIP detected, init complete"; \
         break; \
       fi; \
-      PFILES=$(find "${TERM_DIR}" -maxdepth 1 -type f 2>/dev/null | wc -l) || PFILES=0; \
-      echo "Waiting for portable init (${INIT_WAITED}s, install_files=${PFILES}, tini=${CUR_TINI_SIZE}B)..."; \
+      if find "${TERM_DIR}" -name "Experts" -type d 2>/dev/null | grep -q .; then \
+        echo "MQL5/Experts dir found after ${INIT_WAITED}s — portable init done"; \
+        break; \
+      fi; \
       sleep 5; \
       INIT_WAITED=$(( INIT_WAITED + 5 )); \
     done; \
