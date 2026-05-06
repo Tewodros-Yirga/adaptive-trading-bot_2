@@ -162,6 +162,33 @@ RUN set -eux; \
             echo "WARNING: terminal64.exe not found in extracted archive"; \
           fi; \
         fi; \
+        \
+        # PowerShell Compress-Archive stores paths with Windows backslashes. \
+        # 7z on Linux extracts "MQL5\Experts\file.ex5" as a flat file whose \
+        # name literally contains backslashes.  Wine looks up MQL5/Experts, \
+        # not MQL5\Experts, so the terminal sees MQL5 as missing and restarts. \
+        # Fix: rename every backslash-named item into the proper directory. \
+        if find "${_MT5_TARGET}" -maxdepth 1 -name '*\\*' 2>/dev/null | grep -q .; then \
+          echo "Fixing Windows backslash paths -> POSIX directory structure..."; \
+          python3 - "${_MT5_TARGET}" <<'__PYEOF__'
+import os, shutil, sys
+target = sys.argv[1]
+# Process deepest paths first (reverse-sort by backslash count)
+entries = [e for e in os.listdir(target) if '\\' in e]
+entries.sort(key=lambda x: x.count('\\'), reverse=True)
+for name in entries:
+    src = os.path.join(target, name)
+    dst = os.path.join(target, name.replace('\\', os.sep))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if not os.path.exists(dst):
+        shutil.move(src, dst)
+print(f"Moved {len(entries)} backslash entries to proper paths.")
+__PYEOF__
+          echo "Backslash path fix done."; \
+        else \
+          echo "No backslash-named entries found — ZIP already POSIX-compliant."; \
+        fi; \
+        \
         rm -rf "${_TMP_EXTRACT}"; \
         TERM_EXE=$(find "${_MT5_TARGET}" -maxdepth 1 \
           -name "terminal64.exe" 2>/dev/null | head -1) || true; \
