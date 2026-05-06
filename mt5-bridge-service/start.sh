@@ -307,9 +307,22 @@ fi
   echo "pending" > "${IPC_STATUS_FILE}" 2>/dev/null || true
 
   CONTEXT_ARGS=()
+  # Auto-detect portable installation: if terminal.ini exists alongside terminal64.exe,
+  # the base image was baked in portable mode. Override MT5_CONTEXT_MODE to portable so
+  # the terminal finds its pre-baked data dir (exe dir) instead of searching AppData
+  # (which was never set up). Without this, the terminal shows the first-run wizard and
+  # never creates the IPC named pipe → mt5.initialize() returns -10003 forever.
+  _TERM_INI_PORTABLE="$(dirname "${TERMINAL_EXE}")/terminal.ini"
+  if [[ "${MT5_CONTEXT_MODE}" == "default" ]] || [[ -z "${MT5_CONTEXT_MODE}" ]]; then
+    if [[ -f "${_TERM_INI_PORTABLE}" ]]; then
+      echo "[mt5-terminal] Portable terminal.ini detected alongside exe — forcing portable mode"
+      MT5_CONTEXT_MODE="portable"
+    fi
+  fi
   case "${MT5_CONTEXT_MODE}" in
     portable)
       CONTEXT_ARGS+=("/portable")
+      echo "[mt5-terminal] MT5_CONTEXT_MODE=portable; using portable (exe-dir) mode"
       ;;
     data_dir)
       mkdir -p "${MT5_CONTEXT_DIR}" 2>/dev/null || true
