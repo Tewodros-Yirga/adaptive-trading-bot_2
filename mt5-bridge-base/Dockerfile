@@ -248,14 +248,24 @@ RUN set -eux; \
     \
     # Lock terminal exes READ-ONLY before first-run launch so that even if \
     # the terminal checks for a newer build, it cannot overwrite itself. \
-    # The CDN blocking is NOT applied here: the forge ZIP ships only exe stubs; \
-    # the terminal needs internet access during Docker build to download the \
-    # MQL5/ data directory (indicators, scripts, etc.) on first run. \
-    # Without MQL5/ the terminal never exits its self-restart loop at runtime. \
     echo "Locking terminal exes (read-only) to prevent self-update during init..."; \
     find "${TERM_DIR}" \( -name '*.exe' -o -name '*.dll' \) \
       -exec chmod a-w {} \; 2>/dev/null || true; \
     echo "Exes locked."; \
+    \
+    # Block ONLY the terminal update-check domains so the update check fails \
+    # instantly (ECONNREFUSED) instead of hanging for 10+ minutes downloading \
+    # an update that can't be installed (exe is locked). \
+    # Data CDNs (cdn.mql5.com, files.mql5.com etc.) are deliberately left \
+    # unblocked so the terminal can download MQL5/ indicators/scripts on first run. \
+    WINE_HOSTS="${WINEPREFIX}/drive_c/windows/system32/drivers/etc/hosts"; \
+    mkdir -p "$(dirname "${WINE_HOSTS}")" 2>/dev/null || true; \
+    for _d in update.mql5.com updates.mql5.com \
+               update.metatrader5.com updates.metatrader5.com \
+               mt5-update.metaquotes.net; do \
+      echo "127.0.0.1 ${_d}" >> "${WINE_HOSTS}" 2>/dev/null || true; \
+    done; \
+    echo "Update-check domains blocked; data CDNs remain open."; \
     \
     echo "Launching terminal in portable mode (internet-accessible for data download)..."; \
     DISPLAY=:99 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
