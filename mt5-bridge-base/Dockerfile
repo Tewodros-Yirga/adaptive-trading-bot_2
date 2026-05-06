@@ -170,23 +170,12 @@ RUN set -eux; \
         # Fix: rename every backslash-named item into the proper directory. \
         if find "${_MT5_TARGET}" -maxdepth 1 -name '*\\*' 2>/dev/null | grep -q .; then \
           echo "Fixing Windows backslash paths -> POSIX directory structure..."; \
-          python3 - "${_MT5_TARGET}" <<'__PYEOF__'
-import os, shutil, sys
-target = sys.argv[1]
-# Process deepest paths first (reverse-sort by backslash count)
-entries = [e for e in os.listdir(target) if '\\' in e]
-entries.sort(key=lambda x: x.count('\\'), reverse=True)
-for name in entries:
-    src = os.path.join(target, name)
-    dst = os.path.join(target, name.replace('\\', os.sep))
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if not os.path.exists(dst):
-        shutil.move(src, dst)
-print(f"Moved {len(entries)} backslash entries to proper paths.")
-__PYEOF__
+          printf 'import os,shutil,sys\ntarget=sys.argv[1]\nentries=[e for e in os.listdir(target) if chr(92) in e]\nentries.sort(key=lambda x:x.count(chr(92)),reverse=True)\nfor name in entries:\n src=os.path.join(target,name)\n dst=os.path.join(target,name.replace(chr(92),"/"))\n os.makedirs(os.path.dirname(dst),exist_ok=True)\n if not os.path.exists(dst):\n  shutil.move(src,dst)\nprint("Moved",len(entries),"backslash entries to proper paths.")\n' > /tmp/fix_paths.py; \
+          python3 /tmp/fix_paths.py "${_MT5_TARGET}"; \
+          rm -f /tmp/fix_paths.py; \
           echo "Backslash path fix done."; \
         else \
-          echo "No backslash-named entries found — ZIP already POSIX-compliant."; \
+          echo "No backslash-named entries — ZIP already POSIX-compliant."; \
         fi; \
         \
         rm -rf "${_TMP_EXTRACT}"; \
