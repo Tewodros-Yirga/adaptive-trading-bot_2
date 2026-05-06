@@ -824,7 +824,7 @@ fi
   fi
 
   # Keep wrapper attached to terminal lifecycle.
-  wait "${TERMINAL_PID}" || true
+  while kill -0 "${TERMINAL_PID}" 2>/dev/null; do sleep 1; done || true
 ) 2>&1 | tee /tmp/mt5-launch-wrapper.log &
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"
