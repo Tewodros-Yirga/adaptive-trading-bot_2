@@ -267,6 +267,22 @@ RUN set -eux; \
     done; \
     echo "Update-check domains blocked; data CDNs remain open."; \
     \
+    # Pre-write portable config and terminal.ini so the first-run wizard \
+    # is skipped and broker login is attempted automatically on startup. \
+    mkdir -p "${TERM_DIR}/config" 2>/dev/null || true; \
+    printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n' \
+      > "${TERM_DIR}/config/common.ini" 2>/dev/null || true; \
+    printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
+      > "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
+    echo "Pre-wrote portable terminal.ini and config/common.ini"; \
+    \
+    # Remove liveme.exe — it blocks the main thread with a dialog on startup. \
+    echo "Removing liveme.exe (blocks IPC if present)..."; \
+    find "${TERM_DIR}" -maxdepth 1 -iname "liveme*.exe" -delete 2>/dev/null || true; \
+    ls -la "${TERM_DIR}/liveme.exe" 2>/dev/null \
+      && echo "WARNING: liveme.exe still present!" \
+      || echo "liveme.exe removed (or was never present)"; \
+    \
     echo "Launching terminal in portable mode (internet-accessible for data download)..."; \
     DISPLAY=:99 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
       wine "${TERM_EXE}" /portable > /tmp/mt5-firstrun.log 2>&1 & \
