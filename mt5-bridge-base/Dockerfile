@@ -135,23 +135,37 @@ RUN set -eux; \
       if echo "${MT5_FILE_TYPE}" | grep -qiE '(Zip archive|zip)'; then \
         echo "=== Detected ZIP archive — extracting portable MT5 installation ==="; \
         _MT5_PARENT="${WINEPREFIX}/drive_c/Program Files"; \
-        mkdir -p "${_MT5_PARENT}"; \
-        7z x /tmp/mt5setup.exe -o"${_MT5_PARENT}" -y > /tmp/7z-extract.log 2>&1 || true; \
+        _MT5_TARGET="${_MT5_PARENT}/MetaTrader 5"; \
+        _TMP_EXTRACT="/tmp/mt5-extract-$$"; \
+        mkdir -p "${_MT5_PARENT}" "${_TMP_EXTRACT}"; \
+        7z x /tmp/mt5setup.exe -o"${_TMP_EXTRACT}" -y > /tmp/7z-extract.log 2>&1 || true; \
         echo "=== 7z extraction log (last 10 lines) ==="; \
         tail -10 /tmp/7z-extract.log 2>/dev/null || true; \
-        # Normalize: rename whatever top-level dir contains terminal64.exe \
-        # to "MetaTrader 5" so start.sh's hardcoded path works. \
-        TERM_EXE=$(find "${WINEPREFIX}/drive_c" -maxdepth 10 \
-          -name "terminal64.exe" 2>/dev/null | head -1) || true; \
-        if [ -n "${TERM_EXE}" ]; then \
-          _ACTUAL_DIR=$(dirname "${TERM_EXE}"); \
-          _EXPECTED_DIR="${_MT5_PARENT}/MetaTrader 5"; \
-          if [ "${_ACTUAL_DIR}" != "${_EXPECTED_DIR}" ]; then \
-            echo "Renaming '${_ACTUAL_DIR}' -> '${_EXPECTED_DIR}'"; \
-            mv "${_ACTUAL_DIR}" "${_EXPECTED_DIR}" 2>/dev/null || true; \
-            TERM_EXE="${_EXPECTED_DIR}/terminal64.exe"; \
+        echo "=== Extracted contents ==="; \
+        ls -la "${_TMP_EXTRACT}/" 2>/dev/null || true; \
+        \
+        # Check if this is a flat ZIP (terminal64.exe at root) or nested \
+        # (inside a subdirectory like "MetaTrader 5/"). \
+        if [ -f "${_TMP_EXTRACT}/terminal64.exe" ]; then \
+          echo "Flat ZIP detected — moving files into '${_MT5_TARGET}'"; \
+          mkdir -p "${_MT5_TARGET}"; \
+          mv "${_TMP_EXTRACT}"/* "${_MT5_TARGET}/" 2>/dev/null || true; \
+        else \
+          # Nested: find the dir containing terminal64.exe and rename it \
+          _NESTED_EXE=$(find "${_TMP_EXTRACT}" -maxdepth 5 \
+            -name "terminal64.exe" 2>/dev/null | head -1) || true; \
+          if [ -n "${_NESTED_EXE}" ]; then \
+            _NESTED_DIR=$(dirname "${_NESTED_EXE}"); \
+            echo "Nested ZIP detected — moving '${_NESTED_DIR}' to '${_MT5_TARGET}'"; \
+            mv "${_NESTED_DIR}" "${_MT5_TARGET}" 2>/dev/null || true; \
+          else \
+            echo "WARNING: terminal64.exe not found in extracted archive"; \
           fi; \
         fi; \
+        rm -rf "${_TMP_EXTRACT}"; \
+        TERM_EXE=$(find "${_MT5_TARGET}" -maxdepth 1 \
+          -name "terminal64.exe" 2>/dev/null | head -1) || true; \
+        echo "terminal64.exe after normalization: ${TERM_EXE:-NOT FOUND}"; \
       fi; \
       \
       # --- Method B: EXE stub fallback (likely to hang — see comments above) \
