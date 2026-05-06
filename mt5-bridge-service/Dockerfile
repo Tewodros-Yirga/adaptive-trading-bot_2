@@ -12,6 +12,8 @@
 
 FROM ghcr.io/loriloha/mt5-bridge-base:latest
 
+# Cache-bust: forces HF to re-pull base image on rebuild (bump to trigger)
+ARG CACHE_BUST=warmup-90s-v2
 # Build and run as root. The wine prefix was also created by root (docker
 # builds always run as root unless a USER instruction changes them — the
 # scottyhardy base does NOT have a USER instruction so build is root).
