@@ -246,45 +246,18 @@ RUN set -eux; \
     OPENBOX_PID=$!; \
     sleep 2; \
     \
-    # Block LiveUpdate CDN — connection to 127.0.0.1 gives instant ECONNREFUSED. \
-    WINE_HOSTS="${WINEPREFIX}/drive_c/windows/system32/drivers/etc/hosts"; \
-    mkdir -p "$(dirname "${WINE_HOSTS}")" 2>/dev/null || true; \
-    for _d in live.mql5.com updates.mql5.com update.mql5.com download.mql5.com \
-               cdn.mql5.com ec.mql5.com files.mql5.com www.mql5.com mql5.com \
-               update.metatrader5.com updates.metatrader5.com \
-               mt5-update.metaquotes.net metaquotes.net; do \
-      echo "127.0.0.1 ${_d}" >> "${WINE_HOSTS}" 2>/dev/null || true; \
-    done; \
-    echo "Wine hosts written (127.0.0.1 = immediate ECONNREFUSED)"; \
+    # Lock terminal exes READ-ONLY before first-run launch so that even if \
+    # the terminal checks for a newer build, it cannot overwrite itself. \
+    # The CDN blocking is NOT applied here: the forge ZIP ships only exe stubs; \
+    # the terminal needs internet access during Docker build to download the \
+    # MQL5/ data directory (indicators, scripts, etc.) on first run. \
+    # Without MQL5/ the terminal never exits its self-restart loop at runtime. \
+    echo "Locking terminal exes (read-only) to prevent self-update during init..."; \
+    find "${TERM_DIR}" \( -name '*.exe' -o -name '*.dll' \) \
+      -exec chmod a-w {} \; 2>/dev/null || true; \
+    echo "Exes locked."; \
     \
-    # Pre-write portable config and terminal.ini so the first-run wizard \
-    # is skipped and broker login is attempted automatically on startup. \
-    # AutoUpdate=0 and [LiveUpdate] Enabled=0 prevent MT5 from running its \
-    # built-in LiveUpdate thread, which otherwise calls DialogBox() on the \
-    # main thread and blocks the IPC message pump indefinitely. \
-    mkdir -p "${TERM_DIR}/config" 2>/dev/null || true; \
-    printf '[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n' \
-      > "${TERM_DIR}/config/common.ini" 2>/dev/null || true; \
-    printf '[Startup]\r\nAutoStart=0\r\n\r\n[Common]\r\nLogin=435609450\r\nPassword=Mznxbcv12#\r\nServer=Exness-MT5Trial9\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
-      > "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
-    echo "Pre-wrote portable terminal.ini and config/common.ini"; \
-    \
-    # -----------------------------------------------------------------------\
-    # CRITICAL: remove liveme.exe before launching the terminal.\
-    # MT5 calls CreateProcess(liveme.exe) + WaitForSingleObject on startup,\
-    # blocking the main thread (and therefore the IPC message pump) until\
-    # liveme.exe exits. Since liveme.exe shows a dialog that needs user input,\
-    # it never exits on its own — causing -10005 indefinitely.\
-    # Without liveme.exe, CreateProcess fails instantly, the Wait returns,\
-    # and the main thread is free to service IPC requests.\
-    # -----------------------------------------------------------------------\
-    echo "Removing liveme.exe (LiveUpdate child process — blocks IPC if present)..."; \
-    find "${TERM_DIR}" -maxdepth 1 -iname "liveme*.exe" -delete 2>/dev/null || true; \
-    ls -la "${TERM_DIR}/liveme.exe" 2>/dev/null \
-      && echo "WARNING: liveme.exe still present!" \
-      || echo "liveme.exe removed (or was never present)"; \
-    \
-    echo "Launching terminal in portable mode..."; \
+    echo "Launching terminal in portable mode (internet-accessible for data download)..."; \
     DISPLAY=:99 WINEDEBUG="err+all" WINEESYNC=0 WINEFSYNC=0 \
       wine "${TERM_EXE}" /portable > /tmp/mt5-firstrun.log 2>&1 & \
     TERM_PID=$!; \
