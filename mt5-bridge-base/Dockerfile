@@ -290,10 +290,12 @@ RUN set -eux; \
     # overwrites it (healthy startup rewrites it from ~300B to >1KB).
     PRE_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
     \
-    # Wait up to 4 min: terminal.ini grown OR MQL5/Experts appeared.
-    echo "Waiting for portable init (terminal.ini size change or MQL5/Experts, up to 240 s)..."; \
+    # Wait up to 10 min: terminal.ini grown OR MQL5/Experts appeared.
+    # The terminal needs 3-5 min on first run to download MQL5/ data from CDN.
+    # Previous 240s timeout was too short — bake the full download into the image.
+    echo "Waiting for portable init (terminal.ini size change or MQL5/Experts, up to 600 s)..."; \
     INIT_WAITED=0; \
-    while [ "${INIT_WAITED}" -lt 240 ]; do \
+    while [ "${INIT_WAITED}" -lt 600 ]; do \
       CUR_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
       if [ "${CUR_TINI_SIZE}" -gt "${PRE_TINI_SIZE}" ]; then \
         echo "terminal.ini grown: ${PRE_TINI_SIZE}->${CUR_TINI_SIZE} bytes after ${INIT_WAITED}s — terminal rewrote config"; \
