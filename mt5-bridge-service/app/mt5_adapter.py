@@ -214,6 +214,25 @@ class MT5Adapter:
                         context_mode = os.environ.get("MT5_CONTEXT_MODE", "default").lower()
                         if context_mode == "portable":
                             creds["portable"] = True
+                        # ── Build-mismatch fast-fail ──────────────────────
+                        # start.sh writes a sentinel if terminal build ≠ package
+                        # build. When mismatched, initialize() blocks for 60-90s
+                        # then returns -10005 every time. Skip the wait entirely.
+                        _mismatch_file = os.path.join(
+                            os.environ.get("LOGDIR", "/tmp/mt5-logs"),
+                            "build_mismatch",
+                        )
+                        if os.path.isfile(_mismatch_file):
+                            try:
+                                _mismatch_info = open(_mismatch_file).read().strip()
+                            except Exception:
+                                _mismatch_info = "unknown"
+                            self.last_error_class = "build_mismatch"
+                            raise RuntimeError(
+                                f"FATAL: terminal/package build mismatch ({_mismatch_info}). "
+                                f"Rebuild the base image with a matching terminal. "
+                                f"mt5.initialize() will return -10005 every time."
+                            )
 
                         ok = False
                         last_init_error = "unknown"

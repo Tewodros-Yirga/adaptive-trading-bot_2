@@ -5,6 +5,10 @@ name: Package MT5 Portable Archive (Windows)
 # the Wine WinHTTP incompatibility that prevents the installer from running
 # under Wine.
 #
+# CRITICAL: The terminal build MUST match the latest MetaTrader5 Python package
+# on PyPI. If they don't match, mt5.initialize() returns -10005 (IPC timeout)
+# under Wine because the IPC protocol version is incompatible.
+#
 # USAGE: Run this workflow once. After it completes, copy the release asset
 # URL into the main build-mt5-base.yml workflow's mt5_url input.
 
@@ -12,13 +16,17 @@ on:
   workflow_dispatch:
     inputs:
       mt5_url:
-        description: "MT5 installer URL"
+        description: "MT5 installer URL (MetaQuotes default or broker-specific like Exness)"
         required: false
         default: "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
       release_tag:
-        description: "Release tag (e.g. mt5-portable-5800)"
+        description: "Release tag (e.g. mt5-portable-5735)"
         required: false
         default: "mt5-portable-latest"
+      force_build:
+        description: "Create release even if builds don't match PyPI (true/false)"
+        required: false
+        default: "false"
 
 jobs:
   package:
@@ -87,6 +95,91 @@ jobs:
           "build=$build"    | Out-File $env:GITHUB_OUTPUT -Append
           "tag=mt5-portable-$build" | Out-File $env:GITHUB_OUTPUT -Append
 
+      # ── NEW: Check PyPI for matching MetaTrader5 Python package ──────────
+      - name: Check PyPI for matching MetaTrader5 package
+        id: pypi_check
+        shell: powershell
+        run: |
+          $build = "${{ steps.mt5_ver.outputs.build }}"
+          $targetPkg = "MetaTrader5==$( '5.0.' + $build )"
+          Write-Host "Terminal build: $build"
+          Write-Host "Looking for PyPI package: $targetPkg"
+
+          # Try to install the exact matching version
+          $exactMatch = $false
+          try {
+            pip install $targetPkg --quiet 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "SUCCESS: Exact match $targetPkg found on PyPI!"
+              $exactMatch = $true
+            }
+          } catch {}
+
+          if (-not $exactMatch) {
+            Write-Host "WARNING: $targetPkg NOT found on PyPI."
+            Write-Host "Installing latest MetaTrader5 package instead..."
+            pip install MetaTrader5 --quiet
+            $installed = pip show MetaTrader5 | Select-String "Version:"
+            Write-Host "Latest PyPI version: $installed"
+
+            # Extract the build number from the installed package version
+            $pkgVer = ($installed -replace 'Version:\s*', '').Trim()
+            $pkgBuild = ($pkgVer -split '\.')[-1]
+            Write-Host "Package build: $pkgBuild vs Terminal build: $build"
+
+            if ($pkgBuild -ne $build) {
+              Write-Host ""
+              Write-Host "##[error] BUILD MISMATCH DETECTED!"
+              Write-Host "##[error] Terminal: $build  |  PyPI package: $pkgBuild"
+              Write-Host "##[error] mt5.initialize() will return -10005 under Wine."
+              Write-Host ""
+              if ("${{ github.event.inputs.force_build }}" -ne "true") {
+                Write-Host "Set force_build=true to create the release anyway."
+                "match=false" | Out-File $env:GITHUB_OUTPUT -Append
+                "pkg_build=$pkgBuild" | Out-File $env:GITHUB_OUTPUT -Append
+                exit 1
+              } else {
+                Write-Host "force_build=true — continuing despite mismatch."
+              }
+            }
+            "pkg_build=$pkgBuild" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            "pkg_build=$build" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+          "match=true" | Out-File $env:GITHUB_OUTPUT -Append
+
+      # ── NEW: Verify IPC works on native Windows ──────────────────────────
+      - name: Verify IPC on native Windows
+        if: steps.pypi_check.outputs.match == 'true' || github.event.inputs.force_build == 'true'
+        shell: powershell
+        run: |
+          Write-Host "Starting terminal for IPC verification..."
+          $term = Start-Process -FilePath "C:\Program Files\MetaTrader 5\terminal64.exe" `
+                                -PassThru
+          Write-Host "Terminal PID: $($term.Id)"
+          Start-Sleep -Seconds 30
+
+          Write-Host "Testing mt5.initialize()..."
+          python -c @"
+          import MetaTrader5 as mt5
+          ok = mt5.initialize(path=r'C:\Program Files\MetaTrader 5\terminal64.exe', timeout=30000)
+          print(f'initialize() = {ok}')
+          if ok:
+              info = mt5.terminal_info()
+              print(f'Terminal: build {info.build}, name={info.name}')
+              ver = mt5.version()
+              print(f'Version tuple: {ver}')
+              mt5.shutdown()
+          else:
+              err = mt5.last_error()
+              print(f'Error: {err}')
+              # Don't fail — IPC may need manual login on first run
+          "@
+
+          # Kill terminal
+          Stop-Process -Id $term.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "IPC verification complete."
+
       - name: Create portable ZIP archive
         shell: bash
         run: |
@@ -97,23 +190,32 @@ jobs:
           du -sh "$GITHUB_WORKSPACE/mt5-portable.zip"
 
       - name: Upload to GitHub Releases
+        if: steps.pypi_check.outputs.match == 'true' || github.event.inputs.force_build == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
           TAG="${{ steps.mt5_ver.outputs.tag }}"
+          BUILD="${{ steps.mt5_ver.outputs.build }}"
+          PKG_BUILD="${{ steps.pypi_check.outputs.pkg_build }}"
+
+          NOTES="MetaTrader 5 portable archive (Windows GHA, $(date -u +%Y-%m-%d)).
+          Terminal build: ${BUILD}
+          PyPI package build: ${PKG_BUILD}
+          Match: ${{ steps.pypi_check.outputs.match }}
+
+          Use this URL as mt5_url in the build-mt5-base workflow:
+          https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5-portable.zip"
+
           # Create or update the release
           if gh release view "${TAG}" > /dev/null 2>&1; then
             echo "Release ${TAG} exists — uploading asset..."
           else
             echo "Creating release ${TAG}..."
             gh release create "${TAG}" \
-              --title "MT5 Portable Build ${{ steps.mt5_ver.outputs.build }}" \
-              --notes "MetaTrader 5 portable archive (Windows GHA, $(date -u +%Y-%m-%d)).
-          
-          Use this URL as mt5_url in the build-mt5-base workflow:
-          https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5-portable.zip"
+              --title "MT5 Portable Build ${BUILD}" \
+              --notes "${NOTES}"
           fi
           gh release upload "${TAG}" \
             "$GITHUB_WORKSPACE/mt5-portable.zip" \

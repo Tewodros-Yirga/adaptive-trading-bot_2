@@ -553,11 +553,58 @@ fi
     # from within Wine — same wineserver as the terminal — which IS reliable.
     echo "[mt5-probe] Upgrading MetaTrader5 package to match terminal build..." >&2
     _PIP_TMP="/tmp/mt5-pip-upgrade-$$"
-    # Detect the terminal build number from the binary so we can install the
-    # exact matching MetaTrader5 Python package. Build N maps to package 5.0.N.
-    # If that exact version is not on PyPI yet, fall back to --upgrade (latest).
-    _TERM_BUILD=$(strings "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe" \
-      2>/dev/null | grep -oP 'build \K[0-9]{4,5}' | tail -1 || true)
+
+    # ── Multi-method terminal build detection ──────────────────────────────
+    # Method 1: PE version info (most reliable — reads the embedded version
+    # resource from terminal64.exe without depending on string patterns).
+    _TERM_EXE="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+    _TERM_BUILD=""
+
+    # Method 1a: parse "FileVersion: X.Y.Z.BUILD" from exiftool/file.
+    if [[ -z "${_TERM_BUILD}" ]] && command -v exiftool &>/dev/null; then
+      _TERM_BUILD=$(exiftool -FileVersion "${_TERM_EXE}" 2>/dev/null \
+        | grep -oE '[0-9]+$' || true)
+      [[ -n "${_TERM_BUILD}" ]] && \
+        echo "[mt5-probe] Build detected via exiftool: ${_TERM_BUILD}" >&2
+    fi
+
+    # Method 1b: strings + portable grep (no PCRE needed).
+    #   The binary contains "MetaTrader 5 x64 build NNNN" or "build NNNN".
+    if [[ -z "${_TERM_BUILD}" ]]; then
+      _TERM_BUILD=$(strings "${_TERM_EXE}" 2>/dev/null \
+        | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || true)
+      [[ -n "${_TERM_BUILD}" ]] && \
+        echo "[mt5-probe] Build detected via strings: ${_TERM_BUILD}" >&2
+    fi
+
+    # Method 2: Scan Journal log files for "build NNNN started".
+    if [[ -z "${_TERM_BUILD}" ]]; then
+      _JOURNAL_DIR=""
+      # Check portable data dir first, then AppData hash dirs.
+      for _jd in \
+        "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/Logs" \
+        $(find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+          -mindepth 2 -maxdepth 2 -type d -name "Logs" 2>/dev/null || true); do
+        if [[ -d "${_jd}" ]]; then
+          _JOURNAL_DIR="${_jd}"
+          break
+        fi
+      done
+      if [[ -n "${_JOURNAL_DIR}" ]]; then
+        _TERM_BUILD=$(grep -rhoE 'build [0-9]{4,5}' "${_JOURNAL_DIR}" 2>/dev/null \
+          | tail -1 | sed 's/build //' || true)
+        [[ -n "${_TERM_BUILD}" ]] && \
+          echo "[mt5-probe] Build detected via Journal: ${_TERM_BUILD}" >&2
+      fi
+    fi
+
+    if [[ -z "${_TERM_BUILD}" ]]; then
+      echo "[mt5-probe] WARNING: Could not detect terminal build via any method" >&2
+      echo "[mt5-probe] Files in terminal dir:" >&2
+      ls -la "${_TERM_EXE}" 2>&2 || true
+    fi
+
+    # ── Install matching MetaTrader5 Python package ────────────────────────
     if [[ -n "${_TERM_BUILD}" ]]; then
       _PKG_VER="5.0.${_TERM_BUILD}"
       echo "[mt5-probe] Terminal build=${_TERM_BUILD} → trying MetaTrader5==${_PKG_VER}" >&2
@@ -572,12 +619,38 @@ fi
     fi
     tail -5 "${_PIP_TMP}" >&2 2>/dev/null || true
     rm -f "${_PIP_TMP}" 2>/dev/null || true
+
+    # ── Read installed package version ─────────────────────────────────────
     _VER_TMP="/tmp/mt5-ver-$$"
     WINEDEBUG="-all" timeout 20 "$WINE_CMD" "$FOUND_PYTHON" \
       -c "import MetaTrader5 as m; print(getattr(m,'__version__','?'))" \
       > "${_VER_TMP}" 2>&1 || true
-    echo "[mt5-probe] MetaTrader5 pkg version: $(cat "${_VER_TMP}" 2>/dev/null || echo 'unknown')" >&2
+    _PKG_VER_INSTALLED=$(cat "${_VER_TMP}" 2>/dev/null | tr -d '\r\n' || echo "unknown")
+    echo "[mt5-probe] MetaTrader5 pkg version: ${_PKG_VER_INSTALLED}" >&2
     rm -f "${_VER_TMP}" 2>/dev/null || true
+
+    # ── Build-mismatch guard ───────────────────────────────────────────────
+    # Extract build number from installed package version (e.g. "5.0.5735" → "5735").
+    _PKG_BUILD=$(echo "${_PKG_VER_INSTALLED}" | grep -oE '[0-9]+$' || true)
+    _MISMATCH_FILE="${LOGDIR}/build_mismatch"
+    if [[ -n "${_TERM_BUILD}" ]] && [[ -n "${_PKG_BUILD}" ]] \
+       && [[ "${_TERM_BUILD}" != "${_PKG_BUILD}" ]]; then
+      echo "[mt5-probe] ╔════════════════════════════════════════════════════╗" >&2
+      echo "[mt5-probe] ║  FATAL: TERMINAL / PACKAGE BUILD MISMATCH         ║" >&2
+      echo "[mt5-probe] ║  Terminal build: ${_TERM_BUILD}                          ║" >&2
+      echo "[mt5-probe] ║  Package build:  ${_PKG_BUILD}                          ║" >&2
+      echo "[mt5-probe] ║                                                    ║" >&2
+      echo "[mt5-probe] ║  mt5.initialize() will return -10005 every time.   ║" >&2
+      echo "[mt5-probe] ║  Rebuild the base image with a matching terminal.  ║" >&2
+      echo "[mt5-probe] ╚════════════════════════════════════════════════════╝" >&2
+      echo "terminal=${_TERM_BUILD} package=${_PKG_BUILD}" > "${_MISMATCH_FILE}" 2>/dev/null || true
+    else
+      rm -f "${_MISMATCH_FILE}" 2>/dev/null || true
+      if [[ -n "${_TERM_BUILD}" ]] && [[ -n "${_PKG_BUILD}" ]]; then
+        echo "[mt5-probe] ✓ Builds match: terminal=${_TERM_BUILD} package=${_PKG_BUILD}" >&2
+      fi
+    fi
+
 
     # -----------------------------------------------------------------------
     # TCP Connectivity Gate — replaces the cross-process wine-python probe.
