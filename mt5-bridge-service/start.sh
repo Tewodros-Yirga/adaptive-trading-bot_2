@@ -459,9 +459,49 @@ fi
         _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.1
         _xd key --window "${_wid}" --clearmodifiers Escape
       done
-      # Step 4: Re-press Return (catches Login dialog that appeared during steps 2/3).
-      _xd key Return
+      # Step 4: Enumerate ALL windows owned by the terminal process (including
+      # hidden/embedded child windows not found by --onlyvisible). This catches
+      # the API authorization dialog that the terminal shows when mt5.initialize()
+      # is called — it may not be visible to xdotool --onlyvisible but still
+      # blocks the IPC pump. Log all found windows for diagnostics.
+      if [ "${_try}" -ge 15 ]; then
+        _TERM_PID=$(DISPLAY=:99 xdotool search --onlyvisible --class "explorer.exe" 2>/dev/null \
+          | head -1 || true)
+        # Get all wine-related pids (terminal64.exe is a wine child process)
+        _WINE_PIDS=$(pgrep -f "terminal64" 2>/dev/null | head -5 || true)
+        for _wpid in ${_WINE_PIDS}; do
+          _W_WIDS=$(DISPLAY=:99 xdotool search --pid "${_wpid}" 2>/dev/null || true)
+          for _ww in ${_W_WIDS}; do
+            _wn=$(DISPLAY=:99 xdotool getwindowname "${_ww}" 2>/dev/null || echo "?")
+            # Only log unnamed or auth-looking windows to avoid log spam
+            case "${_wn}" in
+              ""|"?"|\
+              *"Allow"*|*"Deny"*|*"Authorization"*|*"Access"*|\
+              *"Login"*|*"Connect"*)
+                echo "[dismiss-tree] iter=${_try} pid=${_wpid} wid=${_ww} name=${_wn}" \
+                  >> "${DISMISS_LOG}"
+                # Click at center of the window (likely the Allow/OK button area)
+                eval "$(_xd getwindowgeometry --shell "${_ww}" 2>/dev/null || true)"
+                if [ -n "${WIDTH:-}" ] && [ "${WIDTH}" -gt 50 ] 2>/dev/null; then
+                  _cx=$(( X + WIDTH / 2 ))
+                  _cy=$(( Y + HEIGHT * 65 / 100 ))
+                  echo "[dismiss-tree] clicking Allow area at ${_cx},${_cy} wid=${_ww}" \
+                    >> "${DISMISS_LOG}"
+                  _xd windowactivate --sync "${_ww}"; sleep 0.1
+                  _xd mousemove --clearmodifiers "${_cx}" "${_cy}"; sleep 0.05
+                  _xd click 1; sleep 0.05
+                  _xd key --window "${_ww}" --clearmodifiers Return
+                fi
+                ;;
+            esac
+          done
+        done
+      fi
+      # Step 5: Re-press Return on focused window (catches any auth dialog that
+      # gained focus during steps 2-4).
+      _xd key --clearmodifiers Return
       sleep 5
+
     done
   ) &
 

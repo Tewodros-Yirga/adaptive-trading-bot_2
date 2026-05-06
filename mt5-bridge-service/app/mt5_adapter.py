@@ -215,44 +215,39 @@ class MT5Adapter:
                         if context_mode == "portable":
                             creds["portable"] = True
 
-                        # MT5 initialize timeout: 60s is sufficient once the
-                        # terminal is already connected to Exness (no new
-                        # broker auth needed — just IPC pipe open + dialog).
-                        # path= tells the package the exact exe so it computes
-                        # the correct IPC pipe hash (avoids -10005 from
-                        # registry-scan mismatches with build 5833).
-                        _mt5_exe = os.environ.get(
-                            "MT_TERMINAL_EXE",
-                            r"C:\Program Files\MetaTrader 5\terminal64.exe",
-                        ).replace("/opt/wineprefix/drive_c/", "C:\\").replace("/", "\\")
-
                         ok = False
                         last_init_error = "unknown"
 
-                        # Strategy 1: credentialed + explicit path.
+                        # Strategy 1: bare attach — no credentials, no path.
+                        # The pre-baked AppData session should let the terminal
+                        # accept IPC without showing an authorization dialog.
+                        # This is tried first because it avoids all dialog
+                        # interactions and is fastest when the session is valid.
                         for init_attempt in range(1, 3):
-                            ok = client.initialize(**creds, path=_mt5_exe, timeout=60000)
+                            ok = client.initialize(timeout=30000)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
                             last_init_error = str(err)
                             err_class = self._classify_error_text(last_init_error)
                             if err_class == "ipc_timeout" and init_attempt < 2:
-                                time.sleep(5)
+                                time.sleep(3)
                                 continue
                             break
 
-                        # Strategy 2: bare attach — no credentials.
+                        # Strategy 2: credentialed (no path= to avoid second
+                        # terminal launch).  Triggers the API auth dialog;
+                        # the dismiss loop presses Return/Allow every 5 s.
                         if not ok:
                             for init_attempt in range(1, 3):
-                                ok = client.initialize(timeout=30000)
+                                ok = client.initialize(**creds, timeout=60000)
                                 if ok:
                                     break
                                 err = client.last_error() if hasattr(client, "last_error") else "unknown"
                                 last_init_error = str(err)
                                 err_class = self._classify_error_text(last_init_error)
                                 if err_class == "ipc_timeout" and init_attempt < 2:
-                                    time.sleep(2 + random.random())
+                                    time.sleep(5)
                                     continue
                                 break
 
