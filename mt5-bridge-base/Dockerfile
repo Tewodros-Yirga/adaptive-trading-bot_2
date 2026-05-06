@@ -332,42 +332,82 @@ RUN set -eux; \
     # overwrites it (healthy startup rewrites it from ~300B to >1KB).
     PRE_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
     \
-    # Wait up to 120s for terminal to complete initialization.
-    # Success conditions (any one is sufficient):
-    #   1. terminal.ini grew beyond pre-written size (terminal rewrote it)
-    #   2. Recursive file count > 50 (pre-packaged ZIP — MQL5/ data already present)
-    #   3. MQL5/Experts directory exists anywhere under TERM_DIR
-    echo "Waiting for portable init (up to 120 s)..."; \
-    INIT_WAITED=0; \
-    while [ "${INIT_WAITED}" -lt 120 ]; do \
-      CUR_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
-      PFILES=$(find "${TERM_DIR}" -type f 2>/dev/null | wc -l) || PFILES=0; \
-      echo "Waiting for portable init (${INIT_WAITED}s, total_files=${PFILES}, tini=${CUR_TINI_SIZE}B)..."; \
-      if [ "${CUR_TINI_SIZE}" -gt "${PRE_TINI_SIZE}" ]; then \
-        echo "terminal.ini grown: ${PRE_TINI_SIZE}->${CUR_TINI_SIZE} bytes after ${INIT_WAITED}s"; \
-        break; \
-      fi; \
-      if [ "${PFILES}" -gt 50 ]; then \
-        echo "${PFILES} files present after ${INIT_WAITED}s — pre-packaged ZIP detected, init complete"; \
-        break; \
-      fi; \
-      if find "${TERM_DIR}" -name "Experts" -type d 2>/dev/null | grep -q .; then \
-        echo "MQL5/Experts dir found after ${INIT_WAITED}s — portable init done"; \
-        break; \
-      fi; \
-      sleep 5; \
-      INIT_WAITED=$(( INIT_WAITED + 5 )); \
-    done; \
-    kill "${DISMISS_PID}" 2>/dev/null || true; \
+    # ── PHASE 1: Detect pre-packaged ZIP (instant) ──────────────────────
+    # With the pre-packaged portable ZIP all 599+ files are already present.
+    # Detect this immediately so we can move to Phase 2.
+    echo "Phase 1: Checking for pre-packaged installation..."; \
+    PFILES=$(find "${TERM_DIR}" -type f 2>/dev/null | wc -l) || PFILES=0; \
+    echo "Found ${PFILES} files in install dir."; \
+    if [ "${PFILES}" -lt 50 ]; then \
+      echo "Waiting for terminal to extract MQL5 data (up to 120s)..."; \
+      INIT_WAITED=0; \
+      while [ "${INIT_WAITED}" -lt 120 ]; do \
+        CUR_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
+        PFILES=$(find "${TERM_DIR}" -type f 2>/dev/null | wc -l) || PFILES=0; \
+        echo "  ${INIT_WAITED}s: files=${PFILES} tini=${CUR_TINI_SIZE}B"; \
+        if [ "${PFILES}" -gt 50 ]; then break; fi; \
+        if [ "${CUR_TINI_SIZE}" -gt "${PRE_TINI_SIZE}" ]; then break; fi; \
+        sleep 5; \
+        INIT_WAITED=$(( INIT_WAITED + 5 )); \
+      done; \
+    fi; \
+    echo "Phase 1 done: ${PFILES} files present."; \
     \
-    # Extra settle time for config dirs to flush. \
-    sleep 10; \
+    # ── PHASE 2: Let terminal complete its self-restart cycle ─────────
+    # MT5 always self-restarts once after first launch to build internal
+    # caches (MQL5 compilation, symbol DB, etc). If we kill it before
+    # this completes, it will self-restart at RUNTIME → crash → black
+    # screen → IPC timeout.
+    #
+    # Strategy: let the terminal run for 90s total. Monitor for the
+    # self-restart (original PID exits, new PID appears). After the
+    # restart, give it 30s to stabilize. Then bake the warm image.
+    echo "Phase 2: Letting terminal complete self-restart cycle (90s)..."; \
+    WARMUP_TOTAL=90; \
+    WARMUP_WAITED=0; \
+    RESTART_DETECTED=false; \
+    while [ "${WARMUP_WAITED}" -lt "${WARMUP_TOTAL}" ]; do \
+      # Check if original terminal PID is still alive. \
+      if kill -0 "${TERM_PID}" 2>/dev/null; then \
+        echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} alive"; \
+      else \
+        if [ "${RESTART_DETECTED}" = "false" ]; then \
+          echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} exited — checking for self-restart..."; \
+          NEW_PID=$(pgrep -f 'terminal64.exe' 2>/dev/null | head -1) || true; \
+          if [ -n "${NEW_PID}" ]; then \
+            echo "  Self-restart detected: new PID ${NEW_PID}"; \
+            TERM_PID="${NEW_PID}"; \
+            RESTART_DETECTED=true; \
+          else \
+            echo "  No new terminal PID found — terminal exited cleanly (no restart needed)"; \
+            break; \
+          fi; \
+        else \
+          echo "  ${WARMUP_WAITED}s: restarted terminal also exited — warmup done"; \
+          break; \
+        fi; \
+      fi; \
+      sleep 10; \
+      WARMUP_WAITED=$(( WARMUP_WAITED + 10 )); \
+    done; \
+    echo "Phase 2 done after ${WARMUP_WAITED}s (restart_detected=${RESTART_DETECTED})."; \
+    \
+    # Take a snapshot of what terminal.ini looks like now. \
+    FINAL_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
+    FINAL_FILES=$(find "${TERM_DIR}" -type f 2>/dev/null | wc -l) || FINAL_FILES=0; \
+    echo "Post-warmup: files=${FINAL_FILES} terminal.ini=${FINAL_TINI_SIZE}B (was ${PRE_TINI_SIZE}B)"; \
+    \
+    kill "${DISMISS_PID}" 2>/dev/null || true; \
     \
     # Ensure [Experts] section is in terminal.ini. \
     grep -q '\[Experts\]' "${TERM_DIR}/terminal.ini" 2>/dev/null \
       || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
            >> "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
-    echo "Patched portable terminal.ini with [Experts]"; \
+    # Ensure [LiveUpdate] Enabled=0 survives terminal rewrite. \
+    grep -q '\[LiveUpdate\]' "${TERM_DIR}/terminal.ini" 2>/dev/null \
+      || printf '\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
+           >> "${TERM_DIR}/terminal.ini" 2>/dev/null || true; \
+    echo "Patched portable terminal.ini with [Experts]+[LiveUpdate]"; \
     \
     # Mirror config into AppData hash dirs for non-portable runtime. \
     find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
@@ -381,7 +421,6 @@ RUN set -eux; \
           grep -q '\[Experts\]' "${_hdir}/terminal.ini" 2>/dev/null \
             || printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
                  >> "${_hdir}/terminal.ini" 2>/dev/null || true; \
-          # Also add LiveUpdate=0 to suppress update dialog in AppData hash dirs. \
           grep -q '\[LiveUpdate\]' "${_hdir}/terminal.ini" 2>/dev/null \
             || printf '\r\n[LiveUpdate]\r\nEnabled=0\r\nNextUpdate=9999999999\r\n' \
                  >> "${_hdir}/terminal.ini" 2>/dev/null || true; \
@@ -398,12 +437,16 @@ RUN set -eux; \
     wine reg add "HKCU\\Software\\MetaQuotes\\Terminal5\\Settings" \
       /v "LiveUpdate" /t REG_DWORD /d 0 /f 2>/dev/null || true; \
     \
-    echo "=== Install dir files ==="; \
+    echo "=== Install dir files (top-level) ==="; \
     find "${TERM_DIR}" -maxdepth 1 -type f 2>/dev/null | head -20 || true; \
+    echo "=== MQL5 directory structure ==="; \
+    find "${TERM_DIR}/MQL5" -maxdepth 2 -type d 2>/dev/null | head -30 || true; \
     echo "=== AppData dirs ==="; \
     find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes" \
       -maxdepth 4 -type d 2>/dev/null | head -20 || true; \
     \
+    # Kill ALL terminal processes (original + any self-restarted children). \
+    pkill -f 'terminal64.exe' 2>/dev/null || true; \
     kill "${TERM_PID}" 2>/dev/null || true; \
     sleep 5; \
     wineserver -k 2>/dev/null || true; \
