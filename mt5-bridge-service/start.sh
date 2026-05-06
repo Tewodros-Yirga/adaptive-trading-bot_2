@@ -217,12 +217,9 @@ if command -v wine > /dev/null 2>&1; then
 
     if [[ "$MT5LINUX_PORT_OPEN" == "true" ]]; then
       echo "[mt5linux-launcher] mt5linux RPyC port is OPEN on 127.0.0.1:18812"
-      # Write ipc_ready directly — this is the definitive signal.
-      # The TCP gate may have already timed out (ipc_failed); clear it and set ready.
-      rm -f "${LOGDIR}/mt5_ipc.failed" 2>/dev/null || true
-      echo "ready: mt5linux_port_open" > "${LOGDIR}/mt5_ipc.status" 2>/dev/null || true
-      touch "${LOGDIR}/mt5_ipc.ready" 2>/dev/null || true
-      echo "[mt5linux-launcher] mt5_ipc.ready written — adapter cleared to connect."
+      # Do NOT write mt5_ipc.ready here — the TCP gate (terminal launcher subshell)
+      # is the sole writer. It enforces a grace period after terminal self-restart
+      # before signalling the adapter, preventing -10003 (terminal not found).
     else
       echo "[mt5linux-launcher] mt5linux RPyC port is NOT open on 127.0.0.1:18812" >&2
       echo "=== bootstrap-mt5.log (last 200 lines) ===" >&2
@@ -715,6 +712,7 @@ fi
     TCP_GATE_PASSED=false
     TCP_WAITED=0
     TCP_MAX=600   # 10 minutes max
+    TERMINAL_STABLE_AFTER=0  # grace period: gate can only pass once TCP_WAITED >= this
 
     while (( TCP_WAITED < TCP_MAX )); do
       # Crash / self-restart guard.
@@ -724,6 +722,10 @@ fi
         if [[ -n "${NEW_TERM_PID}" ]] && [[ "${NEW_TERM_PID}" != "${TERMINAL_PID}" ]]; then
           echo "[mt5-probe] New terminal PID detected: ${NEW_TERM_PID} (self-restart after update)" >&2
           TERMINAL_PID="${NEW_TERM_PID}"
+          # Enforce 30s grace period before gate can pass — terminal needs time
+          # to set up its IPC named pipes after restarting.
+          TERMINAL_STABLE_AFTER=$(( TCP_WAITED + 30 ))
+          echo "[mt5-probe] Grace period: gate will not pass until ${TERMINAL_STABLE_AFTER}s elapsed" >&2
         else
           echo "[mt5-probe] FATAL: terminal exited and did not restart." >&2
           echo "failed: terminal_exited_during_tcp_gate elapsed=${TCP_WAITED}s" \
@@ -762,11 +764,15 @@ fi
       _log_ws "tcp_gate_${TCP_WAITED}s"
 
       if (( MT5LINUX_PORT > 0 )) || (( ESTABLISHED > 0 )); then
-        echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s)"
-        { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
-          >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-        TCP_GATE_PASSED=true
-        break
+        if (( TCP_WAITED < TERMINAL_STABLE_AFTER )); then
+          echo "[mt5-probe] TCP gate ready but in grace period (${TCP_WAITED}s < ${TERMINAL_STABLE_AFTER}s) — waiting for terminal to stabilize" >&2
+        else
+          echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s)"
+          { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
+            >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+          TCP_GATE_PASSED=true
+          break
+        fi
       fi
 
       sleep 10
