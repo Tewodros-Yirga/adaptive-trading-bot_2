@@ -742,19 +742,64 @@ fi
     IPC_PIPES_LAST_EVIDENCE=""
     IPC_PIPES_LAST_PRESENT=false
 
+    # Optional extra logging to debug Wine named-pipe listing output.
+    # Enable with:
+    #   MT5_IPC_PIPE_DEBUG=1
+    # and adjust how many gate-checks we capture with:
+    #   MT5_IPC_PIPE_DEBUG_TRIES=4
+    IPC_PIPE_DEBUG="${MT5_IPC_PIPE_DEBUG:-0}"
+    IPC_PIPE_DEBUG_TRIES="${MT5_IPC_PIPE_DEBUG_TRIES:-4}"
+    IPC_PIPE_DEBUG_CHECKS=0
+
     _wine_has_mt5_pipes() {
       # Query Wine's pipe namespace (does not rely on Windows IPC attach).
       # We match only the presence of MT5-family pipes to avoid false positives.
-      local _out _ev
+      local _out _ev _tier_a
+
+      # Try a bare pipe listing first; it tends to have a simpler output.
       # Use single quotes to avoid backslash-escaping pitfalls in bash.
-      _out="$(timeout 8s wine cmd /c 'dir \\.\pipe\\' 2>/dev/null || true)"
-      # Evidence: first relevant line containing known MT5 keywords.
-      _ev="$(echo "${_out}" | grep -Ei 'metatrader|metaquotes|mt5|terminal' | head -n 1 | tr -d '\r' || true)"
-      if [[ -n "${_ev}" ]]; then
-        IPC_PIPES_LAST_EVIDENCE="${_ev}"
+      _out="$(timeout 8s wine cmd /c 'dir /b \\.\pipe\\' 2>/dev/null || true)"
+      # If /b produced nothing, fall back to full `dir`.
+      if [[ -z "${_out//[[:space:]]/}" ]]; then
+        _out="$(timeout 8s wine cmd /c 'dir \\.\pipe\\' 2>/dev/null || true)"
+      fi
+
+      # Normalise CRLF.
+      _out="$(echo "${_out}" | tr -d '\r' || true)"
+
+      # Debug logging: capture raw listing for early gate checks.
+      if [[ "${IPC_PIPE_DEBUG}" == "1" ]] && (( IPC_PIPE_DEBUG_CHECKS < IPC_PIPE_DEBUG_TRIES )); then
+        IPC_PIPE_DEBUG_CHECKS=$(( IPC_PIPE_DEBUG_CHECKS + 1 ))
+        {
+          echo "[mt5-probe][ipc-pipe-debug] check=${IPC_PIPE_DEBUG_CHECKS}/${IPC_PIPE_DEBUG_TRIES}"
+          echo "[mt5-probe][ipc-pipe-debug] raw_out_begin"
+          echo "${_out}" | head -n 60
+          echo "[mt5-probe][ipc-pipe-debug] raw_out_end"
+        } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+      fi
+
+      # Tier A: accept if we can find any non-empty pipe entry line (from `dir /b`),
+      # which usually returns one pipe name per line.
+      _tier_a="$(
+        echo "${_out}" \
+          | grep -vE 'File Not Found|cannot find|cannot open|Access is denied|The system cannot find' \
+          | grep -E '^[[:alnum:]_.-]+$' \
+          | head -n 1 || true
+      )"
+      if [[ -n "${_tier_a}" ]]; then
+        IPC_PIPES_LAST_EVIDENCE="pipe_entry_present: ${_tier_a}"
         IPC_PIPES_LAST_PRESENT=true
         return 0
       fi
+
+      # Tier B: keyword heuristic as additional evidence.
+      _ev="$(echo "${_out}" | grep -Ei 'metatrader|metaquotes|mt5|terminal' | head -n 1 || true)"
+      if [[ -n "${_ev}" ]]; then
+        IPC_PIPES_LAST_EVIDENCE="keyword_evidence: ${_ev}"
+        IPC_PIPES_LAST_PRESENT=true
+        return 0
+      fi
+
       IPC_PIPES_LAST_EVIDENCE=""
       IPC_PIPES_LAST_PRESENT=false
       return 1
