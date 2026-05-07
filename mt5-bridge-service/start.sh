@@ -820,15 +820,28 @@ fi
       return 1
     }
 
+    _FUNCTIONAL_LAST_ERR=""
+    _FUNCTIONAL_LAST_OUT=""
+
     _functional_mt5_probe() {
       # The ONLY definitive test of IPC readiness: call mt5.initialize() from
       # inside Wine (same wineserver as terminal).  If this returns True, the
       # terminal's IPC backend is alive and serving, regardless of whether
-      # `dir \\.|\pipe\` shows anything.
-      local _out _ok_line
+      # `dir \.\|\pipe\` shows anything.
+      local _out _ok_line _err_line _term_linux_path _term_wine_path
       if [[ -z "${FOUND_PYTHON:-}" ]] || [[ ! -f "${FOUND_PYTHON}" ]]; then
         return 1
       fi
+      # Resolve terminal path the same way mt5_adapter.py does.
+      _term_linux_path="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+      # Convert to Windows path for MetaTrader5 package (expects C:\ style).
+      _term_wine_path="C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+      if [[ -n "${WINEPREFIX}" ]]; then
+        _term_wine_path="${_term_linux_path#${WINEPREFIX}/drive_c/}"
+        _term_wine_path="C:\\\\${_term_wine_path////\\\\}"
+      fi
+
+      # Attempt 1: bare initialize (no path) — matches natural AppData discovery.
       _out="$(timeout 25s wine "${FOUND_PYTHON}" -c "
 import MetaTrader5 as mt5
 ok = mt5.initialize(timeout=15000)
@@ -836,8 +849,31 @@ err = mt5.last_error()
 mt5.shutdown()
 print(f'FUNCTIONAL_OK={ok}')
 print(f'FUNCTIONAL_ERR={err}')
+print(f'FUNCTIONAL_MODE=bare')
 " 2>/dev/null || true)"
+      _FUNCTIONAL_LAST_OUT="${_out}"
       _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False)' | head -1 || true)"
+      _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
+      _FUNCTIONAL_LAST_ERR="${_err_line}"
+      if echo "${_ok_line}" | grep -q 'FUNCTIONAL_OK=True'; then
+        return 0
+      fi
+
+      # Attempt 2: explicit path — if bare attach fails with terminal_not_found
+      # (-10003) the terminal may need a path hint even in default mode.
+      _out="$(timeout 25s wine "${FOUND_PYTHON}" -c "
+import MetaTrader5 as mt5
+ok = mt5.initialize(path=r'${_term_wine_path}', timeout=15000)
+err = mt5.last_error()
+mt5.shutdown()
+print(f'FUNCTIONAL_OK={ok}')
+print(f'FUNCTIONAL_ERR={err}')
+print(f'FUNCTIONAL_MODE=path')
+" 2>/dev/null || true)"
+      _FUNCTIONAL_LAST_OUT="${_out}"
+      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False)' | head -1 || true)"
+      _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
+      _FUNCTIONAL_LAST_ERR="${_err_line}"
       if echo "${_ok_line}" | grep -q 'FUNCTIONAL_OK=True'; then
         return 0
       fi
@@ -987,9 +1023,9 @@ print(f'FUNCTIONAL_ERR={err}')
             break
           else
             if [[ "${_FUNCTIONAL_READY}" != "true" ]] && [[ "${_PIPE_READY}" != "true" ]]; then
-              echo "[mt5-probe] TCP gate soft-ready but MT5 IPC not attachable yet — functional_probe=fail, pipes=missing (required_hints=${IPC_PIPES_REQUIRED_HITS})" >&2
+              echo "[mt5-probe] TCP gate soft-ready but MT5 IPC not attachable yet — functional_probe=fail (${_FUNCTIONAL_LAST_ERR:-unknown}), pipes=missing (required_hints=${IPC_PIPES_REQUIRED_HITS})" >&2
             elif [[ "${_FUNCTIONAL_READY}" != "true" ]]; then
-              echo "[mt5-probe] TCP gate soft-ready but functional probe still failing — waiting (pipes_ok, required_hits=${IPC_PIPES_REQUIRED_HITS})" >&2
+              echo "[mt5-probe] TCP gate soft-ready but functional probe still failing (${_FUNCTIONAL_LAST_ERR:-unknown}) — waiting (pipes_ok, required_hits=${IPC_PIPES_REQUIRED_HITS})" >&2
             fi
           fi
         fi
@@ -1052,6 +1088,32 @@ print(f'FUNCTIONAL_ERR={err}')
           tail -n 40 "${WINESERVER_TIMELINE}" 2>/dev/null || true
           echo "=== terminal.log tail ==="
           tail -n 100 "${LOGDIR}/mt5-terminal.log" 2>/dev/null || true
+          echo "=== MT5 Terminal Logs (AppData) ==="
+          _MT5_LOG_DIR=""
+          for _ld in \
+            "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+            "${WINEPREFIX}/drive_c/users/wineuser/AppData/Roaming/MetaQuotes/Terminal"; do
+            if [[ -d "${_ld}" ]]; then
+              _MT5_LOG_DIR="${_ld}"
+              break
+            fi
+          done
+          if [[ -n "${_MT5_LOG_DIR}" ]]; then
+            find "${_MT5_LOG_DIR}" -maxdepth 3 -name "*.log" -newer "${IPC_PROBE_LOG}" 2>/dev/null | while IFS= read -r _lf; do
+              echo "--- ${_lf} ---"
+              tail -n 50 "${_lf}" 2>/dev/null || true
+            done
+            echo "--- terminal.ini ---"
+            find "${_MT5_LOG_DIR}" -maxdepth 3 -name "terminal.ini" -exec cat {} \; 2>/dev/null || true
+          fi
+          echo "=== Screenshot (X11 display) ==="
+          if command -v import &>/dev/null; then
+            import -window root -format png "${LOGDIR}/screenshot-gate-timeout.png" 2>/dev/null && echo "screenshot saved: ${LOGDIR}/screenshot-gate-timeout.png" || echo "screenshot failed"
+          elif command -v xwd &>/dev/null; then
+            DISPLAY="${DISPLAY}" xwd -root -out "${LOGDIR}/screenshot-gate-timeout.xwd" 2>/dev/null && echo "screenshot saved: ${LOGDIR}/screenshot-gate-timeout.xwd" || echo "screenshot failed"
+          else
+            echo "no screenshot tool available (install imagemagick or x11-apps)"
+          fi
         } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
         touch "${IPC_FAILED_FILE}" 2>/dev/null || true
       fi
