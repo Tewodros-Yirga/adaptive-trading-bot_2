@@ -108,8 +108,12 @@ Root cause: terminal PID tracking reused one variable for both child PID (`$!`) 
 
 ## Runtime Readiness Contract (Current)
 
-- Primary readiness path is TCP-based (`mt5linux` + stabilization checks).
+- Primary readiness path is TCP-based (`mt5linux` + stabilization checks), but `mt5_ipc.ready` is written only after MT5 IPC named pipes are visible inside Wine (`ipc_pipes=present`).
 - Visible MT5 X11 windows are optional by default in headless deployments.
+- Portable context is now deterministic:
+  - auto-forcing `MT5_CONTEXT_MODE=portable` when `terminal.ini` exists is disabled by default,
+  - default AppData (`MT5_CONTEXT_MODE=default`) is preferred,
+  - to force portable explicitly, set `MT5_CONTEXT_MODE=portable` or `MT5_FORCE_PORTABLE_IF_TERMINAL_INI=true`.
 - To force UI-backed readiness during interactive debugging, set:
   - `MT5_REQUIRE_X11_WINDOW=1`.
 
@@ -117,11 +121,11 @@ Root cause: terminal PID tracking reused one variable for both child PID (`$!`) 
 
 1. `/debug/mt5`:
    - ensure `mt5_ipc.ready` is created,
-   - confirm status line contains `ready: tcp_connected ... mode=...`.
+   - confirm status line contains `ready: tcp_connected ... ipc_pipes=present`.
 2. `/debug/screenshot`:
    - black screenshot is no longer a blocker by itself when mode is `headless_tcp_no_x11`.
 3. `/debug/pipes`:
-   - capture for diagnostics, but do not require as readiness gate criterion.
+   - capture for diagnostics; during readiness, MT5-relevant pipes should be present in Wine.
 4. First adapter `mt5.initialize()` call:
    - verify connection succeeds without waiting for visible UI windows.
 5. Startup log lifecycle section:
@@ -131,6 +135,7 @@ Root cause: terminal PID tracking reused one variable for both child PID (`$!`) 
 ## Files Touched in This Workstream
 
 - `mt5-bridge-service/start.sh`
+- `mt5-bridge-service/app/mt5_adapter.py`
 - `scripts/init-mt5-portable.ps1`
 - `scripts/package-mt5-portable.ps1`
 - `mt5-bridge-base/Dockerfile`
