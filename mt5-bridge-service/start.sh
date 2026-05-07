@@ -436,6 +436,20 @@ fi
       _ACTIVE_WID=$(_xd getactivewindow 2>/dev/null || echo "none")
       _ACTIVE_NAME=$(DISPLAY=:99 xdotool getwindowname "${_ACTIVE_WID}" 2>/dev/null || echo "?")
       echo "[dismiss-heartbeat] iter=${_try} focus=${_ACTIVE_WID}(${_ACTIVE_NAME})" >> "${DISMISS_LOG}"
+      # If the active window is unnamed (common for Wine splash screens,
+      # loading dialogs, or early MT5 windows before title is set), try
+      # aggressive dismissal: Tab+Return, Escape, and click center.
+      if [[ "${_ACTIVE_NAME}" == "?" ]] && [[ "${_ACTIVE_WID}" != "none" ]]; then
+        _xd windowactivate --sync "${_ACTIVE_WID}" 2>/dev/null || true
+        _xd key --window "${_ACTIVE_WID}" --clearmodifiers Tab Return 2>/dev/null || true
+        sleep 0.2
+        _xd key --window "${_ACTIVE_WID}" --clearmodifiers Escape 2>/dev/null || true
+        sleep 0.2
+        # Click center of screen (common OK/Allow button area on 1280x720)
+        _xd mousemove --clearmodifiers 640 360 2>/dev/null || true
+        _xd click 1 2>/dev/null || true
+        echo "[dismiss-action] iter=${_try} aggressive-dismiss unnamed wid=${_ACTIVE_WID} (Tab+Return, Escape, center-click)" >> "${DISMISS_LOG}"
+      fi
       # Step 2: LiveUpdate dialogs (including UAC elevation prompt).
       # "Updating MetaTrader 5" = Wine UAC/admin dialog — click CANCEL.
       for _wid in $({ _xd search --onlyvisible --name "Updating MetaTrader"
@@ -822,16 +836,19 @@ fi
 
     _FUNCTIONAL_LAST_ERR=""
     _FUNCTIONAL_LAST_OUT=""
+    _FUNCTIONAL_LAST_STDERR=""
 
     _functional_mt5_probe() {
       # The ONLY definitive test of IPC readiness: call mt5.initialize() from
       # inside Wine (same wineserver as terminal).  If this returns True, the
       # terminal's IPC backend is alive and serving, regardless of whether
       # `dir \.\|\pipe\` shows anything.
-      local _out _ok_line _err_line _term_linux_path _term_wine_path
+      local _out _ok_line _err_line _stderr_file _term_linux_path _term_wine_path
       if [[ -z "${FOUND_PYTHON:-}" ]] || [[ ! -f "${FOUND_PYTHON}" ]]; then
+        _FUNCTIONAL_LAST_ERR="FUNCTIONAL_ERR=(no_python, 'FOUND_PYTHON not set')"
         return 1
       fi
+      _stderr_file="/tmp/mt5-functional-stderr-$$"
       # Resolve terminal path the same way mt5_adapter.py does.
       _term_linux_path="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
       # Convert to Windows path for MetaTrader5 package (expects C:\ style).
@@ -842,39 +859,53 @@ fi
       fi
 
       # Attempt 1: bare initialize (no path) — matches natural AppData discovery.
-      _out="$(timeout 25s wine "${FOUND_PYTHON}" -c "
-import MetaTrader5 as mt5
+      # Use python -u (unbuffered) and explicit sys.stdout.flush() so we
+      # capture output even if timeout kills the process.
+      _out="$(timeout 25s wine "${FOUND_PYTHON}" -u -c "
+import sys, MetaTrader5 as mt5
 ok = mt5.initialize(timeout=15000)
 err = mt5.last_error()
-mt5.shutdown()
+try:
+    mt5.shutdown()
+except Exception:
+    pass
 print(f'FUNCTIONAL_OK={ok}')
 print(f'FUNCTIONAL_ERR={err}')
 print(f'FUNCTIONAL_MODE=bare')
-" 2>/dev/null || true)"
+sys.stdout.flush()
+" 2>"${_stderr_file}" || true)"
       _FUNCTIONAL_LAST_OUT="${_out}"
-      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False)' | head -1 || true)"
+      _FUNCTIONAL_LAST_STDERR="$(cat "${_stderr_file}" 2>/dev/null | head -c 4096 || true)"
+      rm -f "${_stderr_file}" 2>/dev/null || true
+      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False|None)' | head -1 || true)"
       _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
       _FUNCTIONAL_LAST_ERR="${_err_line}"
-      if echo "${_ok_line}" | grep -q 'FUNCTIONAL_OK=True'; then
+      if echo "${_ok_line}" | grep -qE 'FUNCTIONAL_OK=(True|None)'; then
         return 0
       fi
 
       # Attempt 2: explicit path — if bare attach fails with terminal_not_found
       # (-10003) the terminal may need a path hint even in default mode.
-      _out="$(timeout 25s wine "${FOUND_PYTHON}" -c "
-import MetaTrader5 as mt5
+      _out="$(timeout 25s wine "${FOUND_PYTHON}" -u -c "
+import sys, MetaTrader5 as mt5
 ok = mt5.initialize(path=r'${_term_wine_path}', timeout=15000)
 err = mt5.last_error()
-mt5.shutdown()
+try:
+    mt5.shutdown()
+except Exception:
+    pass
 print(f'FUNCTIONAL_OK={ok}')
 print(f'FUNCTIONAL_ERR={err}')
 print(f'FUNCTIONAL_MODE=path')
-" 2>/dev/null || true)"
+sys.stdout.flush()
+" 2>"${_stderr_file}" || true)"
       _FUNCTIONAL_LAST_OUT="${_out}"
-      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False)' | head -1 || true)"
+      _FUNCTIONAL_LAST_STDERR="$(cat "${_stderr_file}" 2>/dev/null | head -c 4096 || true)"
+      rm -f "${_stderr_file}" 2>/dev/null || true
+      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False|None)' | head -1 || true)"
       _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
       _FUNCTIONAL_LAST_ERR="${_err_line}"
-      if echo "${_ok_line}" | grep -q 'FUNCTIONAL_OK=True'; then
+      if echo "${_ok_line}" | grep -qE 'FUNCTIONAL_OK=(True|None)'; then
         return 0
       fi
       return 1
@@ -1023,9 +1054,9 @@ print(f'FUNCTIONAL_MODE=path')
             break
           else
             if [[ "${_FUNCTIONAL_READY}" != "true" ]] && [[ "${_PIPE_READY}" != "true" ]]; then
-              echo "[mt5-probe] TCP gate soft-ready but MT5 IPC not attachable yet — functional_probe=fail (${_FUNCTIONAL_LAST_ERR:-unknown}), pipes=missing (required_hints=${IPC_PIPES_REQUIRED_HITS})" >&2
+              echo "[mt5-probe] TCP gate soft-ready but MT5 IPC not attachable yet — functional_probe=fail (${_FUNCTIONAL_LAST_ERR:-unknown}) stderr='${_FUNCTIONAL_LAST_STDERR:-}' pipes=missing (required_hints=${IPC_PIPES_REQUIRED_HITS})" >&2
             elif [[ "${_FUNCTIONAL_READY}" != "true" ]]; then
-              echo "[mt5-probe] TCP gate soft-ready but functional probe still failing (${_FUNCTIONAL_LAST_ERR:-unknown}) — waiting (pipes_ok, required_hits=${IPC_PIPES_REQUIRED_HITS})" >&2
+              echo "[mt5-probe] TCP gate soft-ready but functional probe still failing (${_FUNCTIONAL_LAST_ERR:-unknown}) stderr='${_FUNCTIONAL_LAST_STDERR:-}' — waiting (pipes_ok, required_hits=${IPC_PIPES_REQUIRED_HITS})" >&2
             fi
           fi
         fi
