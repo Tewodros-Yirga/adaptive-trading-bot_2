@@ -397,9 +397,10 @@ fi
       /config:"C:\\mt5-headless.ini" \
       "${CONTEXT_ARGS[@]}" \
       > "${LOGDIR}/mt5-terminal.log" 2>&1 &
-    TERMINAL_PID=$!
-    echo "[mt5-terminal] terminal pid=${TERMINAL_PID}"
-    _log_ws "terminal_launch_pid_${TERMINAL_PID}"
+    TERMINAL_CHILD_PID=$!
+    TERMINAL_RUNTIME_PID="${TERMINAL_CHILD_PID}"
+    echo "[mt5-terminal] terminal pid=${TERMINAL_RUNTIME_PID} (child_pid=${TERMINAL_CHILD_PID})"
+    _log_ws "terminal_launch_pid_${TERMINAL_RUNTIME_PID}"
   }
   _launch_terminal
   LAST_WS_PIDS="$(_ws_pids)"
@@ -737,12 +738,15 @@ fi
 
     while (( TCP_WAITED < TCP_MAX )); do
       # Crash / self-restart guard.
-      if ! kill -0 "${TERMINAL_PID}" 2>/dev/null; then
-        echo "[mt5-probe] terminal64.exe (PID ${TERMINAL_PID}) has exited" >&2
+      if ! kill -0 "${TERMINAL_RUNTIME_PID}" 2>/dev/null; then
+        echo "[mt5-probe] terminal64.exe (PID ${TERMINAL_RUNTIME_PID}) has exited" >&2
         NEW_TERM_PID=$(pgrep -f 'terminal64.exe' 2>/dev/null | head -1) || true
-        if [[ -n "${NEW_TERM_PID}" ]] && [[ "${NEW_TERM_PID}" != "${TERMINAL_PID}" ]]; then
+        if [[ -n "${NEW_TERM_PID}" ]] && [[ "${NEW_TERM_PID}" != "${TERMINAL_RUNTIME_PID}" ]]; then
           echo "[mt5-probe] New terminal PID detected: ${NEW_TERM_PID} (self-restart after update)" >&2
-          TERMINAL_PID="${NEW_TERM_PID}"
+          TERMINAL_RUNTIME_PID="${NEW_TERM_PID}"
+          if [[ -n "${TERMINAL_CHILD_PID:-}" ]] && [[ "${TERMINAL_RUNTIME_PID}" != "${TERMINAL_CHILD_PID}" ]]; then
+            echo "[mt5-probe] Terminal PID moved to adopted process (runtime_pid=${TERMINAL_RUNTIME_PID}, child_pid=${TERMINAL_CHILD_PID})" >&2
+          fi
           # Enforce 30s grace period before gate can pass — terminal needs time
           # to set up its IPC named pipes after restarting.
           TERMINAL_STABLE_AFTER=$(( TCP_WAITED + 30 ))
@@ -785,8 +789,8 @@ fi
             DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || true
           done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
       _TERM_WINDOWS=0
-      if [[ -n "${TERMINAL_PID:-}" ]]; then
-        _TERM_WINDOWS=$(DISPLAY="${DISPLAY}" xdotool search --pid "${TERMINAL_PID}" 2>/dev/null | wc -l || echo 0)
+      if [[ -n "${TERMINAL_RUNTIME_PID:-}" ]]; then
+        _TERM_WINDOWS=$(DISPLAY="${DISPLAY}" xdotool search --pid "${TERMINAL_RUNTIME_PID}" 2>/dev/null | wc -l || echo 0)
       fi
 
       { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} mt5linux_port=${MT5LINUX_PORT} mt5linux_port_stable_for=${MT5LINUX_PORT_STABLE_FOR}s term_windows=${_TERM_WINDOWS} windows=${_WIN_SNAP:-none}"; } \
@@ -805,7 +809,7 @@ fi
         elif (( MT5LINUX_PORT_STABLE_FOR < MT5LINUX_PORT_STABLE_REQUIRED )); then
           echo "[mt5-probe] TCP gate ready but mt5linux port not stable yet (${MT5LINUX_PORT_STABLE_FOR}s < ${MT5LINUX_PORT_STABLE_REQUIRED}s) — waiting" >&2
         elif (( _X11_WINDOW_READY == 0 )); then
-          echo "[mt5-probe] TCP gate ready but terminal has no X11 windows yet (pid=${TERMINAL_PID}) and MT5_REQUIRE_X11_WINDOW=1 — waiting" >&2
+          echo "[mt5-probe] TCP gate ready but terminal has no X11 windows yet (pid=${TERMINAL_RUNTIME_PID}) and MT5_REQUIRE_X11_WINDOW=1 — waiting" >&2
         else
           _SINCE_RESTART=$(( TCP_WAITED - LAST_TERMINAL_RESTART_AT ))
           _READY_MODE="x11_confirmed"
@@ -860,7 +864,8 @@ fi
                 echo "${_wsid}:${_wname}"
               done || true
           echo "=== terminal pid / process snapshot ==="
-          echo "terminal_pid=${TERMINAL_PID:-unknown}"
+          echo "terminal_pid=${TERMINAL_RUNTIME_PID:-unknown}"
+          echo "terminal_child_pid=${TERMINAL_CHILD_PID:-unknown}"
           ps -eo pid,ppid,comm,args 2>/dev/null | grep -E 'terminal64\.exe|wineserver|wine|Xvfb|fluxbox|python|mt5linux' || true
           echo "=== dismiss log tail ==="
           tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
@@ -875,7 +880,16 @@ fi
   fi
 
   # Keep wrapper attached to terminal lifecycle.
-  wait "${TERMINAL_PID}" || true
+  if [[ -n "${TERMINAL_CHILD_PID:-}" ]] && kill -0 "${TERMINAL_CHILD_PID}" 2>/dev/null; then
+    echo "[mt5-lifecycle] mode=wait_child child_pid=${TERMINAL_CHILD_PID} runtime_pid=${TERMINAL_RUNTIME_PID:-unknown}"
+    wait "${TERMINAL_CHILD_PID}" || true
+  elif [[ -n "${TERMINAL_RUNTIME_PID:-}" ]] && kill -0 "${TERMINAL_RUNTIME_PID}" 2>/dev/null; then
+    echo "[mt5-lifecycle] mode=poll_runtime_pid runtime_pid=${TERMINAL_RUNTIME_PID} child_pid=${TERMINAL_CHILD_PID:-none}"
+    while kill -0 "${TERMINAL_RUNTIME_PID}" 2>/dev/null; do sleep 5; done
+    echo "[mt5-lifecycle] runtime_pid_exited pid=${TERMINAL_RUNTIME_PID}"
+  else
+    echo "[mt5-lifecycle] mode=no_active_terminal child_pid=${TERMINAL_CHILD_PID:-none} runtime_pid=${TERMINAL_RUNTIME_PID:-none}"
+  fi
 ) 2>&1 | tee /tmp/mt5-launch-wrapper.log &
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"

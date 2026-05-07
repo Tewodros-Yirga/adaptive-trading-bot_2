@@ -22,6 +22,16 @@ Runtime logs now show a specific deadlock pattern:
 
 This confirms the old gate was over-constrained for headless environments: TCP bridge readiness existed, but the extra visible-X11 requirement blocked progress.
 
+### Follow-up Incident (Post Gate Fix)
+
+After headless gate pass started working, a new lifecycle symptom appeared:
+
+- `mt5_ipc.ready` is written successfully,
+- terminal self-restarts to a new PID (expected),
+- wrapper logs: `wait: pid <runtime_pid> is not a child of this shell`.
+
+Root cause: terminal PID tracking reused one variable for both child PID (`$!`) and adopted runtime PID (`pgrep` result), so final `wait` could target a non-child process.
+
 ## What We Have Done
 
 ### 1) Root-cause investigation
@@ -51,6 +61,17 @@ This confirms the old gate was over-constrained for headless environments: TCP b
   - `xdotool` / `wmctrl` availability,
   - visible window snapshot,
   - terminal/Wine/X process snapshot.
+
+### 2c) Terminal lifecycle wait fix
+
+- Updated `mt5-bridge-service/start.sh` PID model:
+  - `TERMINAL_CHILD_PID` tracks the directly launched child process,
+  - `TERMINAL_RUNTIME_PID` tracks the active terminal process after self-restart/adoption.
+- Replaced fragile final `wait` logic:
+  - `mode=wait_child` when child PID is still valid,
+  - `mode=poll_runtime_pid` when terminal moved to non-child PID,
+  - `mode=no_active_terminal` when neither PID is alive.
+- Added lifecycle telemetry and adoption logs so `/debug/mt5` clearly shows why the wrapper used wait-vs-poll mode.
 
 ### 3) Portable payload rebuild work
 
@@ -103,6 +124,9 @@ This confirms the old gate was over-constrained for headless environments: TCP b
    - capture for diagnostics, but do not require as readiness gate criterion.
 4. First adapter `mt5.initialize()` call:
    - verify connection succeeds without waiting for visible UI windows.
+5. Startup log lifecycle section:
+   - confirm there is no `wait: pid ... is not a child of this shell`,
+   - confirm one of `[mt5-lifecycle] mode=wait_child|poll_runtime_pid|no_active_terminal` is emitted.
 
 ## Files Touched in This Workstream
 
