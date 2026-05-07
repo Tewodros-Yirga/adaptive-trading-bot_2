@@ -731,6 +731,9 @@ fi
     # Require a sustained-open mt5linux port window to avoid false "ready"
     # right after terminal self-restart.
     MT5LINUX_PORT_STABLE_REQUIRED="${MT5LINUX_PORT_STABLE_REQUIRED:-30}"
+    # Headless deployments can keep MT5 functional without an exposed X11
+    # window. Keep strict mode available for interactive debugging.
+    MT5_REQUIRE_X11_WINDOW="${MT5_REQUIRE_X11_WINDOW:-0}"
 
     while (( TCP_WAITED < TCP_MAX )); do
       # Crash / self-restart guard.
@@ -793,16 +796,25 @@ fi
       _log_ws "tcp_gate_${TCP_WAITED}s"
 
       if (( MT5LINUX_PORT > 0 )) || (( ESTABLISHED > 0 )); then
+        _X11_WINDOW_READY=1
+        if [[ "${MT5_REQUIRE_X11_WINDOW}" == "1" ]] && (( _TERM_WINDOWS == 0 )); then
+          _X11_WINDOW_READY=0
+        fi
         if (( TCP_WAITED < TERMINAL_STABLE_AFTER )); then
           echo "[mt5-probe] TCP gate ready but in grace period (${TCP_WAITED}s < ${TERMINAL_STABLE_AFTER}s) — waiting for terminal to stabilize" >&2
         elif (( MT5LINUX_PORT_STABLE_FOR < MT5LINUX_PORT_STABLE_REQUIRED )); then
           echo "[mt5-probe] TCP gate ready but mt5linux port not stable yet (${MT5LINUX_PORT_STABLE_FOR}s < ${MT5LINUX_PORT_STABLE_REQUIRED}s) — waiting" >&2
-        elif (( _TERM_WINDOWS == 0 )); then
-          echo "[mt5-probe] TCP gate ready but terminal has no X11 windows yet (pid=${TERMINAL_PID}) — waiting" >&2
+        elif (( _X11_WINDOW_READY == 0 )); then
+          echo "[mt5-probe] TCP gate ready but terminal has no X11 windows yet (pid=${TERMINAL_PID}) and MT5_REQUIRE_X11_WINDOW=1 — waiting" >&2
         else
           _SINCE_RESTART=$(( TCP_WAITED - LAST_TERMINAL_RESTART_AT ))
+          _READY_MODE="x11_confirmed"
+          if (( _TERM_WINDOWS == 0 )); then
+            _READY_MODE="headless_tcp_no_x11"
+            echo "[mt5-probe] TCP gate PASSING in headless mode (no X11 terminal windows detected, MT5_REQUIRE_X11_WINDOW=0)" >&2
+          fi
           echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s), mt5linux port stable for ${MT5LINUX_PORT_STABLE_FOR}s, restart_age=${_SINCE_RESTART}s"
-          { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
+          { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s mode=${_READY_MODE}] established=${ESTABLISHED}"; } \
             >> "${IPC_PROBE_LOG}" 2>/dev/null || true
           TCP_GATE_PASSED=true
           break
@@ -814,12 +826,17 @@ fi
     done
 
     if [[ "${TCP_GATE_PASSED}" == "true" ]]; then
-      echo "ready: tcp_connected elapsed=${TCP_WAITED}s" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      _READY_STATUS_MODE="x11_confirmed"
+      if (( _TERM_WINDOWS == 0 )); then
+        _READY_STATUS_MODE="headless_tcp_no_x11"
+      fi
+      echo "ready: tcp_connected elapsed=${TCP_WAITED}s mode=${_READY_STATUS_MODE} mt5linux_port_stable_for=${MT5LINUX_PORT_STABLE_FOR}s require_x11=${MT5_REQUIRE_X11_WINDOW}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
       touch "${IPC_READY_FILE}" 2>/dev/null || true
       echo "[mt5-probe] mt5_ipc.ready written — adapter will connect via mt5linux TCP bridge"
       {
         echo "=== TCP gate PASSED diagnostics ==="
         echo "elapsed=${TCP_WAITED}s established=${ESTABLISHED:-?}"
+        echo "mode=${_READY_STATUS_MODE} term_windows=${_TERM_WINDOWS:-?} require_x11=${MT5_REQUIRE_X11_WINDOW}"
         echo "=== dismiss log tail ==="
         tail -n 40 "${DISMISS_LOG}" 2>/dev/null || true
         echo "=== wineserver timeline tail ==="
@@ -832,6 +849,19 @@ fi
         {
           echo "=== TCP gate TIMEOUT diagnostics ==="
           echo "elapsed=${TCP_WAITED}s"
+          echo "DISPLAY=${DISPLAY:-unset}"
+          echo "MT5_REQUIRE_X11_WINDOW=${MT5_REQUIRE_X11_WINDOW}"
+          echo "xdotool_path=$(command -v xdotool 2>/dev/null || echo missing)"
+          echo "wmctrl_path=$(command -v wmctrl 2>/dev/null || echo missing)"
+          echo "=== visible windows snapshot ==="
+          DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
+            | while IFS= read -r _wsid; do
+                _wname=$(DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || echo "?")
+                echo "${_wsid}:${_wname}"
+              done || true
+          echo "=== terminal pid / process snapshot ==="
+          echo "terminal_pid=${TERMINAL_PID:-unknown}"
+          ps -eo pid,ppid,comm,args 2>/dev/null | grep -E 'terminal64\.exe|wineserver|wine|Xvfb|fluxbox|python|mt5linux' || true
           echo "=== dismiss log tail ==="
           tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
           echo "=== wineserver timeline tail ==="
