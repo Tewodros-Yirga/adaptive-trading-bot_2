@@ -363,13 +363,23 @@ RUN set -eux; \
     # self-restart (original PID exits, new PID appears). After the
     # restart, give it 30s to stabilize. Then bake the warm image.
     echo "Phase 2: Letting terminal complete self-restart cycle (90s)..."; \
-    WARMUP_TOTAL=90; \
+    WARMUP_TOTAL=120; \
     WARMUP_WAITED=0; \
     RESTART_DETECTED=false; \
+    RESTART_WINDOW_STABLE=0; \
+    RESTART_WINDOW_REQUIRED=30; \
     while [ "${WARMUP_WAITED}" -lt "${WARMUP_TOTAL}" ]; do \
       # Check if original terminal PID is still alive. \
       if kill -0 "${TERM_PID}" 2>/dev/null; then \
-        echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} alive"; \
+        _WCOUNT=$(DISPLAY=:99 xdotool search --pid "${TERM_PID}" 2>/dev/null | wc -l || echo 0); \
+        echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} alive (windows=${_WCOUNT})"; \
+        if [ "${RESTART_DETECTED}" = "true" ]; then \
+          if [ "${_WCOUNT}" -gt 0 ]; then \
+            RESTART_WINDOW_STABLE=$(( RESTART_WINDOW_STABLE + 10 )); \
+          else \
+            RESTART_WINDOW_STABLE=0; \
+          fi; \
+        fi; \
       else \
         if [ "${RESTART_DETECTED}" = "false" ]; then \
           echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} exited — checking for self-restart..."; \
@@ -378,6 +388,7 @@ RUN set -eux; \
             echo "  Self-restart detected: new PID ${NEW_PID}"; \
             TERM_PID="${NEW_PID}"; \
             RESTART_DETECTED=true; \
+            RESTART_WINDOW_STABLE=0; \
           else \
             echo "  No new terminal PID found — terminal exited cleanly (no restart needed)"; \
             break; \
@@ -387,10 +398,17 @@ RUN set -eux; \
           break; \
         fi; \
       fi; \
+      if [ "${RESTART_DETECTED}" = "true" ] && [ "${RESTART_WINDOW_STABLE}" -ge "${RESTART_WINDOW_REQUIRED}" ]; then \
+        echo "  Restarted terminal is window-stable for ${RESTART_WINDOW_STABLE}s — bake gate passed."; \
+        break; \
+      fi; \
       sleep 10; \
       WARMUP_WAITED=$(( WARMUP_WAITED + 10 )); \
     done; \
-    echo "Phase 2 done after ${WARMUP_WAITED}s (restart_detected=${RESTART_DETECTED})."; \
+    if [ "${RESTART_DETECTED}" = "true" ] && [ "${RESTART_WINDOW_STABLE}" -lt "${RESTART_WINDOW_REQUIRED}" ]; then \
+      echo "WARNING: restart detected but terminal windows did not stabilize (${RESTART_WINDOW_STABLE}s < ${RESTART_WINDOW_REQUIRED}s)"; \
+    fi; \
+    echo "Phase 2 done after ${WARMUP_WAITED}s (restart_detected=${RESTART_DETECTED}, restart_window_stable=${RESTART_WINDOW_STABLE}s)."; \
     \
     # Take a snapshot of what terminal.ini looks like now. \
     FINAL_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \

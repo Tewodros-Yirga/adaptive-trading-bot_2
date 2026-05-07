@@ -144,6 +144,25 @@ GitHub Actions publishes **two** base-image flavors to GHCR:
 
 Important: **push builds do not publish `:latest`**.
 
+### Refresh portable MT5 bundle locally (Windows)
+
+When runtime shows terminal self-restart plus black-screen/no-window behavior, rebuild the portable payload from a local warm run before rebuilding base images:
+
+```powershell
+# 1) Warm-run the local MT5 directory (portable mode)
+powershell -ExecutionPolicy Bypass -File scripts/init-mt5-portable.ps1 `
+  -TerminalExe "G:\mt5 v5640\terminal64.exe" `
+  -PortableDir "G:\mt5 v5640"
+
+# 2) Package a POSIX-safe zip (avoids backslash path artifacts)
+powershell -ExecutionPolicy Bypass -File scripts/package-mt5-portable.ps1 `
+  -SourceDir "G:\mt5 v5640" `
+  -OutZip "G:\adaptive-trading-bot\mt5-portable.zip" `
+  -Overwrite
+```
+
+Upload `mt5-portable.zip` to the `mt5-portable-latest` release asset, then trigger the base-image workflow (defaults already point to that URL).
+
 ### Push bridge service to HF Spaces
 ```powershell
 # One-time remote setup
