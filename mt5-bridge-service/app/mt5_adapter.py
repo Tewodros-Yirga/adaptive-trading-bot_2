@@ -188,12 +188,16 @@ class MT5Adapter:
             "mt5_ipc.ready",
         )
         if launch_terminal_enabled and not os.path.isfile(ipc_ready_file):
-            self.connected = False
-            self.last_error = "mt5 ipc not ready yet"
-            self.last_error_class = "ipc_not_ready"
-            if not settings.mt_fallback_mode:
-                raise RuntimeError(self.last_error)
-            return
+            # Fast-fail for the first attempts to avoid blocking the event loop.
+            # After enough retries, attempt connection anyway so real MT5 errors
+            # (e.g. -10003 / -10005) surface in logs for diagnosis.
+            if self._connect_attempts < 3:
+                self.connected = False
+                self.last_error = "mt5 ipc not ready yet"
+                self.last_error_class = "ipc_not_ready"
+                if not settings.mt_fallback_mode:
+                    raise RuntimeError(self.last_error)
+                return
 
         # 1) Try native MetaTrader5 — Windows only.
         #    The native package uses Windows DLLs (CreateFileMapping / named pipes)
