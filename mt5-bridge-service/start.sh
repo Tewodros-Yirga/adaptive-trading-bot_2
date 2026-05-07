@@ -726,6 +726,11 @@ fi
     TCP_WAITED=0
     TCP_MAX=600   # 10 minutes max
     TERMINAL_STABLE_AFTER=0  # grace period: gate can only pass once TCP_WAITED >= this
+    LAST_TERMINAL_RESTART_AT=0
+    MT5LINUX_PORT_STABLE_FOR=0
+    # Require a sustained-open mt5linux port window to avoid false "ready"
+    # right after terminal self-restart.
+    MT5LINUX_PORT_STABLE_REQUIRED="${MT5LINUX_PORT_STABLE_REQUIRED:-30}"
 
     while (( TCP_WAITED < TCP_MAX )); do
       # Crash / self-restart guard.
@@ -738,6 +743,8 @@ fi
           # Enforce 30s grace period before gate can pass — terminal needs time
           # to set up its IPC named pipes after restarting.
           TERMINAL_STABLE_AFTER=$(( TCP_WAITED + 30 ))
+          LAST_TERMINAL_RESTART_AT="${TCP_WAITED}"
+          MT5LINUX_PORT_STABLE_FOR=0
           echo "[mt5-probe] Grace period: gate will not pass until ${TERMINAL_STABLE_AFTER}s elapsed" >&2
         else
           echo "[mt5-probe] FATAL: terminal exited and did not restart." >&2
@@ -754,6 +761,11 @@ fi
       # wine python.exe -m mt5linux inside the same wineserver as terminal64.exe.
       MT5LINUX_PORT=0
       if (echo > /dev/tcp/127.0.0.1/18812) > /dev/null 2>&1; then MT5LINUX_PORT=1; fi
+      if (( MT5LINUX_PORT > 0 )); then
+        MT5LINUX_PORT_STABLE_FOR=$(( MT5LINUX_PORT_STABLE_FOR + 10 ))
+      else
+        MT5LINUX_PORT_STABLE_FOR=0
+      fi
 
       # Secondary gate: external broker TCP connections (belt + suspenders).
       # On HF Spaces the broker (MetaQuotes) may be unreachable, so this is
@@ -769,18 +781,27 @@ fi
         | while IFS= read -r _wsid; do
             DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || true
           done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
+      _TERM_WINDOWS=0
+      if [[ -n "${TERMINAL_PID:-}" ]]; then
+        _TERM_WINDOWS=$(DISPLAY="${DISPLAY}" xdotool search --pid "${TERMINAL_PID}" 2>/dev/null | wc -l || echo 0)
+      fi
 
-      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} mt5linux_port=${MT5LINUX_PORT} windows=${_WIN_SNAP:-none}"; } \
+      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} mt5linux_port=${MT5LINUX_PORT} mt5linux_port_stable_for=${MT5LINUX_PORT_STABLE_FOR}s term_windows=${_TERM_WINDOWS} windows=${_WIN_SNAP:-none}"; } \
         >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED} mt5linux=${MT5LINUX_PORT}" \
+      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED} mt5linux=${MT5LINUX_PORT} mt5linux_stable_for=${MT5LINUX_PORT_STABLE_FOR}s term_windows=${_TERM_WINDOWS}" \
         > "${IPC_STATUS_FILE}" 2>/dev/null || true
       _log_ws "tcp_gate_${TCP_WAITED}s"
 
       if (( MT5LINUX_PORT > 0 )) || (( ESTABLISHED > 0 )); then
         if (( TCP_WAITED < TERMINAL_STABLE_AFTER )); then
           echo "[mt5-probe] TCP gate ready but in grace period (${TCP_WAITED}s < ${TERMINAL_STABLE_AFTER}s) — waiting for terminal to stabilize" >&2
+        elif (( MT5LINUX_PORT_STABLE_FOR < MT5LINUX_PORT_STABLE_REQUIRED )); then
+          echo "[mt5-probe] TCP gate ready but mt5linux port not stable yet (${MT5LINUX_PORT_STABLE_FOR}s < ${MT5LINUX_PORT_STABLE_REQUIRED}s) — waiting" >&2
+        elif (( _TERM_WINDOWS == 0 )); then
+          echo "[mt5-probe] TCP gate ready but terminal has no X11 windows yet (pid=${TERMINAL_PID}) — waiting" >&2
         else
-          echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s)"
+          _SINCE_RESTART=$(( TCP_WAITED - LAST_TERMINAL_RESTART_AT ))
+          echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s), mt5linux port stable for ${MT5LINUX_PORT_STABLE_FOR}s, restart_age=${_SINCE_RESTART}s"
           { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
             >> "${IPC_PROBE_LOG}" 2>/dev/null || true
           TCP_GATE_PASSED=true
