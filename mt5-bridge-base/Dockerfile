@@ -31,7 +31,7 @@ ENV WINEFSYNC=0
 # ---------------------------------------------------------------------------
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        openbox xdotool p7zip-full file winetricks \
+        openbox xdotool p7zip-full file winetricks binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -87,13 +87,10 @@ RUN set -eux; \
     fi; \
     echo "${WINE_PY}" > /opt/wine_python_exe.path; \
     \
-    # -- pip install MetaTrader5 + mt5linux -- \
+    # -- pip install dependencies (MetaTrader5 version matched to terminal below) -- \
     timeout 300 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir pip || true; \
-    timeout 600 wine "${WINE_PY}" -m pip install --no-cache-dir MetaTrader5 || true; \
     timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir "mt5linux>=0.1.9" || true; \
     timeout 300 wine "${WINE_PY}" -m pip install --no-cache-dir python-dateutil || true; \
-    wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
-      || echo "WARNING: MetaTrader5 verification failed"; \
     wine "${WINE_PY}" -c "import mt5linux; print('mt5linux OK')" \
       || echo "WARNING: mt5linux verification failed"; \
     \
@@ -207,6 +204,25 @@ RUN set -eux; \
     else \
       echo "HAS_MT5 not true — skipping MT5 terminal"; \
     fi; \
+    \
+    # -- Install MetaTrader5 package matching terminal build (dynamic) -- \
+    TERM_BUILD=""; \
+    if [ -n "${TERM_EXE}" ]; then \
+      TERM_BUILD=$(strings -e l "${TERM_EXE}" 2>/dev/null | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || strings "${TERM_EXE}" 2>/dev/null | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || echo ''); \
+    fi; \
+    if [ -n "${TERM_BUILD}" ]; then \
+      echo "Terminal build detected: ${TERM_BUILD} — installing MetaTrader5==5.0.${TERM_BUILD}"; \
+      timeout 600 wine "${WINE_PY}" -m pip install --upgrade --force-reinstall --no-cache-dir "MetaTrader5==5.0.${TERM_BUILD}" 2>/dev/null || { \
+        echo "WARNING: MetaTrader5==5.0.${TERM_BUILD} not found on PyPI"; \
+        echo "Installing latest MetaTrader5 instead (build mismatch risk!)"; \
+        timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
+      }; \
+    else \
+      echo "No terminal build detected — installing latest MetaTrader5"; \
+      timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
+    fi; \
+    wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
+      || echo "WARNING: MetaTrader5 verification failed"; \
     \
     # -- Smoke-test script perms -- \
     chmod +x /bridge/smoke-test-ipc.sh; \
