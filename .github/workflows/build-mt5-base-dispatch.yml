@@ -10,7 +10,7 @@ on:
       wine_base:
         description: "Wine base image tag (e.g. scottyhardy/docker-wine:devel)"
         required: false
-        default: "scottyhardy/docker-wine:devel"
+        default: "scottyhardy/docker-wine:stable-10.0-20250525"
 
 env:
   REGISTRY: ghcr.io
