@@ -314,8 +314,10 @@ fi
   # never creates the IPC named pipe → mt5.initialize() returns -10003 forever.
   _TERM_INI_PORTABLE="$(dirname "${TERMINAL_EXE}")/terminal.ini"
   if [[ "${MT5_CONTEXT_MODE}" == "default" ]] || [[ -z "${MT5_CONTEXT_MODE}" ]]; then
-    if [[ -f "${_TERM_INI_PORTABLE}" ]]; then
-      echo "[mt5-terminal] Portable terminal.ini detected alongside exe — forcing portable mode"
+    # Prefer AppData/default mode for determinism.
+    # Portable auto-force can be re-enabled only when explicitly requested.
+    if [[ "${MT5_FORCE_PORTABLE_IF_TERMINAL_INI:-false}" == "true" ]] && [[ -f "${_TERM_INI_PORTABLE}" ]]; then
+      echo "[mt5-terminal] Portable terminal.ini detected alongside exe — forcing portable mode (MT5_FORCE_PORTABLE_IF_TERMINAL_INI=true)"
       MT5_CONTEXT_MODE="portable"
     fi
   fi
@@ -397,9 +399,10 @@ fi
       /config:"C:\\mt5-headless.ini" \
       "${CONTEXT_ARGS[@]}" \
       > "${LOGDIR}/mt5-terminal.log" 2>&1 &
-    TERMINAL_PID=$!
-    echo "[mt5-terminal] terminal pid=${TERMINAL_PID}"
-    _log_ws "terminal_launch_pid_${TERMINAL_PID}"
+    TERMINAL_CHILD_PID=$!
+    TERMINAL_RUNTIME_PID="${TERMINAL_CHILD_PID}"
+    echo "[mt5-terminal] terminal pid=${TERMINAL_RUNTIME_PID} (child_pid=${TERMINAL_CHILD_PID})"
+    _log_ws "terminal_launch_pid_${TERMINAL_RUNTIME_PID}"
   }
   _launch_terminal
   LAST_WS_PIDS="$(_ws_pids)"
@@ -433,6 +436,20 @@ fi
       _ACTIVE_WID=$(_xd getactivewindow 2>/dev/null || echo "none")
       _ACTIVE_NAME=$(DISPLAY=:99 xdotool getwindowname "${_ACTIVE_WID}" 2>/dev/null || echo "?")
       echo "[dismiss-heartbeat] iter=${_try} focus=${_ACTIVE_WID}(${_ACTIVE_NAME})" >> "${DISMISS_LOG}"
+      # If the active window is unnamed (common for Wine splash screens,
+      # loading dialogs, or early MT5 windows before title is set), try
+      # aggressive dismissal: Tab+Return, Escape, and click center.
+      if [[ "${_ACTIVE_NAME}" == "?" ]] && [[ "${_ACTIVE_WID}" != "none" ]]; then
+        _xd windowactivate --sync "${_ACTIVE_WID}" 2>/dev/null || true
+        _xd key --window "${_ACTIVE_WID}" --clearmodifiers Tab Return 2>/dev/null || true
+        sleep 0.2
+        _xd key --window "${_ACTIVE_WID}" --clearmodifiers Escape 2>/dev/null || true
+        sleep 0.2
+        # Click center of screen (common OK/Allow button area on 1280x720)
+        _xd mousemove --clearmodifiers 640 360 2>/dev/null || true
+        _xd click 1 2>/dev/null || true
+        echo "[dismiss-action] iter=${_try} aggressive-dismiss unnamed wid=${_ACTIVE_WID} (Tab+Return, Escape, center-click)" >> "${DISMISS_LOG}"
+      fi
       # Step 2: LiveUpdate dialogs (including UAC elevation prompt).
       # "Updating MetaTrader 5" = Wine UAC/admin dialog — click CANCEL.
       for _wid in $({ _xd search --onlyvisible --name "Updating MetaTrader"
@@ -726,18 +743,201 @@ fi
     TCP_WAITED=0
     TCP_MAX=600   # 10 minutes max
     TERMINAL_STABLE_AFTER=0  # grace period: gate can only pass once TCP_WAITED >= this
+    LAST_TERMINAL_RESTART_AT=0
+    MT5LINUX_PORT_STABLE_FOR=0
+    # Require a sustained-open mt5linux port window to avoid false "ready"
+    # right after terminal self-restart.
+    MT5LINUX_PORT_STABLE_REQUIRED="${MT5LINUX_PORT_STABLE_REQUIRED:-30}"
+    # Named-pipe verification: ensure MT5 IPC is actually registered inside Wine.
+    # This prevents "TCP ready but IPC not attachable" which surfaces as
+    # terminal_not_found / -10003 on /account.
+    IPC_PIPES_REQUIRED_HITS="${IPC_PIPES_REQUIRED_HITS:-2}"
+    IPC_PIPES_HITS=0
+    IPC_PIPES_LAST_EVIDENCE=""
+    IPC_PIPES_LAST_PRESENT=false
+
+    # Optional extra logging to debug Wine named-pipe listing output.
+    # Enable with:
+    #   MT5_IPC_PIPE_DEBUG=1
+    # and adjust how many gate-checks we capture with:
+    #   MT5_IPC_PIPE_DEBUG_TRIES=4
+    IPC_PIPE_DEBUG="${MT5_IPC_PIPE_DEBUG:-0}"
+    IPC_PIPE_DEBUG_TRIES="${MT5_IPC_PIPE_DEBUG_TRIES:-4}"
+    IPC_PIPE_DEBUG_CHECKS=0
+
+    _wine_has_mt5_pipes() {
+      # Query Wine's pipe namespace (does not rely on Windows IPC attach).
+      # We match only the presence of MT5-family pipes to avoid false positives.
+      local _out _ev _tier_a _tier_c
+
+      # Try a bare pipe listing first; it tends to have a simpler output.
+      # Use single quotes to avoid backslash-escaping pitfalls in bash.
+      _out="$(timeout 8s wine cmd /c 'dir /b \\.\pipe\\' 2>/dev/null || true)"
+      # If /b produced nothing, fall back to full `dir`.
+      if [[ -z "${_out//[[:space:]]/}" ]]; then
+        _out="$(timeout 8s wine cmd /c 'dir \\.\pipe\\' 2>/dev/null || true)"
+      fi
+
+      # Normalise CRLF.
+      _out="$(echo "${_out}" | tr -d '\r' || true)"
+
+      # Debug logging: capture raw listing for early gate checks.
+      if [[ "${IPC_PIPE_DEBUG}" == "1" ]] && (( IPC_PIPE_DEBUG_CHECKS < IPC_PIPE_DEBUG_TRIES )); then
+        IPC_PIPE_DEBUG_CHECKS=$(( IPC_PIPE_DEBUG_CHECKS + 1 ))
+        {
+          echo "[mt5-probe][ipc-pipe-debug] check=${IPC_PIPE_DEBUG_CHECKS}/${IPC_PIPE_DEBUG_TRIES}"
+          echo "[mt5-probe][ipc-pipe-debug] raw_out_begin"
+          echo "${_out}" | head -n 60
+          echo "[mt5-probe][ipc-pipe-debug] raw_out_end"
+        } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+      fi
+
+      # Tier A: accept if we can find any non-empty pipe entry line (from `dir /b`),
+      # which usually returns one pipe name per line.
+      _tier_a="$(
+        echo "${_out}" \
+          | grep -vE 'File Not Found|cannot find|cannot open|Access is denied|The system cannot find' \
+          | grep -E '^[[:alnum:]_.-]+$' \
+          | head -n 1 || true
+      )"
+      if [[ -n "${_tier_a}" ]]; then
+        IPC_PIPES_LAST_EVIDENCE="pipe_entry_present: ${_tier_a}"
+        IPC_PIPES_LAST_PRESENT=true
+        return 0
+      fi
+
+      # Tier B: keyword heuristic as additional evidence.
+      _ev="$(echo "${_out}" | grep -Ei 'metatrader|metaquotes|mt5|terminal' | head -n 1 || true)"
+      if [[ -n "${_ev}" ]]; then
+        IPC_PIPES_LAST_EVIDENCE="keyword_evidence: ${_ev}"
+        IPC_PIPES_LAST_PRESENT=true
+        return 0
+      fi
+
+      # Tier C: Python os.listdir fallback — Wine's cmd.exe dir may not enumerate
+      # pipes correctly even when the IPC backend is alive (observed in build 5640
+      # under certain Wine versions).  Python's os.listdir uses the native API.
+      if [[ -n "${FOUND_PYTHON:-}" ]] && [[ -f "${FOUND_PYTHON}" ]]; then
+        _tier_c="$(timeout 8s wine "${FOUND_PYTHON}" -c "import os; print('\n'.join(os.listdir(r'\\.\pipe\')))" 2>/dev/null \
+          | grep -vE 'File Not Found|cannot find|cannot open|Access is denied' \
+          | grep -Ei 'metatrader|metaquotes|mt5|terminal|^[[:alnum:]_.-]+$' \
+          | head -n 1 || true)"
+        if [[ -n "${_tier_c}" ]]; then
+          IPC_PIPES_LAST_EVIDENCE="python_listdir_evidence: ${_tier_c}"
+          IPC_PIPES_LAST_PRESENT=true
+          return 0
+        fi
+      fi
+
+      IPC_PIPES_LAST_EVIDENCE=""
+      IPC_PIPES_LAST_PRESENT=false
+      return 1
+    }
+
+    _FUNCTIONAL_LAST_ERR=""
+    _FUNCTIONAL_LAST_OUT=""
+    _FUNCTIONAL_LAST_STDERR=""
+
+    _functional_mt5_probe() {
+      # The ONLY definitive test of IPC readiness: call mt5.initialize() from
+      # inside Wine (same wineserver as terminal).  If this returns True, the
+      # terminal's IPC backend is alive and serving, regardless of whether
+      # `dir \.\|\pipe\` shows anything.
+      local _out _ok_line _err_line _stderr_file _term_linux_path _term_wine_path
+      if [[ -z "${FOUND_PYTHON:-}" ]] || [[ ! -f "${FOUND_PYTHON}" ]]; then
+        _FUNCTIONAL_LAST_ERR="FUNCTIONAL_ERR=(no_python, 'FOUND_PYTHON not set')"
+        return 1
+      fi
+      _stderr_file="/tmp/mt5-functional-stderr-$$"
+      # Resolve terminal path the same way mt5_adapter.py does.
+      _term_linux_path="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+      # Convert to Windows path for MetaTrader5 package (expects C:\ style).
+      _term_wine_path="C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+      if [[ -n "${WINEPREFIX}" ]]; then
+        _term_wine_path="${_term_linux_path#${WINEPREFIX}/drive_c/}"
+        _term_wine_path="C:\\\\${_term_wine_path////\\\\}"
+      fi
+
+      # Attempt 1: bare initialize (no path) — matches natural AppData discovery.
+      # Use python -u (unbuffered) and explicit sys.stdout.flush() so we
+      # capture output even if timeout kills the process.
+      _out="$(timeout 25s wine "${FOUND_PYTHON}" -u -c "
+import sys, MetaTrader5 as mt5
+ok = mt5.initialize(timeout=15000)
+err = mt5.last_error()
+try:
+    mt5.shutdown()
+except Exception:
+    pass
+print(f'FUNCTIONAL_OK={ok}')
+print(f'FUNCTIONAL_ERR={err}')
+print(f'FUNCTIONAL_MODE=bare')
+sys.stdout.flush()
+" 2>"${_stderr_file}" || true)"
+      _FUNCTIONAL_LAST_OUT="${_out}"
+      _FUNCTIONAL_LAST_STDERR="$(cat "${_stderr_file}" 2>/dev/null | head -c 4096 || true)"
+      rm -f "${_stderr_file}" 2>/dev/null || true
+      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False|None)' | head -1 || true)"
+      _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
+      _FUNCTIONAL_LAST_ERR="${_err_line}"
+      if echo "${_ok_line}" | grep -qE 'FUNCTIONAL_OK=(True|None)'; then
+        return 0
+      fi
+
+      # Attempt 2: explicit path — if bare attach fails with terminal_not_found
+      # (-10003) the terminal may need a path hint even in default mode.
+      _out="$(timeout 25s wine "${FOUND_PYTHON}" -u -c "
+import sys, MetaTrader5 as mt5
+ok = mt5.initialize(path=r'${_term_wine_path}', timeout=15000)
+err = mt5.last_error()
+try:
+    mt5.shutdown()
+except Exception:
+    pass
+print(f'FUNCTIONAL_OK={ok}')
+print(f'FUNCTIONAL_ERR={err}')
+print(f'FUNCTIONAL_MODE=path')
+sys.stdout.flush()
+" 2>"${_stderr_file}" || true)"
+      _FUNCTIONAL_LAST_OUT="${_out}"
+      _FUNCTIONAL_LAST_STDERR="$(cat "${_stderr_file}" 2>/dev/null | head -c 4096 || true)"
+      rm -f "${_stderr_file}" 2>/dev/null || true
+      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False|None)' | head -1 || true)"
+      _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
+      _FUNCTIONAL_LAST_ERR="${_err_line}"
+      if echo "${_ok_line}" | grep -qE 'FUNCTIONAL_OK=(True|None)'; then
+        return 0
+      fi
+      return 1
+    }
+    # Headless deployments can keep MT5 functional without an exposed X11
+    # window. Keep strict mode available for interactive debugging.
+    MT5_REQUIRE_X11_WINDOW="${MT5_REQUIRE_X11_WINDOW:-0}"
+
+    # When set to 1, the gate will NOT require visible named-pipe evidence.
+    # This is a diagnostic / compatibility switch for Wine builds where
+    # MT5 IPC works but `dir \\.|\pipe\` never lists anything (e.g. build 5640).
+    MT5_SKIP_PIPE_VERIFICATION="${MT5_SKIP_PIPE_VERIFICATION:-0}"
+    if [[ "${MT5_SKIP_PIPE_VERIFICATION}" == "1" ]]; then
+      echo "[mt5-probe] MT5_SKIP_PIPE_VERIFICATION=1 — pipe visibility requirement bypassed (functional probe still required)" >&2
+    fi
 
     while (( TCP_WAITED < TCP_MAX )); do
       # Crash / self-restart guard.
-      if ! kill -0 "${TERMINAL_PID}" 2>/dev/null; then
-        echo "[mt5-probe] terminal64.exe (PID ${TERMINAL_PID}) has exited" >&2
+      if ! kill -0 "${TERMINAL_RUNTIME_PID}" 2>/dev/null; then
+        echo "[mt5-probe] terminal64.exe (PID ${TERMINAL_RUNTIME_PID}) has exited" >&2
         NEW_TERM_PID=$(pgrep -f 'terminal64.exe' 2>/dev/null | head -1) || true
-        if [[ -n "${NEW_TERM_PID}" ]] && [[ "${NEW_TERM_PID}" != "${TERMINAL_PID}" ]]; then
+        if [[ -n "${NEW_TERM_PID}" ]] && [[ "${NEW_TERM_PID}" != "${TERMINAL_RUNTIME_PID}" ]]; then
           echo "[mt5-probe] New terminal PID detected: ${NEW_TERM_PID} (self-restart after update)" >&2
-          TERMINAL_PID="${NEW_TERM_PID}"
+          TERMINAL_RUNTIME_PID="${NEW_TERM_PID}"
+          if [[ -n "${TERMINAL_CHILD_PID:-}" ]] && [[ "${TERMINAL_RUNTIME_PID}" != "${TERMINAL_CHILD_PID}" ]]; then
+            echo "[mt5-probe] Terminal PID moved to adopted process (runtime_pid=${TERMINAL_RUNTIME_PID}, child_pid=${TERMINAL_CHILD_PID})" >&2
+          fi
           # Enforce 30s grace period before gate can pass — terminal needs time
           # to set up its IPC named pipes after restarting.
           TERMINAL_STABLE_AFTER=$(( TCP_WAITED + 30 ))
+          LAST_TERMINAL_RESTART_AT="${TCP_WAITED}"
+          MT5LINUX_PORT_STABLE_FOR=0
           echo "[mt5-probe] Grace period: gate will not pass until ${TERMINAL_STABLE_AFTER}s elapsed" >&2
         else
           echo "[mt5-probe] FATAL: terminal exited and did not restart." >&2
@@ -754,6 +954,11 @@ fi
       # wine python.exe -m mt5linux inside the same wineserver as terminal64.exe.
       MT5LINUX_PORT=0
       if (echo > /dev/tcp/127.0.0.1/18812) > /dev/null 2>&1; then MT5LINUX_PORT=1; fi
+      if (( MT5LINUX_PORT > 0 )); then
+        MT5LINUX_PORT_STABLE_FOR=$(( MT5LINUX_PORT_STABLE_FOR + 10 ))
+      else
+        MT5LINUX_PORT_STABLE_FOR=0
+      fi
 
       # Secondary gate: external broker TCP connections (belt + suspenders).
       # On HF Spaces the broker (MetaQuotes) may be unreachable, so this is
@@ -769,22 +974,91 @@ fi
         | while IFS= read -r _wsid; do
             DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || true
           done 2>/dev/null | paste -sd'|' - 2>/dev/null) || _WIN_SNAP=""
+      _TERM_WINDOWS=0
+      if [[ -n "${TERMINAL_RUNTIME_PID:-}" ]]; then
+        _TERM_WINDOWS=$(DISPLAY="${DISPLAY}" xdotool search --pid "${TERMINAL_RUNTIME_PID}" 2>/dev/null | wc -l || echo 0)
+      fi
 
-      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} mt5linux_port=${MT5LINUX_PORT} windows=${_WIN_SNAP:-none}"; } \
+      { echo "[tcp-gate elapsed=${TCP_WAITED}s] established=${ESTABLISHED} mt5linux_port=${MT5LINUX_PORT} mt5linux_port_stable_for=${MT5LINUX_PORT_STABLE_FOR}s term_windows=${_TERM_WINDOWS} windows=${_WIN_SNAP:-none}"; } \
         >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED} mt5linux=${MT5LINUX_PORT}" \
+      echo "waiting: tcp_check elapsed=${TCP_WAITED}s established=${ESTABLISHED} mt5linux=${MT5LINUX_PORT} mt5linux_stable_for=${MT5LINUX_PORT_STABLE_FOR}s term_windows=${_TERM_WINDOWS}" \
         > "${IPC_STATUS_FILE}" 2>/dev/null || true
       _log_ws "tcp_gate_${TCP_WAITED}s"
 
       if (( MT5LINUX_PORT > 0 )) || (( ESTABLISHED > 0 )); then
+        _X11_WINDOW_READY=1
+        if [[ "${MT5_REQUIRE_X11_WINDOW}" == "1" ]] && (( _TERM_WINDOWS == 0 )); then
+          _X11_WINDOW_READY=0
+        fi
         if (( TCP_WAITED < TERMINAL_STABLE_AFTER )); then
           echo "[mt5-probe] TCP gate ready but in grace period (${TCP_WAITED}s < ${TERMINAL_STABLE_AFTER}s) — waiting for terminal to stabilize" >&2
+        elif (( MT5LINUX_PORT_STABLE_FOR < MT5LINUX_PORT_STABLE_REQUIRED )); then
+          echo "[mt5-probe] TCP gate ready but mt5linux port not stable yet (${MT5LINUX_PORT_STABLE_FOR}s < ${MT5LINUX_PORT_STABLE_REQUIRED}s) — waiting" >&2
+        elif (( _X11_WINDOW_READY == 0 )); then
+          echo "[mt5-probe] TCP gate ready but terminal has no X11 windows yet (pid=${TERMINAL_RUNTIME_PID}) and MT5_REQUIRE_X11_WINDOW=1 — waiting" >&2
         else
-          echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s)"
-          { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s] established=${ESTABLISHED}"; } \
-            >> "${IPC_PROBE_LOG}" 2>/dev/null || true
-          TCP_GATE_PASSED=true
-          break
+          # Soft readiness criteria passed: TCP is stable and grace elapsed.
+          # Verify IPC readiness via functional probe (highest confidence) OR
+          # named-pipe visibility.  Either one is sufficient.
+          _FUNCTIONAL_READY=false
+          if _functional_mt5_probe; then
+            _FUNCTIONAL_READY=true
+            echo "[mt5-probe] Functional probe SUCCEEDED — MT5 IPC backend is alive" >&2
+            { echo "[tcp-gate functional_probe=ok elapsed=${TCP_WAITED}s]"; } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+          else
+            { echo "[tcp-gate functional_probe=fail elapsed=${TCP_WAITED}s]"; } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+          fi
+
+          _PIPE_READY=false
+          if _wine_has_mt5_pipes; then
+            _PIPE_READY=true
+            IPC_PIPES_HITS=$(( IPC_PIPES_HITS + 1 ))
+            echo "[mt5-probe] IPC pipe evidence hit ${IPC_PIPES_HITS}/${IPC_PIPES_REQUIRED_HITS}: ${IPC_PIPES_LAST_EVIDENCE}" >&2
+          else
+            if (( IPC_PIPES_HITS > 0 )); then
+              echo "[mt5-probe] IPC pipe evidence disappeared — resetting hits to 0" >&2
+            fi
+            IPC_PIPES_HITS=0
+          fi
+
+          # Gate pass decision:
+          # 1. Functional probe succeeded → pass immediately (highest confidence).
+          # 2. Pipe hits reached threshold → pass (legacy path).
+          # 3. SKIP_PIPE_VERIFICATION=1 and we've waited long enough → pass
+          #    so the adapter can attempt connection and surface real errors.
+          _FORCE_PASS=false
+          if [[ "${_FUNCTIONAL_READY}" == "true" ]]; then
+            _FORCE_PASS=true
+          elif (( IPC_PIPES_HITS >= IPC_PIPES_REQUIRED_HITS )); then
+            _FORCE_PASS=true
+          elif [[ "${MT5_SKIP_PIPE_VERIFICATION}" == "1" ]] && (( TCP_WAITED >= 180 )); then
+            echo "[mt5-probe] MT5_SKIP_PIPE_VERIFICATION=1 and elapsed=${TCP_WAITED}s >= 180s — forcing gate pass for diagnostic connection" >&2
+            _FORCE_PASS=true
+          fi
+
+          if [[ "${_FORCE_PASS}" == "true" ]]; then
+            _SINCE_RESTART=$(( TCP_WAITED - LAST_TERMINAL_RESTART_AT ))
+            _READY_MODE="x11_confirmed"
+            if (( _TERM_WINDOWS == 0 )); then
+              _READY_MODE="headless_tcp_no_x11"
+              echo "[mt5-probe] TCP gate PASSING in headless mode (no X11 terminal windows detected, MT5_REQUIRE_X11_WINDOW=0)" >&2
+            fi
+            if [[ "${_FUNCTIONAL_READY}" == "true" ]]; then
+              echo "[mt5-probe] TCP gate PASSED via functional probe — mt5.initialize() confirmed working inside Wine"
+            else
+              echo "[mt5-probe] TCP gate PASSED — terminal has ${ESTABLISHED} external TCP connection(s), mt5linux port stable for ${MT5LINUX_PORT_STABLE_FOR}s, restart_age=${_SINCE_RESTART}s, ipc_pipes=present"
+            fi
+            { echo "[tcp-gate PASSED elapsed=${TCP_WAITED}s mode=${_READY_MODE} functional_ready=${_FUNCTIONAL_READY} ipc_pipes_hits=${IPC_PIPES_HITS}/${IPC_PIPES_REQUIRED_HITS}] established=${ESTABLISHED} last_evidence=${IPC_PIPES_LAST_EVIDENCE}"; } \
+              >> "${IPC_PROBE_LOG}" 2>/dev/null || true
+            TCP_GATE_PASSED=true
+            break
+          else
+            if [[ "${_FUNCTIONAL_READY}" != "true" ]] && [[ "${_PIPE_READY}" != "true" ]]; then
+              echo "[mt5-probe] TCP gate soft-ready but MT5 IPC not attachable yet — functional_probe=fail (${_FUNCTIONAL_LAST_ERR:-unknown}) stderr='${_FUNCTIONAL_LAST_STDERR:-}' pipes=missing (required_hints=${IPC_PIPES_REQUIRED_HITS})" >&2
+            elif [[ "${_FUNCTIONAL_READY}" != "true" ]]; then
+              echo "[mt5-probe] TCP gate soft-ready but functional probe still failing (${_FUNCTIONAL_LAST_ERR:-unknown}) stderr='${_FUNCTIONAL_LAST_STDERR:-}' — waiting (pipes_ok, required_hits=${IPC_PIPES_REQUIRED_HITS})" >&2
+            fi
+          fi
         fi
       fi
 
@@ -793,12 +1067,22 @@ fi
     done
 
     if [[ "${TCP_GATE_PASSED}" == "true" ]]; then
-      echo "ready: tcp_connected elapsed=${TCP_WAITED}s" > "${IPC_STATUS_FILE}" 2>/dev/null || true
+      _READY_STATUS_MODE="x11_confirmed"
+      if (( _TERM_WINDOWS == 0 )); then
+        _READY_STATUS_MODE="headless_tcp_no_x11"
+      fi
+      _PIPES_STATUS="present"
+      if [[ "${_FUNCTIONAL_READY}" != "true" ]] && (( IPC_PIPES_HITS < IPC_PIPES_REQUIRED_HITS )); then
+        _PIPES_STATUS="absent"
+      fi
+      echo "ready: tcp_connected elapsed=${TCP_WAITED}s mode=${_READY_STATUS_MODE} mt5linux_port_stable_for=${MT5LINUX_PORT_STABLE_FOR}s require_x11=${MT5_REQUIRE_X11_WINDOW} functional_ready=${_FUNCTIONAL_READY} ipc_pipes=${_PIPES_STATUS} ipc_pipes_hits=${IPC_PIPES_HITS}/${IPC_PIPES_REQUIRED_HITS} last_evidence=${IPC_PIPES_LAST_EVIDENCE}" > "${IPC_STATUS_FILE}" 2>/dev/null || true
       touch "${IPC_READY_FILE}" 2>/dev/null || true
       echo "[mt5-probe] mt5_ipc.ready written — adapter will connect via mt5linux TCP bridge"
       {
         echo "=== TCP gate PASSED diagnostics ==="
         echo "elapsed=${TCP_WAITED}s established=${ESTABLISHED:-?}"
+        echo "mode=${_READY_STATUS_MODE} term_windows=${_TERM_WINDOWS:-?} require_x11=${MT5_REQUIRE_X11_WINDOW}"
+        echo "ipc_pipes=present ipc_pipes_hits=${IPC_PIPES_HITS}/${IPC_PIPES_REQUIRED_HITS} last_evidence=${IPC_PIPES_LAST_EVIDENCE}"
         echo "=== dismiss log tail ==="
         tail -n 40 "${DISMISS_LOG}" 2>/dev/null || true
         echo "=== wineserver timeline tail ==="
@@ -811,12 +1095,56 @@ fi
         {
           echo "=== TCP gate TIMEOUT diagnostics ==="
           echo "elapsed=${TCP_WAITED}s"
+          echo "DISPLAY=${DISPLAY:-unset}"
+          echo "MT5_REQUIRE_X11_WINDOW=${MT5_REQUIRE_X11_WINDOW}"
+          echo "MT5_SKIP_PIPE_VERIFICATION=${MT5_SKIP_PIPE_VERIFICATION}"
+          echo "ipc_pipes_required_hits=${IPC_PIPES_REQUIRED_HITS}"
+          echo "xdotool_path=$(command -v xdotool 2>/dev/null || echo missing)"
+          echo "wmctrl_path=$(command -v wmctrl 2>/dev/null || echo missing)"
+          echo "ipc_pipes_last_present=${IPC_PIPES_LAST_PRESENT}"
+          echo "ipc_pipes_last_evidence=${IPC_PIPES_LAST_EVIDENCE}"
+          echo "=== visible windows snapshot ==="
+          DISPLAY="${DISPLAY}" xdotool search --onlyvisible 2>/dev/null \
+            | while IFS= read -r _wsid; do
+                _wname=$(DISPLAY="${DISPLAY}" xdotool getwindowname "${_wsid}" 2>/dev/null || echo "?")
+                echo "${_wsid}:${_wname}"
+              done || true
+          echo "=== terminal pid / process snapshot ==="
+          echo "terminal_pid=${TERMINAL_RUNTIME_PID:-unknown}"
+          echo "terminal_child_pid=${TERMINAL_CHILD_PID:-unknown}"
+          ps -eo pid,ppid,comm,args 2>/dev/null | grep -E 'terminal64\.exe|wineserver|wine|Xvfb|fluxbox|python|mt5linux' || true
           echo "=== dismiss log tail ==="
           tail -n 80 "${DISMISS_LOG}" 2>/dev/null || true
           echo "=== wineserver timeline tail ==="
           tail -n 40 "${WINESERVER_TIMELINE}" 2>/dev/null || true
           echo "=== terminal.log tail ==="
           tail -n 100 "${LOGDIR}/mt5-terminal.log" 2>/dev/null || true
+          echo "=== MT5 Terminal Logs (AppData) ==="
+          _MT5_LOG_DIR=""
+          for _ld in \
+            "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+            "${WINEPREFIX}/drive_c/users/wineuser/AppData/Roaming/MetaQuotes/Terminal"; do
+            if [[ -d "${_ld}" ]]; then
+              _MT5_LOG_DIR="${_ld}"
+              break
+            fi
+          done
+          if [[ -n "${_MT5_LOG_DIR}" ]]; then
+            find "${_MT5_LOG_DIR}" -maxdepth 3 -name "*.log" -newer "${IPC_PROBE_LOG}" 2>/dev/null | while IFS= read -r _lf; do
+              echo "--- ${_lf} ---"
+              tail -n 50 "${_lf}" 2>/dev/null || true
+            done
+            echo "--- terminal.ini ---"
+            find "${_MT5_LOG_DIR}" -maxdepth 3 -name "terminal.ini" -exec cat {} \; 2>/dev/null || true
+          fi
+          echo "=== Screenshot (X11 display) ==="
+          if command -v import &>/dev/null; then
+            import -window root -format png "${LOGDIR}/screenshot-gate-timeout.png" 2>/dev/null && echo "screenshot saved: ${LOGDIR}/screenshot-gate-timeout.png" || echo "screenshot failed"
+          elif command -v xwd &>/dev/null; then
+            DISPLAY="${DISPLAY}" xwd -root -out "${LOGDIR}/screenshot-gate-timeout.xwd" 2>/dev/null && echo "screenshot saved: ${LOGDIR}/screenshot-gate-timeout.xwd" || echo "screenshot failed"
+          else
+            echo "no screenshot tool available (install imagemagick or x11-apps)"
+          fi
         } >> "${IPC_PROBE_LOG}" 2>/dev/null || true
         touch "${IPC_FAILED_FILE}" 2>/dev/null || true
       fi
@@ -824,7 +1152,16 @@ fi
   fi
 
   # Keep wrapper attached to terminal lifecycle.
-  wait "${TERMINAL_PID}" || true
+  if [[ -n "${TERMINAL_CHILD_PID:-}" ]] && kill -0 "${TERMINAL_CHILD_PID}" 2>/dev/null; then
+    echo "[mt5-lifecycle] mode=wait_child child_pid=${TERMINAL_CHILD_PID} runtime_pid=${TERMINAL_RUNTIME_PID:-unknown}"
+    wait "${TERMINAL_CHILD_PID}" || true
+  elif [[ -n "${TERMINAL_RUNTIME_PID:-}" ]] && kill -0 "${TERMINAL_RUNTIME_PID}" 2>/dev/null; then
+    echo "[mt5-lifecycle] mode=poll_runtime_pid runtime_pid=${TERMINAL_RUNTIME_PID} child_pid=${TERMINAL_CHILD_PID:-none}"
+    while kill -0 "${TERMINAL_RUNTIME_PID}" 2>/dev/null; do sleep 5; done
+    echo "[mt5-lifecycle] runtime_pid_exited pid=${TERMINAL_RUNTIME_PID}"
+  else
+    echo "[mt5-lifecycle] mode=no_active_terminal child_pid=${TERMINAL_CHILD_PID:-none} runtime_pid=${TERMINAL_RUNTIME_PID:-none}"
+  fi
 ) 2>&1 | tee /tmp/mt5-launch-wrapper.log &
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"

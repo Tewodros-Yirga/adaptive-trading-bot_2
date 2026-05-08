@@ -1,6 +1,7 @@
 import os
 import random
 import time
+import re
 from typing import Any
 
 from .config import settings
@@ -108,6 +109,46 @@ class MT5Adapter:
             return "initialize_failed"
         return "unknown"
 
+    def _infer_context_mode(self) -> str:
+        """
+        Infer MT5 context mode deterministically from start.sh.
+        start.sh writes ${LOGDIR}/mt5_context.status as: mode=<...>; exe=...; args=...
+        """
+        logdir = os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs")
+        context_status_file = os.path.join(logdir, "mt5_context.status")
+        try:
+            if os.path.isfile(context_status_file):
+                txt = open(context_status_file, "r", encoding="utf-8", errors="replace").read()
+                m = re.search(r"mode=([^;]+);", txt)
+                if m:
+                    return m.group(1).strip().lower()
+        except Exception:
+            pass
+
+        return os.environ.get("MT5_CONTEXT_MODE", "default").strip().lower()
+
+    def _linux_to_windows_path(self, linux_path: str) -> str | None:
+        """
+        Convert Wine linux executable paths like:
+          /opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe
+        into:
+          C:\\Program Files\\MetaTrader 5\\terminal64.exe
+        """
+        try:
+            wineprefix = (os.environ.get("WINEPREFIX") or "/opt/wineprefix").rstrip("/")
+            rel = linux_path
+            if linux_path.startswith(wineprefix):
+                rel = linux_path[len(wineprefix) :]
+            # Expect /drive_<letter>/<path...>
+            m = re.search(r"/drive_([a-zA-Z])/((?:.*)$)", rel)
+            if not m:
+                return None
+            drive = m.group(1).upper()
+            sub = m.group(2).replace("/", "\\")
+            return f"{drive}:\\{sub}"
+        except Exception:
+            return None
+
     def _retry_backoff(self) -> float:
         """Return how many seconds to wait before the next connection attempt."""
         idx = min(self._connect_attempts, len(_RETRY_BACKOFF_SECONDS) - 1)
@@ -147,12 +188,16 @@ class MT5Adapter:
             "mt5_ipc.ready",
         )
         if launch_terminal_enabled and not os.path.isfile(ipc_ready_file):
-            self.connected = False
-            self.last_error = "mt5 ipc not ready yet"
-            self.last_error_class = "ipc_not_ready"
-            if not settings.mt_fallback_mode:
-                raise RuntimeError(self.last_error)
-            return
+            # Fast-fail for the first attempts to avoid blocking the event loop.
+            # After enough retries, attempt connection anyway so real MT5 errors
+            # (e.g. -10003 / -10005) surface in logs for diagnosis.
+            if self._connect_attempts < 3:
+                self.connected = False
+                self.last_error = "mt5 ipc not ready yet"
+                self.last_error_class = "ipc_not_ready"
+                if not settings.mt_fallback_mode:
+                    raise RuntimeError(self.last_error)
+                return
 
         # 1) Try native MetaTrader5 — Windows only.
         #    The native package uses Windows DLLs (CreateFileMapping / named pipes)
@@ -211,8 +256,9 @@ class MT5Adapter:
                         # computes the IPC pipe name from the exe directory (portable data
                         # dir) rather than %APPDATA%\MetaQuotes\...  Without this flag,
                         # the pipe lookup always times out with -10005.
-                        context_mode = os.environ.get("MT5_CONTEXT_MODE", "default").lower()
-                        if context_mode == "portable":
+                        context_mode = self._infer_context_mode()
+                        portable_flag = context_mode == "portable"
+                        if portable_flag:
                             creds["portable"] = True
                         # ── Build-mismatch fast-fail ──────────────────────
                         # start.sh writes a sentinel if terminal build ≠ package
@@ -243,7 +289,16 @@ class MT5Adapter:
                         # This is tried first because it avoids all dialog
                         # interactions and is fastest when the session is valid.
                         for init_attempt in range(1, 3):
-                            ok = client.initialize(timeout=30000)
+                            init_kwargs: dict[str, Any] = {"timeout": 30000}
+                            if portable_flag:
+                                init_kwargs["portable"] = True
+                            try:
+                                ok = client.initialize(**init_kwargs)
+                            except TypeError:
+                                # Some mt5linux/meta wrapper signatures may not accept
+                                # portable for bare attach; retry without it.
+                                init_kwargs.pop("portable", None)
+                                ok = client.initialize(**init_kwargs)
                             if ok:
                                 break
                             err = client.last_error() if hasattr(client, "last_error") else "unknown"
@@ -274,10 +329,34 @@ class MT5Adapter:
                             classified = self._classify_error_text(last_init_error)
                             if classified == "ipc_timeout" and context_mode in {"portable", "data_dir"}:
                                 classified = "context_mismatch_suspected"
+                            # One-time remediation: terminal_not_found (-10003) can be caused
+                            # by path/IPC naming mismatch. Retry once with an explicit
+                            # terminal executable path.
+                            if classified == "terminal_not_found":
+                                terminal_windows_path = self._linux_to_windows_path(terminal_exe)
+                                if terminal_windows_path:
+                                    init_kwargs = {"timeout": 60000, "path": terminal_windows_path}
+                                    if portable_flag:
+                                        init_kwargs["portable"] = True
+                                    try:
+                                        ok = client.initialize(**init_kwargs)
+                                    except TypeError:
+                                        init_kwargs.pop("portable", None)
+                                        ok = client.initialize(**init_kwargs)
+                                    if ok:
+                                        info = client.account_info()
+                                        if info is not None:
+                                            self._mt = client
+                                            self._backend = "mt5linux"
+                                            self.connected = True
+                                            self.last_error = None
+                                            self.last_error_class = None
+                                            self._connect_attempts = 0
+                                            self._next_connect_at = 0.0
+                                            return
+
                             self.last_error_class = classified
-                            raise RuntimeError(
-                                f"initialize() returned False [{self.last_error_class}]: {last_init_error}"
-                            )
+                            raise RuntimeError(f"initialize() returned False [{self.last_error_class}]: {last_init_error}")
 
                         info = client.account_info()
                         if info is None:

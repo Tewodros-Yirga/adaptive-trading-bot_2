@@ -214,6 +214,8 @@ def debug_mt5():
         "runtime_env": {
             "mt5_launch_terminal": os.environ.get("MT5_LAUNCH_TERMINAL", ""),
             "mt5_context_mode": os.environ.get("MT5_CONTEXT_MODE", ""),
+            "mt5_skip_pipe_verification": os.environ.get("MT5_SKIP_PIPE_VERIFICATION", ""),
+            "mt5_require_x11_window": os.environ.get("MT5_REQUIRE_X11_WINDOW", ""),
             "mt_login_configured": bool(settings.mt_login),
             "mt_server_configured": bool(settings.mt_server.strip()),
         },
