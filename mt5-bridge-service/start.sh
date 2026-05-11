@@ -1101,12 +1101,24 @@ fi
         _term_wine_path="C:\\\\${_term_wine_path////\\\\}"
       fi
 
-      # Attempt 1: bare initialize (no path) — matches natural AppData discovery.
-      # Use python -u (unbuffered) and explicit sys.stdout.flush() so we
-      # capture output even if timeout kills the process.
-      _out="$(timeout 25s wine "${FOUND_PYTHON}" -u -c "
-import sys, MetaTrader5 as mt5
-ok = mt5.initialize(timeout=15000)
+      # Attempt 1: credentialed initialize with path — give MetaTrader5.pyd
+      # full context to find the terminal.  Bare initialize (no path, no login)
+      # relies on Windows registry discovery which is unreliable under Wine.
+      # Passing login/password/server triggers the terminal's auth flow and
+      # ensures the correct IPC shared-memory segment is opened.
+      # Timeout increased from 15s to 60s for Wine overhead.
+      _out="$(timeout 70s wine "${FOUND_PYTHON}" -u -c "
+import sys, os, MetaTrader5 as mt5
+login = int(os.environ.get('MT_LOGIN', '0'))
+password = os.environ.get('MT_PASSWORD', '')
+server = os.environ.get('MT_SERVER', '')
+path = r'${_term_wine_path}'
+kwargs = {'path': path, 'timeout': 60000}
+if login and password and server:
+    kwargs['login'] = login
+    kwargs['password'] = password
+    kwargs['server'] = server
+ok = mt5.initialize(**kwargs)
 err = mt5.last_error()
 try:
     mt5.shutdown()
@@ -1114,7 +1126,7 @@ except Exception:
     pass
 print(f'FUNCTIONAL_OK={ok}')
 print(f'FUNCTIONAL_ERR={err}')
-print(f'FUNCTIONAL_MODE=bare')
+print(f'FUNCTIONAL_MODE=credentialed')
 sys.stdout.flush()
 " 2>"${_stderr_file}" || true)"
       _FUNCTIONAL_LAST_OUT="${_out}"
@@ -1127,11 +1139,11 @@ sys.stdout.flush()
         return 0
       fi
 
-      # Attempt 2: explicit path — if bare attach fails with terminal_not_found
-      # (-10003) the terminal may need a path hint even in default mode.
-      _out="$(timeout 25s wine "${FOUND_PYTHON}" -u -c "
+      # Attempt 2: bare initialize (no credentials) — fallback in case
+      # the credentialed call causes an auth dialog that blocks.
+      _out="$(timeout 70s wine "${FOUND_PYTHON}" -u -c "
 import sys, MetaTrader5 as mt5
-ok = mt5.initialize(path=r'${_term_wine_path}', timeout=15000)
+ok = mt5.initialize(path=r'${_term_wine_path}', timeout=60000)
 err = mt5.last_error()
 try:
     mt5.shutdown()
@@ -1139,7 +1151,7 @@ except Exception:
     pass
 print(f'FUNCTIONAL_OK={ok}')
 print(f'FUNCTIONAL_ERR={err}')
-print(f'FUNCTIONAL_MODE=path')
+print(f'FUNCTIONAL_MODE=bare_path')
 sys.stdout.flush()
 " 2>"${_stderr_file}" || true)"
       _FUNCTIONAL_LAST_OUT="${_out}"
