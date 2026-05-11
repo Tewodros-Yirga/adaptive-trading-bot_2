@@ -366,11 +366,36 @@ fi
     | while IFS= read -r _hcfg; do _mt5_precfg "${_hcfg}"; done || true
   unset -f _mt5_precfg
 
+  # ── Patch terminal.ini to force AllowLiveTrading=1 ─────────────────────────
+  # MT5 has a safety feature: when the account "changes" (which happens on
+  # every container restart because credentials are injected fresh), it auto-
+  # disables the Algo Trading button. With Algo Trading disabled, MT5 does
+  # NOT create the IPC named pipes, causing mt5.initialize() → -10005.
+  # Fix: patch every terminal.ini we can find to force AllowLiveTrading=1.
+  _mt5_patch_terminal_ini() {
+    local _ini="$1"
+    if [ -f "${_ini}" ]; then
+      # Enable AllowLiveTrading if it exists as 0
+      sed -i 's/AllowLiveTrading=0/AllowLiveTrading=1/g' "${_ini}" 2>/dev/null || true
+      # Ensure [Experts] section exists with the right settings
+      if ! grep -q '\[Experts\]' "${_ini}" 2>/dev/null; then
+        printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\n' >> "${_ini}" 2>/dev/null || true
+      fi
+      echo "[mt5-terminal] Patched terminal.ini → ${_ini}"
+    fi
+  }
+  # Patch terminal.ini in every profile directory
+  find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+    -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null \
+    | while IFS= read -r _hcfg; do _mt5_patch_terminal_ini "${_hcfg}/terminal.ini"; done || true
+  _mt5_patch_terminal_ini "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config/terminal.ini"
+  unset -f _mt5_patch_terminal_ini
+
   # Write a Windows-accessible standalone config file used by the /config: flag.
   # This is the most reliable way to pass Login/Server to the terminal on startup
   # regardless of which profile directory it selects internally.
   _WIN_CFG_LINUX="${WINEPREFIX}/drive_c/mt5-headless.ini"
-  printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+  printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\n' \
     "${MT_LOGIN}" "${MT_SERVER}" > "${_WIN_CFG_LINUX}" 2>/dev/null || true
   echo "[mt5-terminal] Wrote Windows-accessible config → ${_WIN_CFG_LINUX}"
 
@@ -537,6 +562,21 @@ fi
         if [ $(( _try % 10 )) -eq 0 ]; then
           echo "[dismiss-action] iter=${_try} clicked Cancel(748,490) + Escape on main_wid=${_MAIN_WID}" >> "${DISMISS_LOG}"
         fi
+      fi
+      # Step 3c: Enable Algo Trading (Ctrl+E) on the main terminal window.
+      # MT5 auto-disables Algo Trading when the account "changes" (which
+      # happens on every container restart). Without Algo Trading enabled,
+      # MT5 does NOT create the IPC named pipes → mt5.initialize() returns
+      # -10005. Ctrl+E is the keyboard shortcut to toggle Algo Trading ON.
+      #
+      # IMPORTANT: Ctrl+E is a TOGGLE — sending it every iteration would
+      # flip ON→OFF→ON. We send it only on specific iterations (5,15,25...)
+      # giving the terminal time to start and disable algo trading first,
+      # then toggling it back ON once.
+      if [ -n "${_MAIN_WID}" ] && [ $(( _try % 10 )) -eq 5 ]; then
+        _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
+        _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
+        echo "[dismiss-action] iter=${_try} sent Ctrl+E (Algo Trading toggle) to main_wid=${_MAIN_WID}" >> "${DISMISS_LOG}"
       fi
       # Step 4: Enumerate ALL windows owned by the terminal process (including
       # hidden/embedded child windows not found by --onlyvisible). This catches
