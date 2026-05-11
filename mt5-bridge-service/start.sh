@@ -374,19 +374,40 @@ fi
     "${MT_LOGIN}" "${MT_SERVER}" > "${_WIN_CFG_LINUX}" 2>/dev/null || true
   echo "[mt5-terminal] Wrote Windows-accessible config → ${_WIN_CFG_LINUX}"
 
-  # ── Lock terminal binaries READ-ONLY before launch ──────────────────────────
-  # LiveUpdate can download a newer build (e.g. 5833) that has NO matching
-  # MetaTrader5 Python package on PyPI (latest is 5.0.5735). When the terminal
-  # and Python package build numbers don't match, mt5.initialize() returns
-  # -10005 (IPC timeout) on every call. Locking the .exe/.dll files prevents
-  # LiveUpdate from overwriting them; the terminal runs fine but stays at the
-  # pre-baked build that matches the installed Python package.
+  # ── Lock terminal binaries IMMUTABLE before launch ─────────────────────────
+  # chmod a-w alone is NOT enough: the owner can still DELETE and RECREATE the
+  # file (unlink+create), which is exactly what LiveUpdate does. It downloads
+  # a newer build (e.g. 5833) that has NO matching MetaTrader5 Python package
+  # on PyPI. When the terminal and Python package build numbers don't match,
+  # mt5.initialize() returns -10005 (IPC timeout) on every call.
+  #
+  # Defense in depth:
+  #   1. chattr +i   — makes files immutable (can't delete, rename, or modify)
+  #   2. sticky bit  — prevents deletion by non-owner in shared dirs (backup)
+  #   3. iptables    — blocks outbound to MetaQuotes update IPs (they bypass DNS)
   _TERM_DIR="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5"
   echo "[mt5-terminal] Locking terminal binaries to prevent LiveUpdate version drift..."
+  # Layer 1: Make exe/dll files immutable via chattr (ext4 filesystem attribute)
+  find "${_TERM_DIR}" \( -name '*.exe' -o -name '*.dll' \) \
+    -exec chattr +i {} \; 2>/dev/null || true
+  # Layer 2: Fallback — remove write permission from files AND directories
   find "${_TERM_DIR}" \( -name '*.exe' -o -name '*.dll' \) \
     -exec chmod a-w {} \; 2>/dev/null || true
-  echo "[mt5-terminal] Terminal binaries locked (read-only)."
-  unset _TERM_DIR
+  chmod a-w "${_TERM_DIR}" 2>/dev/null || true
+  # Layer 3: Block outbound connections to known MetaQuotes update IP ranges.
+  # The terminal uses hardcoded IPs alongside DNS, so /etc/hosts alone is not
+  # enough. These cover cdn.mql5.com / update.metatrader5.com ranges.
+  for _ip_range in \
+    "78.140.128.0/17" "213.143.96.0/20" "185.31.148.0/22" \
+    "95.211.0.0/16" "159.253.0.0/16" "193.105.236.0/23"; do
+    iptables -A OUTPUT -d "${_ip_range}" -j DROP 2>/dev/null || true
+  done
+  echo "[mt5-terminal] Terminal binaries locked (immutable+iptables)."
+  # Verify: log the current binary version
+  _LOCKED_BUILD=$(exiftool -FileVersionNumber "${_TERM_DIR}/terminal64.exe" 2>/dev/null \
+    | grep -oP '\d+\.\d+\.\d+\.(\d+)' | grep -oP '\d+$' || echo "?")
+  echo "[mt5-terminal] Locked binary build: ${_LOCKED_BUILD}"
+  unset _TERM_DIR _LOCKED_BUILD
 
   _launch_terminal() {
     echo "[mt5-terminal] Launching MetaTrader 5 terminal..."
