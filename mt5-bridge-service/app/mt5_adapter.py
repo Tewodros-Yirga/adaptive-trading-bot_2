@@ -276,7 +276,8 @@ class MT5Adapter:
                             self.last_error_class = "build_mismatch"
                             raise RuntimeError(
                                 f"FATAL: terminal/package build mismatch ({_mismatch_info}). "
-                                f"Rebuild the base image with a matching terminal. "
+                                f"Fix: set MT5_PORTABLE_ZIP_URL env var to a portable zip "
+                                f"matching the package build, or rebuild the base image. "
                                 f"mt5.initialize() will return -10005 every time."
                             )
 
@@ -385,7 +386,7 @@ class MT5Adapter:
             except Exception as exc:
                 self.last_error = f"mt5linux init failed: {exc}"
                 # Preserve more specific classification chosen in inner scope.
-                if self.last_error_class != "context_mismatch_suspected":
+                if self.last_error_class not in ("context_mismatch_suspected", "build_mismatch"):
                     self.last_error_class = self._classify_error_text(self.last_error)
 
         self.connected = False

@@ -698,14 +698,134 @@ fi
     if [[ -n "${_TERM_BUILD}" ]] && [[ -n "${_PKG_BUILD}" ]] \
        && [[ "${_TERM_BUILD}" != "${_PKG_BUILD}" ]]; then
       echo "[mt5-probe] ╔════════════════════════════════════════════════════╗" >&2
-      echo "[mt5-probe] ║  FATAL: TERMINAL / PACKAGE BUILD MISMATCH         ║" >&2
+      echo "[mt5-probe] ║  TERMINAL / PACKAGE BUILD MISMATCH DETECTED       ║" >&2
       echo "[mt5-probe] ║  Terminal build: ${_TERM_BUILD}                          ║" >&2
       echo "[mt5-probe] ║  Package build:  ${_PKG_BUILD}                          ║" >&2
       echo "[mt5-probe] ║                                                    ║" >&2
-      echo "[mt5-probe] ║  mt5.initialize() will return -10005 every time.   ║" >&2
-      echo "[mt5-probe] ║  Rebuild the base image with a matching terminal.  ║" >&2
+      echo "[mt5-probe] ║  Attempting runtime self-heal...                   ║" >&2
       echo "[mt5-probe] ╚════════════════════════════════════════════════════╝" >&2
       echo "terminal=${_TERM_BUILD} package=${_PKG_BUILD}" > "${_MISMATCH_FILE}" 2>/dev/null || true
+
+      # ── Self-healing: download a portable terminal matching the package ──
+      # Priority:
+      #   1. MT5_PORTABLE_ZIP_URL env var (user-supplied direct link)
+      #   2. Well-known GitHub Release asset pattern
+      _PORTABLE_URL="${MT5_PORTABLE_ZIP_URL:-}"
+      if [[ -z "${_PORTABLE_URL}" ]] && [[ -n "${_PKG_BUILD}" ]]; then
+        _PORTABLE_URL="https://github.com/loriloha/adaptive-trading-bot/releases/download/mt5-portable-${_PKG_BUILD}/mt5-portable.zip"
+      fi
+
+      _HEAL_SUCCESS=false
+      if [[ -n "${_PORTABLE_URL}" ]]; then
+        echo "[mt5-probe] Attempting terminal downgrade via portable zip..." >&2
+        echo "[mt5-probe]   URL: ${_PORTABLE_URL}" >&2
+        _DL_TMP="${MT5_WORKDIR:-/tmp}/mt5-portable-dl.zip"
+        if curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 \
+             "${_PORTABLE_URL}" -o "${_DL_TMP}" 2>/dev/null \
+           && [[ -s "${_DL_TMP}" ]]; then
+          echo "[mt5-probe] Downloaded portable zip ($(du -sh "${_DL_TMP}" 2>/dev/null | cut -f1))" >&2
+
+          # 1) Kill the running terminal — it has the wrong build
+          echo "[mt5-probe] Stopping terminal64.exe (build ${_TERM_BUILD})..." >&2
+          pkill -f "terminal64.exe" 2>/dev/null || true
+          sleep 2
+          # Force-kill if still alive
+          pkill -9 -f "terminal64.exe" 2>/dev/null || true
+          sleep 1
+
+          # 2) Unlock binaries, extract portable zip, re-lock
+          _TERM_DIR="${WINEPREFIX}/drive_c/Program Files/MetaTrader 5"
+          chmod -R u+w "${_TERM_DIR}" 2>/dev/null || true
+          if unzip -o "${_DL_TMP}" -d "${_TERM_DIR}" >/dev/null 2>&1; then
+            echo "[mt5-probe] Extracted portable zip into ${_TERM_DIR}" >&2
+            find "${_TERM_DIR}" \( -name '*.exe' -o -name '*.dll' \) \
+              -exec chmod a-w {} \; 2>/dev/null || true
+            echo "[mt5-probe] Terminal binaries re-locked (read-only)." >&2
+          else
+            echo "[mt5-probe] WARNING: unzip failed — terminal may be corrupt" >&2
+          fi
+          rm -f "${_DL_TMP}" 2>/dev/null || true
+
+          # 3) Verify the build after replacement
+          _NEW_BUILD=""
+          if command -v exiftool &>/dev/null; then
+            _NEW_BUILD=$(exiftool -FileVersion "${_TERM_EXE}" 2>/dev/null \
+              | grep -oE '[0-9]+$' || true)
+          fi
+          if [[ -z "${_NEW_BUILD}" ]]; then
+            _NEW_BUILD=$(strings "${_TERM_EXE}" 2>/dev/null \
+              | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || true)
+          fi
+          echo "[mt5-probe] Post-replacement terminal build: ${_NEW_BUILD:-unknown}" >&2
+
+          if [[ "${_NEW_BUILD}" == "${_PKG_BUILD}" ]]; then
+            echo "[mt5-probe] ✓ Build mismatch RESOLVED! terminal=${_NEW_BUILD} package=${_PKG_BUILD}" >&2
+            rm -f "${_MISMATCH_FILE}" 2>/dev/null || true
+            _TERM_BUILD="${_NEW_BUILD}"
+            _HEAL_SUCCESS=true
+          elif [[ -n "${_NEW_BUILD}" ]]; then
+            # Terminal replaced but package still mismatches — sync the package
+            echo "[mt5-probe] Terminal now build ${_NEW_BUILD}, package is ${_PKG_BUILD} — syncing package..." >&2
+            _SYNC_PKG="MetaTrader5==5.0.${_NEW_BUILD}"
+            if WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
+                 "${_SYNC_PKG}" --quiet >/dev/null 2>&1; then
+              echo "[mt5-probe] ✓ Package synced to ${_SYNC_PKG}" >&2
+              _PKG_BUILD="${_NEW_BUILD}"
+              _TERM_BUILD="${_NEW_BUILD}"
+              rm -f "${_MISMATCH_FILE}" 2>/dev/null || true
+              _HEAL_SUCCESS=true
+            else
+              echo "[mt5-probe] WARNING: pip install ${_SYNC_PKG} failed — trying latest..." >&2
+              WINEDEBUG="-all" timeout 120 "$WINE_CMD" "$FOUND_PYTHON" -m pip install \
+                --upgrade MetaTrader5 --quiet >/dev/null 2>&1 || true
+              # Re-read installed version
+              _SYNC_VER=$(WINEDEBUG="-all" timeout 20 "$WINE_CMD" "$FOUND_PYTHON" \
+                -c "import MetaTrader5 as m; print(getattr(m,'__version__','?'))" 2>/dev/null \
+                | tr -d '\r\n' || echo "unknown")
+              _SYNC_BUILD=$(echo "${_SYNC_VER}" | grep -oE '[0-9]+$' || true)
+              if [[ "${_SYNC_BUILD}" == "${_NEW_BUILD}" ]]; then
+                echo "[mt5-probe] ✓ Package synced via upgrade: ${_SYNC_VER}" >&2
+                _PKG_BUILD="${_SYNC_BUILD}"
+                _TERM_BUILD="${_NEW_BUILD}"
+                rm -f "${_MISMATCH_FILE}" 2>/dev/null || true
+                _HEAL_SUCCESS=true
+              else
+                echo "[mt5-probe] Package sync failed: terminal=${_NEW_BUILD} package=${_SYNC_BUILD:-unknown}" >&2
+              fi
+            fi
+          fi
+
+          # 4) Relaunch the terminal with the replaced binary
+          echo "[mt5-probe] Relaunching terminal64.exe..." >&2
+          _launch_terminal
+          LAST_WS_PIDS="$(_ws_pids)"
+          echo "[mt5-probe] Relaunched terminal (new PID=${TERMINAL_RUNTIME_PID})" >&2
+          # Reset grace period for TCP gate
+          TERMINAL_STABLE_AFTER=$(( TCP_WAITED + 30 )) 2>/dev/null || true
+          MT5LINUX_PORT_STABLE_FOR=0
+        else
+          echo "[mt5-probe] Portable zip download FAILED (URL: ${_PORTABLE_URL})" >&2
+          echo "[mt5-probe] To fix: set MT5_PORTABLE_ZIP_URL env var to a direct link" >&2
+          echo "[mt5-probe]   containing a portable MT5 terminal zip for build ${_PKG_BUILD}" >&2
+          rm -f "${_DL_TMP}" 2>/dev/null || true
+        fi
+      else
+        echo "[mt5-probe] No portable zip URL configured and no GitHub Release found" >&2
+        echo "[mt5-probe] Set MT5_PORTABLE_ZIP_URL in Space env vars to self-heal" >&2
+      fi
+
+      # If self-heal failed, keep the mismatch file so the adapter fast-fails
+      if [[ "${_HEAL_SUCCESS}" != "true" ]]; then
+        echo "[mt5-probe] ╔════════════════════════════════════════════════════╗" >&2
+        echo "[mt5-probe] ║  SELF-HEAL FAILED — mismatch persists             ║" >&2
+        echo "[mt5-probe] ║  mt5.initialize() will return -10005 every time.  ║" >&2
+        echo "[mt5-probe] ║                                                    ║" >&2
+        echo "[mt5-probe] ║  Fix options:                                      ║" >&2
+        echo "[mt5-probe] ║  1. Set MT5_PORTABLE_ZIP_URL to a matching zip    ║" >&2
+        echo "[mt5-probe] ║  2. Rebuild base image with terminal ≤ ${_PKG_BUILD}     ║" >&2
+        echo "[mt5-probe] ║  3. Wait for PyPI MetaTrader5==${_TERM_BUILD} release    ║" >&2
+        echo "[mt5-probe] ╚════════════════════════════════════════════════════╝" >&2
+      fi
     else
       rm -f "${_MISMATCH_FILE}" 2>/dev/null || true
       if [[ -n "${_TERM_BUILD}" ]] && [[ -n "${_PKG_BUILD}" ]]; then
