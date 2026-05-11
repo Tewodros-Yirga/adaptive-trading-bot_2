@@ -1,6 +1,6 @@
 ---
 title: MT5 Bridge Service
-emoji: 📈
+emoji: 📊
 colorFrom: blue
 colorTo: indigo
 sdk: docker
