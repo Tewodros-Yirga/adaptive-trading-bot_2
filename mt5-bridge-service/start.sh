@@ -567,16 +567,44 @@ fi
       # MT5 auto-disables Algo Trading when the account "changes" (which
       # happens on every container restart). Without Algo Trading enabled,
       # MT5 does NOT create the IPC named pipes → mt5.initialize() returns
-      # -10005. Ctrl+E is the keyboard shortcut to toggle Algo Trading ON.
+      # -10005.
       #
-      # IMPORTANT: Ctrl+E is a TOGGLE — sending it every iteration would
-      # flip ON→OFF→ON. We send it only on specific iterations (5,15,25...)
-      # giving the terminal time to start and disable algo trading first,
-      # then toggling it back ON once.
-      if [ -n "${_MAIN_WID}" ] && [ $(( _try % 10 )) -eq 5 ]; then
-        _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
-        _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
-        echo "[dismiss-action] iter=${_try} sent Ctrl+E (Algo Trading toggle) to main_wid=${_MAIN_WID}" >> "${DISMISS_LOG}"
+      # PROBLEM: Ctrl+E is a TOGGLE. Sending it blindly oscillates ON→OFF→ON.
+      # The "account has been changed" event can fire MINUTES after startup,
+      # re-disabling algo trading after we already enabled it.
+      #
+      # SOLUTION: Check the MT5 journal log for the LAST occurrence of
+      # "automated trading is disabled" vs "automated trading is enabled".
+      # Only send Ctrl+E if the last state is "disabled".
+      if [ -n "${_MAIN_WID}" ]; then
+        _MT5_LOGDIR="${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal"
+        _LATEST_LOG=$(find "${_MT5_LOGDIR}" -name "*.log" -path "*/logs/*" 2>/dev/null \
+          | sort | tail -1 || true)
+        if [ -z "${_LATEST_LOG}" ]; then
+          # Also check portable-style log path
+          _LATEST_LOG=$(find "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/logs" \
+            -name "*.log" 2>/dev/null | sort | tail -1 || true)
+        fi
+        _ALGO_STATE="unknown"
+        if [ -n "${_LATEST_LOG}" ] && [ -f "${_LATEST_LOG}" ]; then
+          # Get the LAST line matching either state
+          _LAST_ALGO=$(grep -i "automated trading is" "${_LATEST_LOG}" 2>/dev/null | tail -1 || true)
+          if echo "${_LAST_ALGO}" | grep -qi "is disabled"; then
+            _ALGO_STATE="disabled"
+          elif echo "${_LAST_ALGO}" | grep -qi "is enabled"; then
+            _ALGO_STATE="enabled"
+          fi
+        fi
+        if [ "${_ALGO_STATE}" = "disabled" ]; then
+          _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
+          _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
+          echo "[dismiss-action] iter=${_try} Algo Trading was DISABLED → sent Ctrl+E to re-enable (main_wid=${_MAIN_WID})" >> "${DISMISS_LOG}"
+        elif [ "${_ALGO_STATE}" = "unknown" ] && [ $(( _try % 20 )) -eq 5 ]; then
+          # Fallback: if we can't determine state, try once at iter 5,25,45...
+          _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
+          _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
+          echo "[dismiss-action] iter=${_try} Algo Trading state unknown → sent Ctrl+E (fallback)" >> "${DISMISS_LOG}"
+        fi
       fi
       # Step 4: Enumerate ALL windows owned by the terminal process (including
       # hidden/embedded child windows not found by --onlyvisible). This catches
