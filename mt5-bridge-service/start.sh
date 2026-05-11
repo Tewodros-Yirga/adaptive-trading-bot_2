@@ -472,10 +472,14 @@ fi
           _xd key --window "${_wid}" --clearmodifiers Return
         fi
       done
-      # Step 3: First-run wizard dialogs — press Escape to CANCEL them.
-      # Do NOT type server names or click Next — the terminal's pre-baked
-      # AppData config handles auth automatically. Advancing the wizard
-      # causes a MetaQuotes account setup flow that blocks IPC.
+      # Step 3: First-run wizard dialogs.
+      # IMPORTANT: The "Select a company" dialog is NOT a separate X11 window.
+      # It is an embedded Win32 child dialog inside the main MT5 X11 window
+      # (e.g. "435802062 - Exness-MT5Trial9 - Netting"). Therefore,
+      # xdotool search --name "Select a company" finds NOTHING.
+      # Fix: find the main terminal window and click the Cancel button at
+      # its known coordinates (bottom-right of the centered dialog).
+      # On a 1024x768 display, Cancel is approximately at x=748,y=490.
       for _wid in $({ _xd search --onlyvisible --name "Select a company"
                       _xd search --onlyvisible --name "open an account"
                       _xd search --onlyvisible --name "Setup"
@@ -486,6 +490,33 @@ fi
         _xd key --window "${_wid}" --clearmodifiers Escape; sleep 0.1
         _xd key --window "${_wid}" --clearmodifiers Escape
       done
+      # Step 3b: Click Cancel on embedded "Select a company" dialog.
+      # This dialog is NOT a separate X11 window — it renders inside the
+      # main MT5 terminal window. xdotool can only find the parent X11
+      # window, so we click Cancel at its known screen coordinates.
+      _MAIN_WID=$(_xd search --onlyvisible --name "Netting" 2>/dev/null | head -1 || true)
+      if [ -z "${_MAIN_WID}" ]; then
+        _MAIN_WID=$(_xd search --onlyvisible --name "Hedging" 2>/dev/null | head -1 || true)
+      fi
+      if [ -z "${_MAIN_WID}" ]; then
+        _MAIN_WID=$(_xd search --onlyvisible --name "Exness" 2>/dev/null | head -1 || true)
+      fi
+      if [ -z "${_MAIN_WID}" ]; then
+        _MAIN_WID=$(_xd search --onlyvisible --name "MetaTrader" 2>/dev/null | head -1 || true)
+      fi
+      if [ -n "${_MAIN_WID}" ]; then
+        _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.2
+        # Cancel button is at bottom-right of the centered dialog.
+        # On 1024x768: Cancel ≈ (748, 490)
+        _xd mousemove --clearmodifiers 748 490; sleep 0.05
+        _xd click 1; sleep 0.1
+        # Also try Escape on the main window
+        _xd key --window "${_MAIN_WID}" --clearmodifiers Escape; sleep 0.1
+        _xd key --window "${_MAIN_WID}" --clearmodifiers Escape
+        if [ $(( _try % 10 )) -eq 0 ]; then
+          echo "[dismiss-action] iter=${_try} clicked Cancel(748,490) + Escape on main_wid=${_MAIN_WID}" >> "${DISMISS_LOG}"
+        fi
+      fi
       # Step 4: Enumerate ALL windows owned by the terminal process (including
       # hidden/embedded child windows not found by --onlyvisible). This catches
       # the API authorization dialog that the terminal shows when mt5.initialize()
