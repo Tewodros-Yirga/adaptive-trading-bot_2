@@ -10,12 +10,10 @@
 #   - /opt/mt5_terminal.preinstalled (sentinel)
 # ============================================================
 
-# IMPORTANT: This tag MUST match a terminal build that has a corresponding
-# MetaTrader5 Python package on PyPI. The base image tagged terminal-5430
-# currently contains build 5836 (auto-updated by mt5setup.exe). The runtime
-# self-healing in start.sh (MT5_PORTABLE_ZIP_URL) will download and replace
-# the terminal binary with a matching build at startup.
-ARG BASE_IMAGE_TAG=terminal-5430
+# IMPORTANT: This tag MUST point to a base image whose terminal build
+# matches a MetaTrader5 PyPI package. The 'latest' tag was rebuilt on
+# 2026-05-11 with terminal build 5430 from the portable zip.
+ARG BASE_IMAGE_TAG=latest
 FROM ghcr.io/loriloha/mt5-bridge-base:${BASE_IMAGE_TAG}
 
 # Cache-bust: forces HF to re-pull base image on rebuild (bump to trigger)
