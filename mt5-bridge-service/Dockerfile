@@ -60,6 +60,29 @@ COPY bootstrap-mt5.sh /bridge/bootstrap-mt5.sh
 COPY start.sh /bridge/start.sh
 RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
 
+# ── Embed Exness servers.dat ─────────────────────────────────────────────────
+# The generic MetaQuotes installer's servers.dat does NOT contain Exness
+# server endpoints.  Without a valid servers.dat, the terminal cannot resolve
+# "Exness-MT5Trial9" → IP:port and never establishes a broker TCP connection.
+# Result: established=0, empty Market Watch, no IPC pipes, -10005 forever.
+#
+# The file is gzipped + base64-encoded (text) because HuggingFace rejects
+# binary files in git pushes.  Decoded at build time.
+COPY config/servers.dat.b64 /bridge/servers.dat.b64
+RUN set -eux; \
+    base64 -d /bridge/servers.dat.b64 | gunzip > /bridge/servers.dat; \
+    MT5_DIR="/opt/wineprefix/drive_c/Program Files/MetaTrader 5"; \
+    APPDATA_DIR="/opt/wineprefix/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal"; \
+    mkdir -p "${MT5_DIR}/config" && \
+    cp /bridge/servers.dat "${MT5_DIR}/config/servers.dat"; \
+    mkdir -p "${APPDATA_DIR}/Common/config" && \
+    cp /bridge/servers.dat "${APPDATA_DIR}/Common/config/servers.dat"; \
+    find "${APPDATA_DIR}" -mindepth 2 -maxdepth 2 -type d -name "config" \
+      2>/dev/null | while IFS= read -r d; do \
+        cp /bridge/servers.dat "${d}/servers.dat" || true; \
+    done; \
+    echo "servers.dat installed ($(wc -c < /bridge/servers.dat) bytes)"
+
 EXPOSE 5555
 
 # Clear scottyhardy's gosu entrypoint so start.sh runs directly as root.

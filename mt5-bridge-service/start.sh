@@ -366,6 +366,28 @@ fi
     | while IFS= read -r _hcfg; do _mt5_precfg "${_hcfg}"; done || true
   unset -f _mt5_precfg
 
+  # ── Distribute servers.dat to all config paths ─────────────────────────────
+  # Without a valid servers.dat containing Exness endpoints, the terminal
+  # cannot resolve "Exness-MT5Trial9" → IP:port and never establishes a
+  # broker TCP connection (established=0, empty Market Watch, no IPC pipes).
+  _SERVERS_SRC="/bridge/servers.dat"
+  if [ -f "${_SERVERS_SRC}" ]; then
+    _mt5_copy_servers() {
+      local _d="$1"
+      mkdir -p "${_d}" 2>/dev/null || return
+      cp -f "${_SERVERS_SRC}" "${_d}/servers.dat" 2>/dev/null || true
+    }
+    _mt5_copy_servers "${WINEPREFIX}/drive_c/Program Files/MetaTrader 5/config"
+    _mt5_copy_servers "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/Common/config"
+    find "${WINEPREFIX}/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal" \
+      -mindepth 2 -maxdepth 2 -type d -name "config" 2>/dev/null \
+      | while IFS= read -r _hcfg; do _mt5_copy_servers "${_hcfg}"; done || true
+    unset -f _mt5_copy_servers
+    echo "[mt5-terminal] Distributed servers.dat ($(wc -c < "${_SERVERS_SRC}") bytes) to all config paths"
+  else
+    echo "[mt5-terminal] WARNING: /bridge/servers.dat not found — broker resolution may fail"
+  fi
+
   # ── Patch terminal.ini to force AllowLiveTrading=1 ─────────────────────────
   # MT5 has a safety feature: when the account "changes" (which happens on
   # every container restart because credentials are injected fresh), it auto-
