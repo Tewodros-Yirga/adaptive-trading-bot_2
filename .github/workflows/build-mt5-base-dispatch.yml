@@ -6,7 +6,7 @@ on:
       mt5_url:
         description: "Pinned MT5 setup.exe URL"
         required: false
-        default: "https://github.com/loriloha/adaptive-trading-bot/releases/download/mt5-installer-build-4816/mt5setup.exe"
+        default: "https://github.com/loriloha/adaptive-trading-bot/releases/download/mt5-portable-5430/mt5_v5430.zip"
       wine_base:
         description: "Wine base image tag (e.g. scottyhardy/docker-wine:devel)"
         required: false
@@ -102,5 +102,15 @@ jobs:
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           DIGEST="${{ steps.build_candidate.outputs.digest }}"
           SOURCE_REF="${IMAGE}@${DIGEST}"
+
+          # Detect terminal build and tag image for easy discoverability.
+          CANDIDATE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:candidate-${{ github.sha }}"
+          TERM_BUILD=$(docker run --rm --entrypoint bash "${CANDIDATE}" -c \
+            "strings -e l '/opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe' 2>/dev/null | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || strings '/opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe' 2>/dev/null | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || echo ''")
+          if [[ -n "${TERM_BUILD}" ]]; then
+            echo "Detected terminal build: ${TERM_BUILD} — tagging ${IMAGE}:terminal-${TERM_BUILD}"
+            docker buildx imagetools create --tag "${IMAGE}:terminal-${TERM_BUILD}" "${SOURCE_REF}"
+          fi
+
           docker buildx imagetools create --tag "${IMAGE}:latest" "${SOURCE_REF}"
           docker buildx imagetools create --tag "${IMAGE}:sha-${{ github.sha }}" "${SOURCE_REF}"

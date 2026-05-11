@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Package local MT5 build 5430 and upload to GitHub release, then trigger base image build.
@@ -151,7 +151,7 @@ try {
         $body = @{
             tag_name = $ReleaseTag
             name     = "MT5 Portable Build 5430"
-            body     = "MetaTrader 5 portable archive (build 5430).`n`nUploaded via package-and-build-mt5.ps1"
+            body     = ("MetaTrader 5 portable archive (build 5430)." + "`n`n" + "Uploaded via package-and-build-mt5.ps1")
         } | ConvertTo-Json
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/$Repo/releases" -Headers $headers -Method POST -Body $body
         Write-Host "Release created: $($release.html_url)" -ForegroundColor Green
