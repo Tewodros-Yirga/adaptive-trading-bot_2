@@ -587,8 +587,10 @@ fi
         fi
         _ALGO_STATE="unknown"
         if [ -n "${_LATEST_LOG}" ] && [ -f "${_LATEST_LOG}" ]; then
-          # Get the LAST line matching either state
-          _LAST_ALGO=$(grep -i "automated trading is" "${_LATEST_LOG}" 2>/dev/null | tail -1 || true)
+          # MT5 log files on Wine are UTF-16LE encoded. grep cannot read
+          # UTF-16 directly. Use 'strings' to extract ASCII text first.
+          _LAST_ALGO=$(strings "${_LATEST_LOG}" 2>/dev/null \
+            | grep -i "automated trading is" | tail -1 || true)
           if echo "${_LAST_ALGO}" | grep -qi "is disabled"; then
             _ALGO_STATE="disabled"
           elif echo "${_LAST_ALGO}" | grep -qi "is enabled"; then
@@ -599,8 +601,9 @@ fi
           _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
           _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
           echo "[dismiss-action] iter=${_try} Algo Trading was DISABLED → sent Ctrl+E to re-enable (main_wid=${_MAIN_WID})" >> "${DISMISS_LOG}"
-        elif [ "${_ALGO_STATE}" = "unknown" ] && [ $(( _try % 20 )) -eq 5 ]; then
-          # Fallback: if we can't determine state, try once at iter 5,25,45...
+        elif [ "${_ALGO_STATE}" = "unknown" ] && [ $(( _try % 10 )) -eq 5 ]; then
+          # Fallback: if we can't determine state (log not created yet),
+          # try at iter 5,15,25,35... (every ~50s)
           _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
           _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
           echo "[dismiss-action] iter=${_try} Algo Trading state unknown → sent Ctrl+E (fallback)" >> "${DISMISS_LOG}"
