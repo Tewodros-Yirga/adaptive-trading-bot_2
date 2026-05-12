@@ -1,73 +1,93 @@
-# Keep HuggingFace Space awake by pinging the health endpoint every 14 minutes.
-# HF Spaces sleep after a period of inactivity (typically 48h for free tier,
-# configurable for paid). This cron job ensures continuous uptime for the
-# MT5 bridge service.
+# Keep Hugging Face Space awake by pinging the public health endpoint on a schedule.
+# Runs in *this* GitHub repo; configure secrets here (not on HF).
+#
+# Secrets (repo → Settings → Secrets):
+#   HF_SPACE_URL      — optional; default https://loriloha-mt5-bridge-service.hf.space
+#   HF_TOKEN          — optional; Authorization: Bearer for private HF Spaces
+#   MT_BRIDGE_SECRET  — optional; required only for the extra /debug/mt5 line in logs
+#
+# Note: scheduled workflows only run on the repository default branch.
 name: Keep MT5 Bridge Alive
 
 on:
   schedule:
-    # Every 14 minutes (GitHub Actions cron minimum granularity is 5 min,
-    # but HF needs a hit at least every ~30 min to avoid sleep).
-    - cron: '*/14 * * * *'
-  workflow_dispatch: # Allow manual trigger for testing
+    - cron: "*/14 * * * *"
+  workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # Worst case: 30s first curl + 10s sleep + 120s retry (+ debug) exceeds 2 minutes.
+    timeout-minutes: 5
     steps:
       - name: Ping health endpoint
         env:
-          HF_SPACE_URL: ${{ secrets.HF_SPACE_URL || 'https://loriloha-mt5-bridge-service.hf.space' }}
+          HF_SPACE_URL: ${{ secrets.HF_SPACE_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MT_BRIDGE_SECRET: ${{ secrets.MT_BRIDGE_SECRET }}
         run: |
           set -euo pipefail
 
-          HEALTH_URL="${HF_SPACE_URL}/health"
-          DEBUG_URL="${HF_SPACE_URL}/debug/mt5"
+          DEFAULT_URL="https://loriloha-mt5-bridge-service.hf.space"
+          BASE_URL="${HF_SPACE_URL:-$DEFAULT_URL}"
+          BASE_URL="${BASE_URL%/}"
 
-          echo "🏓 Pinging ${HEALTH_URL} ..."
+          HEALTH_URL="${BASE_URL}/health"
+          DEBUG_URL="${BASE_URL}/debug/mt5"
 
-          # Build auth header if token is available
-          AUTH_HEADER=""
+          echo "Pinging ${HEALTH_URL} ..."
+
+          # Optional HF Space JWT (private spaces)
+          health_curl=(curl -sS -o /tmp/health.json -w "%{http_code}" --max-time 30)
           if [ -n "${HF_TOKEN:-}" ]; then
-            AUTH_HEADER="-H \"Authorization: Bearer ${HF_TOKEN}\""
+            health_curl+=(-H "Authorization: Bearer ${HF_TOKEN}")
           fi
+          health_curl+=("${HEALTH_URL}")
 
-          # Ping health endpoint (wakes up the Space if sleeping)
-          HTTP_CODE=$(eval curl -s -o /tmp/health.json -w '%{http_code}' \
-            --max-time 30 \
-            ${AUTH_HEADER} \
-            "${HEALTH_URL}" || echo "000")
+          HTTP_CODE="$("${health_curl[@]}" || true)"
+          if [ -z "${HTTP_CODE}" ]; then HTTP_CODE="000"; fi
 
           if [ "${HTTP_CODE}" = "200" ]; then
-            echo "✅ Health check passed (HTTP ${HTTP_CODE})"
-            cat /tmp/health.json | python3 -m json.tool 2>/dev/null || cat /tmp/health.json
-          elif [ "${HTTP_CODE}" = "000" ]; then
-            echo "⚠️ Connection timeout — Space may be cold-starting"
-            # Retry once with longer timeout (Space may need to boot)
+            echo "Health check passed (HTTP ${HTTP_CODE})"
+            python3 -m json.tool /tmp/health.json 2>/dev/null || cat /tmp/health.json
+          else
+            echo "First attempt not OK (HTTP ${HTTP_CODE}) — cold start or transient; retrying once ..."
+            cat /tmp/health.json 2>/dev/null || true
             sleep 10
-            HTTP_CODE2=$(eval curl -s -o /tmp/health2.json -w '%{http_code}' \
-              --max-time 120 \
-              ${AUTH_HEADER} \
-              "${HEALTH_URL}" || echo "000")
+            health_curl_retry=(curl -sS -o /tmp/health2.json -w "%{http_code}" --max-time 120)
+            if [ -n "${HF_TOKEN:-}" ]; then
+              health_curl_retry+=(-H "Authorization: Bearer ${HF_TOKEN}")
+            fi
+            health_curl_retry+=("${HEALTH_URL}")
+            HTTP_CODE2="$("${health_curl_retry[@]}" || true)"
+            if [ -z "${HTTP_CODE2}" ]; then HTTP_CODE2="000"; fi
             echo "Retry result: HTTP ${HTTP_CODE2}"
             cat /tmp/health2.json 2>/dev/null || true
-          else
-            echo "❌ Health check failed (HTTP ${HTTP_CODE})"
-            cat /tmp/health.json 2>/dev/null || true
+            if [ "${HTTP_CODE2}" != "200" ]; then
+              echo "::error::Health check failed after retry (HTTP ${HTTP_CODE2})"
+              exit 1
+            fi
           fi
 
-          # Quick adapter status check
           echo ""
-          echo "📊 Adapter status:"
-          eval curl -s --max-time 15 \
-            ${AUTH_HEADER} \
-            "${DEBUG_URL}" 2>/dev/null \
-            | python3 -c "
+          echo "Adapter status (debug):"
+          if [ -z "${MT_BRIDGE_SECRET:-}" ]; then
+            echo "  (skipped — set MT_BRIDGE_SECRET in repo secrets to probe /debug/mt5)"
+          else
+            debug_curl=(curl -sS --max-time 30)
+            if [ -n "${HF_TOKEN:-}" ]; then
+              debug_curl+=(-H "Authorization: Bearer ${HF_TOKEN}")
+            fi
+            debug_curl+=(-H "X-Bridge-Secret: ${MT_BRIDGE_SECRET}")
+            debug_curl+=("${DEBUG_URL}")
+            if ! "${debug_curl[@]}" 2>/dev/null | python3 -c "
           import sys, json
           try:
-              d = json.load(sys.stdin)
+              raw = sys.stdin.read()
+              if not raw.strip():
+                  print('  (empty response)')
+                  sys.exit(0)
+              d = json.loads(raw)
               a = d.get('adapter', {})
               b = d.get('bootstrap', {})
               print(f\"  connected:  {a.get('connected')}\")
@@ -76,4 +96,7 @@ jobs:
               print(f\"  error:      {a.get('last_error', 'none')}\")
           except Exception as e:
               print(f'  (parse error: {e})')
-          " || echo "  (endpoint unreachable)"
+          "; then
+              echo "  (debug request failed)"
+            fi
+          fi
