@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+*.log
+.env
+
+# MT5 large files
+_zip_test/
+mt5 v5640/
+mt5_v5430/
+mt5-portable*.zip
+mt5_v5430.zip
+
+# Other
+*.exe
+*.zip
+mt5-diagnostics-export/
