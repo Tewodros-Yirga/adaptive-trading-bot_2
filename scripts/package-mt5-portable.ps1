@@ -1,120 +1,114 @@
-# package-mt5-portable.ps1
-# Initializes MT5 5640 locally in portable mode, zips the result,
-# and uploads to GitHub releases as mt5-portable-5640.
-#
-# Prerequisites: Run from g:\adaptive-trading-bot
-
 param(
-    [string]$GhToken = $env:GITHUB_TOKEN,
-    [string]$SourceDir = "g:\adaptive-trading-bot\mt5 5640",
-    [string]$PortableDir = "g:\adaptive-trading-bot\_mt5-portable-init",
-    [string]$ZipPath = "g:\adaptive-trading-bot\_mt5-portable-5640.zip",
-    [string]$RepoOwner = "loriloha",
-    [string]$RepoName = "adaptive-trading-bot",
-    [string]$ReleaseTag = "mt5-portable-5640",
-    [int]$MaxWaitSeconds = 300
+    [string]$SourceDir = "G:\mt5 v5640",
+    [string]$OutZip = "G:\adaptive-trading-bot\mt5-portable.zip",
+    [switch]$Overwrite
 )
 
-if (-not $GhToken) {
-    $GhToken = Read-Host "GitHub Personal Access Token (needs repo + write:packages)"
+$ErrorActionPreference = "Stop"
+
+if (-not (Test-Path $SourceDir)) {
+    throw "SourceDir not found: '$SourceDir'"
+}
+if (-not (Test-Path (Join-Path $SourceDir "terminal64.exe"))) {
+    throw "terminal64.exe missing in SourceDir: '$SourceDir'"
 }
 
-Write-Host "=== Step 1: Copy exes to portable dir ===" -ForegroundColor Cyan
-if (Test-Path $PortableDir) { Remove-Item -Recurse -Force $PortableDir }
-New-Item -ItemType Directory -Path $PortableDir | Out-Null
-Copy-Item "$SourceDir\terminal64.exe"   $PortableDir
-Copy-Item "$SourceDir\MetaEditor64.exe" $PortableDir
-Copy-Item "$SourceDir\metatester64.exe" $PortableDir
-Write-Host "Copied 3 exes to $PortableDir"
+if ((Test-Path $OutZip) -and (-not $Overwrite)) {
+    throw "Output zip already exists: '$OutZip' (pass -Overwrite to replace)"
+}
 
-Write-Host "=== Step 2: Launch terminal64.exe /portable ===" -ForegroundColor Cyan
-Write-Host "The MT5 terminal will open. Let it run until you see it has loaded."
-Write-Host "This script will auto-close it once MQL5\Experts appears (~60-120s)."
-$proc = Start-Process "$PortableDir\terminal64.exe" "/portable" -PassThru
-Write-Host "Terminal PID: $($proc.Id)"
+$sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue)
 
-Write-Host "=== Step 3: Wait for MQL5\Experts (max ${MaxWaitSeconds}s) ===" -ForegroundColor Cyan
-$waited = 0
-$ready = $false
-while ($waited -lt $MaxWaitSeconds) {
-    Start-Sleep -Seconds 5
-    $waited += 5
-    $expertDir = "$PortableDir\MQL5\Experts"
-    $tiniSize  = if (Test-Path "$PortableDir\terminal.ini") {
-        (Get-Item "$PortableDir\terminal.ini").Length } else { 0 }
-    $files = (Get-ChildItem $PortableDir -Recurse -File).Count
-    Write-Host "  ${waited}s: files=$files  tini=${tiniSize}B  MQL5\Experts=$(Test-Path $expertDir)"
+$tmpRoot = Join-Path $env:TEMP ("mt5-portable-pack-" + [guid]::NewGuid().ToString("N"))
+$tmpPkg = Join-Path $tmpRoot "MetaTrader 5"
+New-Item -ItemType Directory -Path $tmpPkg -Force | Out-Null
 
-    if ((Test-Path $expertDir) -and $tiniSize -gt 500) {
-        Write-Host "MQL5\Experts found and terminal.ini written — initialization complete!" -ForegroundColor Green
-        $ready = $true
-        break
+function New-PosixZipFromDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootDir,
+        [Parameter(Mandatory = $true)][string]$OutZipPath
+    )
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $root = (Resolve-Path $RootDir).Path.TrimEnd('\', '/')
+    $zipStream = [System.IO.File]::Open($OutZipPath, [System.IO.FileMode]::Create)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            # Include directories (so empty dirs survive) and files.
+            $entries = Get-ChildItem -Path $root -Recurse -Force
+
+            # Create directory entries first.
+            foreach ($d in $entries | Where-Object { $_.PSIsContainer }) {
+                $rel = $d.FullName.Substring($root.Length).TrimStart('\','/')
+                if (-not $rel) { continue }
+                $rel = ($rel -replace '\\','/') + '/'
+                [void]$zip.CreateEntry($rel)
+            }
+
+            foreach ($f in $entries | Where-Object { -not $_.PSIsContainer }) {
+                $rel = $f.FullName.Substring($root.Length).TrimStart('\','/')
+                if (-not $rel) { continue }
+                $rel = ($rel -replace '\\','/')
+                $entry = $zip.CreateEntry($rel, [System.IO.Compression.CompressionLevel]::Optimal)
+                $entryStream = $entry.Open()
+                try {
+                    $fileStream = [System.IO.File]::OpenRead($f.FullName)
+                    try {
+                        $fileStream.CopyTo($entryStream)
+                    } finally {
+                        $fileStream.Dispose()
+                    }
+                } finally {
+                    $entryStream.Dispose()
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    } finally {
+        $zipStream.Dispose()
     }
 }
 
-if (-not $ready) {
-    Write-Host "WARNING: MQL5\Experts not found after ${MaxWaitSeconds}s — zipping whatever is there." -ForegroundColor Yellow
-}
-
-Write-Host "=== Step 4: Stopping terminal ===" -ForegroundColor Cyan
-# Give it 10 more seconds to flush writes
-Start-Sleep -Seconds 10
-try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
-# Kill any remaining MT5 processes
-Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 3
-
-Write-Host "=== Step 5: Contents summary ===" -ForegroundColor Cyan
-$allFiles = Get-ChildItem $PortableDir -Recurse -File
-Write-Host "  Total files: $($allFiles.Count)"
-$allFiles | Group-Object { Split-Path $_.DirectoryName -Leaf } |
-    Sort-Object Count -Descending | Select-Object -First 10 |
-    ForEach-Object { Write-Host "  $($_.Name): $($_.Count) files" }
-
-Write-Host "=== Step 6: Creating ZIP ===" -ForegroundColor Cyan
-if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
-Compress-Archive -Path "$PortableDir\*" -DestinationPath $ZipPath
-$zipSize = [math]::Round((Get-Item $ZipPath).Length / 1MB, 1)
-Write-Host "Created $ZipPath ($zipSize MB)"
-
-Write-Host "=== Step 7: Upload to GitHub Releases ===" -ForegroundColor Cyan
-$headers = @{
-    "Authorization" = "token $GhToken"
-    "Accept"        = "application/vnd.github+json"
-    "X-GitHub-Api-Version" = "2022-11-28"
-}
-$apiBase = "https://api.github.com/repos/$RepoOwner/$RepoName"
-
-# Delete existing release if any
 try {
-    $existing = Invoke-RestMethod "$apiBase/releases/tags/$ReleaseTag" -Headers $headers -ErrorAction Stop
-    Write-Host "Deleting existing release $ReleaseTag..."
-    Invoke-RestMethod "$apiBase/releases/$($existing.id)" -Method Delete -Headers $headers | Out-Null
-} catch {}
+    Write-Host "Copying source folder..."
+    Copy-Item -Path (Join-Path $SourceDir "*") -Destination $tmpPkg -Recurse -Force
 
-# Delete existing tag if any
-try {
-    Invoke-RestMethod "$apiBase/git/refs/tags/$ReleaseTag" -Method Delete -Headers $headers -ErrorAction Stop | Out-Null
-    Write-Host "Deleted old tag $ReleaseTag"
-} catch {}
+    # Ensure no path entry contains literal backslashes in file names.
+    $badNames = Get-ChildItem -Path $tmpPkg -Recurse -Force | Where-Object { $_.Name -like "*\*" }
+    if ($badNames.Count -gt 0) {
+        throw "Found invalid backslash-named entries in payload. Refusing to package."
+    }
 
-# Create release
-$body = @{ tag_name = $ReleaseTag; name = "MT5 Portable 5640"; body = "Fully initialized MT5 5640 portable installation with MQL5/ data directory. Matches MetaTrader5==5.0.5640 on PyPI."; draft = $false; prerelease = $false } | ConvertTo-Json
-$release = Invoke-RestMethod "$apiBase/releases" -Method Post -Headers $headers -Body $body -ContentType "application/json"
-Write-Host "Created release: $($release.html_url)"
+    if (Test-Path $OutZip) {
+        Remove-Item $OutZip -Force
+    }
 
-# Upload ZIP
-$uploadUrl = $release.upload_url -replace '\{.*\}', ''
-$uploadUrl = "${uploadUrl}?name=mt5-portable.zip&label=mt5-portable.zip"
-Write-Host "Uploading $ZipPath ($zipSize MB)..."
-$zipBytes = [System.IO.File]::ReadAllBytes($ZipPath)
-$uploadResp = Invoke-RestMethod $uploadUrl -Method Post -Headers ($headers + @{ "Content-Type" = "application/zip" }) -Body $zipBytes
-Write-Host "Uploaded: $($uploadResp.browser_download_url)" -ForegroundColor Green
+    Write-Host "Creating zip archive..."
+    if ($null -ne $sevenZip) {
+        Push-Location $tmpRoot
+        & 7z a -tzip -mx=5 $OutZip ".\MetaTrader 5\*" | Out-Host
+        Pop-Location
+    }
+    else {
+        # IMPORTANT: CreateFromDirectory on Windows writes entries using '\'
+        # separators, which 7z on Linux treats as literal characters. Build a
+        # POSIX-safe zip with '/' separators to avoid flat "MetaTrader 5\file"
+        # entries.
+        New-PosixZipFromDirectory -RootDir $tmpRoot -OutZipPath $OutZip
+    }
 
-Write-Host ""
-Write-Host "=== DONE ===" -ForegroundColor Green
-Write-Host "Release URL: $($release.html_url)"
-Write-Host "ZIP download: $($uploadResp.browser_download_url)"
-Write-Host ""
-Write-Host "Use this URL in the workflow:" -ForegroundColor Yellow
-Write-Host "https://github.com/$RepoOwner/$RepoName/releases/download/$ReleaseTag/mt5-portable.zip"
+    if (-not (Test-Path $OutZip)) {
+        throw "Failed to create zip archive."
+    }
+
+    $size = (Get-Item $OutZip).Length
+    Write-Host ("Portable zip created: {0} ({1} bytes)" -f $OutZip, $size)
+}
+finally {
+    if (Test-Path $tmpRoot) {
+        Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

@@ -10,7 +10,11 @@
 #   - /opt/mt5_terminal.preinstalled (sentinel)
 # ============================================================
 
-FROM ghcr.io/loriloha/mt5-bridge-base:latest
+# IMPORTANT: This tag MUST point to a base image whose terminal build
+# matches a MetaTrader5 PyPI package. The 'latest' tag was rebuilt on
+# 2026-05-11 with terminal build 5430 from the portable zip.
+ARG BASE_IMAGE_TAG=latest
+FROM ghcr.io/loriloha/mt5-bridge-base:${BASE_IMAGE_TAG}
 
 # Cache-bust: forces HF to re-pull base image on rebuild (bump to trigger)
 ARG CACHE_BUST=warmup-90s-v2
@@ -34,7 +38,7 @@ RUN set -eux; \
     apt-get update -qq || true; \
     apt-get install -y --no-install-recommends --fix-missing \
         supervisor python3-venv scrot xdotool x11-utils openbox curl \
-        libimage-exiftool-perl; \
+        libimage-exiftool-perl iptables; \
     rm -rf /var/lib/apt/lists/*
 
 # Ensure /opt/wineprefix is owned by root (matching runtime user).
@@ -55,6 +59,29 @@ COPY supervisord.conf /bridge/supervisord.conf
 COPY bootstrap-mt5.sh /bridge/bootstrap-mt5.sh
 COPY start.sh /bridge/start.sh
 RUN chmod +x /bridge/start.sh /bridge/bootstrap-mt5.sh
+
+# ── Embed Exness servers.dat ─────────────────────────────────────────────────
+# The generic MetaQuotes installer's servers.dat does NOT contain Exness
+# server endpoints.  Without a valid servers.dat, the terminal cannot resolve
+# "Exness-MT5Trial9" → IP:port and never establishes a broker TCP connection.
+# Result: established=0, empty Market Watch, no IPC pipes, -10005 forever.
+#
+# The file is gzipped + base64-encoded (text) because HuggingFace rejects
+# binary files in git pushes.  Decoded at build time.
+COPY config/servers.dat.b64 /bridge/servers.dat.b64
+RUN set -eux; \
+    base64 -d /bridge/servers.dat.b64 | gunzip > /bridge/servers.dat; \
+    MT5_DIR="/opt/wineprefix/drive_c/Program Files/MetaTrader 5"; \
+    APPDATA_DIR="/opt/wineprefix/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal"; \
+    mkdir -p "${MT5_DIR}/config" && \
+    cp /bridge/servers.dat "${MT5_DIR}/config/servers.dat"; \
+    mkdir -p "${APPDATA_DIR}/Common/config" && \
+    cp /bridge/servers.dat "${APPDATA_DIR}/Common/config/servers.dat"; \
+    find "${APPDATA_DIR}" -mindepth 2 -maxdepth 2 -type d -name "config" \
+      2>/dev/null | while IFS= read -r d; do \
+        cp /bridge/servers.dat "${d}/servers.dat" || true; \
+    done; \
+    echo "servers.dat installed ($(wc -c < /bridge/servers.dat) bytes)"
 
 EXPOSE 5555
 

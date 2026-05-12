@@ -186,8 +186,8 @@ jobs:
           set -eux
           cd "C:/Program Files"
           ls "MetaTrader 5/"
-          7z a "$GITHUB_WORKSPACE/mt5-portable.zip" "MetaTrader 5" -mx=5
-          du -sh "$GITHUB_WORKSPACE/mt5-portable.zip"
+          7z a "$GITHUB_WORKSPACE/mt5_v5430.zip" "MetaTrader 5" -mx=5
+          du -sh "$GITHUB_WORKSPACE/mt5_v5430.zip"
 
       - name: Upload to GitHub Releases
         if: steps.pypi_check.outputs.match == 'true' || github.event.inputs.force_build == 'true'
@@ -206,7 +206,7 @@ jobs:
           Match: ${{ steps.pypi_check.outputs.match }}
 
           Use this URL as mt5_url in the build-mt5-base workflow:
-          https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5-portable.zip"
+          https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5_v5430.zip"
 
           # Create or update the release
           if gh release view "${TAG}" > /dev/null 2>&1; then
@@ -218,8 +218,8 @@ jobs:
               --notes "${NOTES}"
           fi
           gh release upload "${TAG}" \
-            "$GITHUB_WORKSPACE/mt5-portable.zip" \
+            "$GITHUB_WORKSPACE/mt5_v5430.zip" \
             --clobber
           echo ""
           echo "=== Use this URL in build-mt5-base.yml ==="
-          echo "https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5-portable.zip"
+          echo "https://github.com/${{ github.repository }}/releases/download/${TAG}/mt5_v5430.zip"

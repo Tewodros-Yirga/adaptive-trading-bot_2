@@ -1,24 +1,92 @@
-﻿$src = "g:\adaptive-trading-bot\mt5 5640"
-$dst = "g:\adaptive-trading-bot\_mt5-portable-init"
-if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
-New-Item -ItemType Directory -Path $dst | Out-Null
-Copy-Item "$src\terminal64.exe" $dst
-Copy-Item "$src\MetaEditor64.exe" $dst
-Copy-Item "$src\metatester64.exe" $dst
-Write-Host "Copied 3 exes - launching /portable..."
-$proc = Start-Process "$dst\terminal64.exe" "/portable" -PassThru
-Write-Host "PID: $($proc.Id)"
-$waited = 0
-while ($waited -lt 300) {
-    Start-Sleep 5
-    $waited += 5
-    $tini = if (Test-Path "$dst\terminal.ini") { (Get-Item "$dst\terminal.ini").Length } else { 0 }
-    $fc = (Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue).Count
-    $exp = Test-Path "$dst\MQL5\Experts"
-    Write-Host "${waited}s: files=$fc tini=${tini}B MQL5\Experts=$exp"
-    if ($exp -and ($tini -gt 500)) { Write-Host "DONE!"; break }
+param(
+    [string]$TerminalExe = "C:\Program Files\MetaTrader 5\terminal64.exe",
+    [string]$PortableDir = "C:\Program Files\MetaTrader 5",
+    [int]$WarmupSeconds = 120,
+    [int]$PostRestartStableSeconds = 45,
+    [switch]$NoPrompt
+)
+
+$ErrorActionPreference = "Stop"
+
+if (-not (Test-Path $TerminalExe)) {
+    throw "terminal64.exe not found at '$TerminalExe'"
 }
-Start-Sleep 10
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-Write-Host "Portable dir ready: $dst"
-Write-Host "Files: $((Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue).Count)"
+if (-not (Test-Path $PortableDir)) {
+    throw "PortableDir not found at '$PortableDir'"
+}
+
+Write-Host "Starting MT5 in portable mode..."
+Write-Host "Terminal: $TerminalExe"
+Write-Host "PortableDir: $PortableDir"
+
+if (-not $NoPrompt) {
+    Write-Host ""
+    Write-Host "Operator guidance:"
+    Write-Host " - Do NOT complete 'Select company / open account' wizard."
+    Write-Host " - If login dialog appears, use broker login/server there."
+    Write-Host " - Let terminal settle; script waits for optional self-restart."
+    Write-Host ""
+}
+
+$proc = Start-Process -FilePath $TerminalExe -ArgumentList "/portable" -PassThru
+$initialPid = $proc.Id
+Write-Host "Initial PID: $initialPid"
+
+$elapsed = 0
+$restartDetected = $false
+$activePid = $initialPid
+$stableAfterRestart = 0
+
+while ($elapsed -lt $WarmupSeconds) {
+    Start-Sleep -Seconds 5
+    $elapsed += 5
+
+    $active = Get-Process -Name terminal64 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $active) {
+        Write-Host ("{0}s: no terminal64 process visible" -f $elapsed)
+        continue
+    }
+
+    if (-not $restartDetected -and $active.Id -ne $initialPid) {
+        $restartDetected = $true
+        $activePid = $active.Id
+        Write-Host ("{0}s: self-restart detected (new PID: {1})" -f $elapsed, $activePid)
+        continue
+    }
+
+    if ($restartDetected) {
+        $stableAfterRestart += 5
+        Write-Host ("{0}s: restarted PID {1} alive (stable {2}s)" -f $elapsed, $active.Id, $stableAfterRestart)
+        if ($stableAfterRestart -ge $PostRestartStableSeconds) {
+            Write-Host "Post-restart stability window reached."
+            break
+        }
+    } else {
+        Write-Host ("{0}s: initial PID {1} still alive" -f $elapsed, $active.Id)
+    }
+}
+
+Write-Host ""
+Write-Host "Stopping terminal processes..."
+Get-Process -Name terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
+$terminalIni = Join-Path $PortableDir "terminal.ini"
+$mqlDir = Join-Path $PortableDir "MQL5"
+$mqlFiles = 0
+if (Test-Path $mqlDir) {
+    $mqlFiles = (Get-ChildItem -Path $mqlDir -File -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count
+}
+$tiniSize = 0
+if (Test-Path $terminalIni) {
+    $tiniSize = (Get-Item $terminalIni).Length
+}
+
+Write-Host "Warmup summary:"
+Write-Host (" - restartDetected={0}" -f $restartDetected)
+Write-Host (" - terminal.ini.size={0}" -f $tiniSize)
+Write-Host (" - mql5.fileCount={0}" -f $mqlFiles)
+
+if ($mqlFiles -lt 100) {
+    Write-Warning "MQL5 file count is low. Consider another warm run before packaging."
+}

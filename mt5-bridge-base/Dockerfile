@@ -6,7 +6,7 @@
 # and COPY'd in — no apt-get, no curl inside Docker.
 # ============================================================
 
-ARG WINE_BASE=scottyhardy/docker-wine:latest
+ARG WINE_BASE=scottyhardy/docker-wine:stable-10.0-20250525
 FROM ${WINE_BASE}
 
 ARG HAS_MT5=false
@@ -31,7 +31,7 @@ ENV WINEFSYNC=0
 # ---------------------------------------------------------------------------
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
-        openbox xdotool p7zip-full file winetricks \
+        openbox xdotool p7zip-full file winetricks binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -87,13 +87,10 @@ RUN set -eux; \
     fi; \
     echo "${WINE_PY}" > /opt/wine_python_exe.path; \
     \
-    # -- pip install MetaTrader5 + mt5linux -- \
+    # -- pip install dependencies (MetaTrader5 version matched to terminal below) -- \
     timeout 300 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir pip || true; \
-    timeout 600 wine "${WINE_PY}" -m pip install --no-cache-dir MetaTrader5==5.0.5640 || true; \
     timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir "mt5linux>=0.1.9" || true; \
     timeout 300 wine "${WINE_PY}" -m pip install --no-cache-dir python-dateutil || true; \
-    wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
-      || echo "WARNING: MetaTrader5 verification failed"; \
     wine "${WINE_PY}" -c "import mt5linux; print('mt5linux OK')" \
       || echo "WARNING: mt5linux verification failed"; \
     \
@@ -207,6 +204,25 @@ RUN set -eux; \
     else \
       echo "HAS_MT5 not true — skipping MT5 terminal"; \
     fi; \
+    \
+    # -- Install MetaTrader5 package matching terminal build (dynamic) -- \
+    TERM_BUILD=""; \
+    if [ -n "${TERM_EXE}" ]; then \
+      TERM_BUILD=$(strings -e l "${TERM_EXE}" 2>/dev/null | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || strings "${TERM_EXE}" 2>/dev/null | grep -oE 'build [0-9]{4,5}' | tail -1 | sed 's/build //' || echo ''); \
+    fi; \
+    if [ -n "${TERM_BUILD}" ]; then \
+      echo "Terminal build detected: ${TERM_BUILD} — installing MetaTrader5==5.0.${TERM_BUILD}"; \
+      timeout 600 wine "${WINE_PY}" -m pip install --upgrade --force-reinstall --no-cache-dir "MetaTrader5==5.0.${TERM_BUILD}" 2>/dev/null || { \
+        echo "WARNING: MetaTrader5==5.0.${TERM_BUILD} not found on PyPI"; \
+        echo "Installing latest MetaTrader5 instead (build mismatch risk!)"; \
+        timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
+      }; \
+    else \
+      echo "No terminal build detected — installing latest MetaTrader5"; \
+      timeout 600 wine "${WINE_PY}" -m pip install --upgrade --no-cache-dir MetaTrader5 || true; \
+    fi; \
+    wine "${WINE_PY}" -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)" \
+      || echo "WARNING: MetaTrader5 verification failed"; \
     \
     # -- Smoke-test script perms -- \
     chmod +x /bridge/smoke-test-ipc.sh; \
@@ -363,13 +379,23 @@ RUN set -eux; \
     # self-restart (original PID exits, new PID appears). After the
     # restart, give it 30s to stabilize. Then bake the warm image.
     echo "Phase 2: Letting terminal complete self-restart cycle (90s)..."; \
-    WARMUP_TOTAL=90; \
+    WARMUP_TOTAL=120; \
     WARMUP_WAITED=0; \
     RESTART_DETECTED=false; \
+    RESTART_WINDOW_STABLE=0; \
+    RESTART_WINDOW_REQUIRED=30; \
     while [ "${WARMUP_WAITED}" -lt "${WARMUP_TOTAL}" ]; do \
       # Check if original terminal PID is still alive. \
       if kill -0 "${TERM_PID}" 2>/dev/null; then \
-        echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} alive"; \
+        _WCOUNT=$(DISPLAY=:99 xdotool search --pid "${TERM_PID}" 2>/dev/null | wc -l || echo 0); \
+        echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} alive (windows=${_WCOUNT})"; \
+        if [ "${RESTART_DETECTED}" = "true" ]; then \
+          if [ "${_WCOUNT}" -gt 0 ]; then \
+            RESTART_WINDOW_STABLE=$(( RESTART_WINDOW_STABLE + 10 )); \
+          else \
+            RESTART_WINDOW_STABLE=0; \
+          fi; \
+        fi; \
       else \
         if [ "${RESTART_DETECTED}" = "false" ]; then \
           echo "  ${WARMUP_WAITED}s: terminal PID ${TERM_PID} exited — checking for self-restart..."; \
@@ -378,6 +404,7 @@ RUN set -eux; \
             echo "  Self-restart detected: new PID ${NEW_PID}"; \
             TERM_PID="${NEW_PID}"; \
             RESTART_DETECTED=true; \
+            RESTART_WINDOW_STABLE=0; \
           else \
             echo "  No new terminal PID found — terminal exited cleanly (no restart needed)"; \
             break; \
@@ -387,10 +414,17 @@ RUN set -eux; \
           break; \
         fi; \
       fi; \
+      if [ "${RESTART_DETECTED}" = "true" ] && [ "${RESTART_WINDOW_STABLE}" -ge "${RESTART_WINDOW_REQUIRED}" ]; then \
+        echo "  Restarted terminal is window-stable for ${RESTART_WINDOW_STABLE}s — bake gate passed."; \
+        break; \
+      fi; \
       sleep 10; \
       WARMUP_WAITED=$(( WARMUP_WAITED + 10 )); \
     done; \
-    echo "Phase 2 done after ${WARMUP_WAITED}s (restart_detected=${RESTART_DETECTED})."; \
+    if [ "${RESTART_DETECTED}" = "true" ] && [ "${RESTART_WINDOW_STABLE}" -lt "${RESTART_WINDOW_REQUIRED}" ]; then \
+      echo "WARNING: restart detected but terminal windows did not stabilize (${RESTART_WINDOW_STABLE}s < ${RESTART_WINDOW_REQUIRED}s)"; \
+    fi; \
+    echo "Phase 2 done after ${WARMUP_WAITED}s (restart_detected=${RESTART_DETECTED}, restart_window_stable=${RESTART_WINDOW_STABLE}s)."; \
     \
     # Take a snapshot of what terminal.ini looks like now. \
     FINAL_TINI_SIZE=$(wc -c < "${TERM_DIR}/terminal.ini" 2>/dev/null || echo 0); \
