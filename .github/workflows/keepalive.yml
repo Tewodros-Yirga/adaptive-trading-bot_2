@@ -1,12 +1,17 @@
-# Keep Hugging Face Space awake by pinging the public health endpoint on a schedule.
-# Runs in *this* GitHub repo; configure secrets here (not on HF).
+# Keep Hugging Face Space awake by pinging it on a schedule.
+# Configure in *this* GitHub repo (Settings → Secrets and variables → Actions).
 #
-# Secrets (repo → Settings → Secrets):
-#   HF_SPACE_URL      — optional; default https://loriloha-mt5-bridge-service.hf.space
-#   HF_TOKEN          — optional; Authorization: Bearer for private HF Spaces
-#   MT_BRIDGE_SECRET  — optional; required only for the extra /debug/mt5 line in logs
+# Secrets:
+#   HF_SPACE_URL      — REQUIRED. Space runtime base URL with no path, e.g.
+#                       https://YOURNAME-YOURSPACENAME.hf.space
+#                       (copy from the Space page when it is running, or Embed / API docs.)
+#   HF_TOKEN          — Optional. HF API token with read access to the Space if it is private.
+#   MT_BRIDGE_SECRET  — Optional. Same value as MT_BRIDGE_SECRET on the Space; enables /debug/mt5 log lines.
 #
-# Note: scheduled workflows only run on the repository default branch.
+# If you see HTTP 404 and HTML mentioning Hugging Face, the hostname is wrong or the Space is
+# private without HF_TOKEN — not a cold start.
+#
+# Scheduled workflows only run on the repository default branch.
 name: Keep MT5 Bridge Alive
 
 on:
@@ -17,7 +22,6 @@ on:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    # Worst case: 30s first curl + 10s sleep + 120s retry (+ debug) exceeds 2 minutes.
     timeout-minutes: 5
     steps:
       - name: Ping health endpoint
@@ -28,51 +32,100 @@ jobs:
         run: |
           set -euo pipefail
 
-          DEFAULT_URL="https://loriloha-mt5-bridge-service.hf.space"
-          BASE_URL="${HF_SPACE_URL:-$DEFAULT_URL}"
-          BASE_URL="${BASE_URL%/}"
+          if [ -z "${HF_SPACE_URL:-}" ]; then
+            echo "::error::Set the HF_SPACE_URL repository secret to your Space base URL (https://… .hf.space with no trailing path). A wrong or missing URL returns Hugging Face HTML 404, not your app."
+            exit 1
+          fi
 
+          BASE_URL="${HF_SPACE_URL%/}"
           HEALTH_URL="${BASE_URL}/health"
+          ROOT_URL="${BASE_URL}/"
           DEBUG_URL="${BASE_URL}/debug/mt5"
+
+          is_hf_gateway_html() {
+            local f="$1"
+            test -f "$f" && head -c 500 "$f" | grep -q '<!DOCTYPE html' && grep -q 'huggingface' "$f" 2>/dev/null
+          }
+
+          warn_hf_404() {
+            local code="$1" file="$2"
+            if [ "${code}" = "404" ] && is_hf_gateway_html "${file}"; then
+              echo "::warning::Response is Hugging Face's HTML 404 (not your Space app). Fix HF_SPACE_URL to your live Space URL, or if the Space is private set HF_TOKEN."
+            fi
+          }
+
+          # curl: write body to $1, print http code on stdout
+          space_get() {
+            local out="$1" max="$2" url="$3"
+            local -a c=(curl -sS -o "${out}" -w "%{http_code}" --max-time "${max}")
+            if [ -n "${HF_TOKEN:-}" ]; then
+              c+=(-H "Authorization: Bearer ${HF_TOKEN}")
+            fi
+            c+=("${url}")
+            local code
+            code="$("${c[@]}" || true)"
+            if [ -z "${code}" ]; then echo "000"; else echo "${code}"; fi
+          }
+
+          bridge_json_ok() {
+            python3 -c "
+          import json, sys
+          p = sys.argv[1]
+          with open(p, 'rb') as f:
+              raw = f.read(8000)
+          if raw.lstrip().startswith(b'<'):
+              sys.exit(1)
+          d = json.loads(raw.decode())
+          sys.exit(0 if d.get('status') == 'ok' else 1)
+          " "$1" 2>/dev/null
+          }
 
           echo "Pinging ${HEALTH_URL} ..."
 
-          # Optional HF Space JWT (private spaces)
-          health_curl=(curl -sS -o /tmp/health.json -w "%{http_code}" --max-time 30)
-          if [ -n "${HF_TOKEN:-}" ]; then
-            health_curl+=(-H "Authorization: Bearer ${HF_TOKEN}")
-          fi
-          health_curl+=("${HEALTH_URL}")
+          HTTP_CODE="$(space_get /tmp/health.json 30 "${HEALTH_URL}")"
 
-          HTTP_CODE="$("${health_curl[@]}" || true)"
-          if [ -z "${HTTP_CODE}" ]; then HTTP_CODE="000"; fi
-
-          if [ "${HTTP_CODE}" = "200" ]; then
-            echo "Health check passed (HTTP ${HTTP_CODE})"
+          if [ "${HTTP_CODE}" = "200" ] && bridge_json_ok /tmp/health.json; then
+            echo "Health check passed (HTTP ${HTTP_CODE} /health)"
             python3 -m json.tool /tmp/health.json 2>/dev/null || cat /tmp/health.json
+          elif [ "${HTTP_CODE}" != "200" ]; then
+            warn_hf_404 "${HTTP_CODE}" /tmp/health.json
+            echo "Trying ${ROOT_URL} (GET /) ..."
+            HTTP_ROOT="$(space_get /tmp/root.json 30 "${ROOT_URL}")"
+            if [ "${HTTP_ROOT}" = "200" ] && bridge_json_ok /tmp/root.json; then
+              echo "Space responded OK on / (HTTP 200); /health was ${HTTP_CODE}"
+              python3 -m json.tool /tmp/root.json 2>/dev/null || cat /tmp/root.json
+            else
+              warn_hf_404 "${HTTP_ROOT}" /tmp/root.json
+              echo "First attempt not OK (/health HTTP ${HTTP_CODE}, / HTTP ${HTTP_ROOT}) — retrying once after 10s ..."
+              cat /tmp/health.json 2>/dev/null | head -c 400 || true
+              echo ""
+              sleep 10
+              HTTP_CODE2="$(space_get /tmp/health2.json 120 "${HEALTH_URL}")"
+              if [ "${HTTP_CODE2}" = "200" ] && bridge_json_ok /tmp/health2.json; then
+                echo "Retry passed (HTTP ${HTTP_CODE2} /health)"
+                python3 -m json.tool /tmp/health2.json 2>/dev/null || cat /tmp/health2.json
+              else
+                HTTP_ROOT2="$(space_get /tmp/root2.json 120 "${ROOT_URL}")"
+                if [ "${HTTP_ROOT2}" = "200" ] && bridge_json_ok /tmp/root2.json; then
+                  echo "Retry passed on / (HTTP ${HTTP_ROOT2})"
+                  python3 -m json.tool /tmp/root2.json 2>/dev/null || cat /tmp/root2.json
+                else
+                  warn_hf_404 "${HTTP_CODE2}" /tmp/health2.json
+                  echo "::error::Health check failed after retry (/health HTTP ${HTTP_CODE2}, / HTTP ${HTTP_ROOT2}). Set HF_SPACE_URL and, for private Spaces, HF_TOKEN."
+                  exit 1
+                fi
+              fi
+            fi
           else
-            echo "First attempt not OK (HTTP ${HTTP_CODE}) — cold start or transient; retrying once ..."
-            cat /tmp/health.json 2>/dev/null || true
-            sleep 10
-            health_curl_retry=(curl -sS -o /tmp/health2.json -w "%{http_code}" --max-time 120)
-            if [ -n "${HF_TOKEN:-}" ]; then
-              health_curl_retry+=(-H "Authorization: Bearer ${HF_TOKEN}")
-            fi
-            health_curl_retry+=("${HEALTH_URL}")
-            HTTP_CODE2="$("${health_curl_retry[@]}" || true)"
-            if [ -z "${HTTP_CODE2}" ]; then HTTP_CODE2="000"; fi
-            echo "Retry result: HTTP ${HTTP_CODE2}"
-            cat /tmp/health2.json 2>/dev/null || true
-            if [ "${HTTP_CODE2}" != "200" ]; then
-              echo "::error::Health check failed after retry (HTTP ${HTTP_CODE2})"
-              exit 1
-            fi
+            echo "::error::Unexpected /health response (HTTP ${HTTP_CODE}) — body is not bridge JSON."
+            cat /tmp/health.json 2>/dev/null | head -c 2000 || true
+            exit 1
           fi
 
           echo ""
           echo "Adapter status (debug):"
           if [ -z "${MT_BRIDGE_SECRET:-}" ]; then
-            echo "  (skipped — set MT_BRIDGE_SECRET in repo secrets to probe /debug/mt5)"
+            echo "  (skipped — set MT_BRIDGE_SECRET to probe /debug/mt5)"
           else
             debug_curl=(curl -sS --max-time 30)
             if [ -n "${HF_TOKEN:-}" ]; then
