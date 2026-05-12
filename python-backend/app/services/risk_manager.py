@@ -1,0 +1,199 @@
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from .. import crud
+
+RISK_KEYS = [
+    "account_balance",
+    "leverage",
+    "risk_per_trade_pct",
+    "max_open_trades",
+    "max_daily_loss_pct",
+    "max_drawdown_pct",
+    "lot_size_mode",
+    "trading_halt",
+    "symbol_exposure_limit",
+]
+
+RISK_DEFAULTS: dict[str, Any] = {
+    "account_balance": 10000.0,
+    "leverage": 100,
+    "risk_per_trade_pct": 1.0,
+    "max_open_trades": 5,
+    "max_daily_loss_pct": 5.0,
+    "max_drawdown_pct": 20.0,
+    "lot_size_mode": "FIXED",
+    "trading_halt": False,
+    "symbol_exposure_limit": 1.0,
+}
+
+
+def get_risk_settings(db: Session) -> dict:
+    stored = crud.get_settings(db, RISK_KEYS)
+    result: dict[str, Any] = {}
+    for key, default in RISK_DEFAULTS.items():
+        raw = stored.get(key)
+        if raw is None:
+            result[key] = default
+        elif isinstance(default, bool):
+            result[key] = raw.lower() in ("true", "1", "yes")
+        elif isinstance(default, int):
+            result[key] = int(float(raw))
+        elif isinstance(default, float):
+            result[key] = float(raw)
+        else:
+            result[key] = raw
+    return result
+
+
+def update_risk_settings(db: Session, payload: dict) -> dict:
+    current = get_risk_settings(db)
+    merged = {**current, **payload}
+    validated = {
+        "account_balance": max(0.0, float(merged["account_balance"])),
+        "leverage": min(max(int(merged["leverage"]), 1), 2000),
+        "risk_per_trade_pct": min(max(float(merged["risk_per_trade_pct"]), 0.01), 10.0),
+        "max_open_trades": min(max(int(merged["max_open_trades"]), 1), 100),
+        "max_daily_loss_pct": min(max(float(merged["max_daily_loss_pct"]), 0.1), 50.0),
+        "max_drawdown_pct": min(max(float(merged["max_drawdown_pct"]), 1.0), 100.0),
+        "lot_size_mode": merged["lot_size_mode"] if merged["lot_size_mode"] in ("FIXED", "DYNAMIC") else "FIXED",
+        "trading_halt": bool(merged["trading_halt"]),
+        "symbol_exposure_limit": min(max(float(merged["symbol_exposure_limit"]), 0.01), 100.0),
+    }
+    for key, value in validated.items():
+        crud.set_setting(db, key, str(value))
+    return validated
+
+
+def pip_value(symbol: str) -> float:
+    """Returns pip value for common symbols."""
+    symbol = symbol.upper()
+    if "JPY" in symbol:
+        return 0.01
+    if symbol in ("XAUUSD", "GOLD"):
+        return 0.1
+    if symbol in ("XAGUSD", "SILVER"):
+        return 0.001
+    if symbol in ("US30", "NAS100", "SPX500"):
+        return 1.0
+    return 0.0001
+
+
+def pip_cost_per_lot(symbol: str) -> float:
+    """Returns approximate USD cost per pip per standard lot."""
+    symbol = symbol.upper()
+    if "JPY" in symbol:
+        return 10.0
+    if symbol in ("XAUUSD", "GOLD"):
+        return 10.0
+    if symbol in ("XAGUSD", "SILVER"):
+        return 50.0
+    return 10.0
+
+
+def compute_dynamic_lot_size(
+    account_balance: float,
+    risk_per_trade_pct: float,
+    entry_price: float,
+    stop_loss: float,
+    symbol: str,
+    leverage: int = 100,
+) -> float:
+    risk_amount = account_balance * (risk_per_trade_pct / 100.0)
+    pv = pip_value(symbol)
+    if pv == 0:
+        pv = 0.0001
+    sl_pips = abs(entry_price - stop_loss) / pv
+    if sl_pips == 0:
+        return 0.01
+    cost = pip_cost_per_lot(symbol)
+    lot_size = risk_amount / (sl_pips * cost)
+    max_lot = (account_balance * leverage) / (entry_price * 100000) if entry_price > 0 else 10.0
+    return round(max(0.01, min(lot_size, max_lot)), 2)
+
+
+def check_and_compute_lot_size(
+    db: Session,
+    symbol: str,
+    entry_price: float,
+    stop_loss: float,
+    default_lot_size: float = 0.01,
+) -> tuple[float, str | None]:
+    """
+    Returns (lot_size, block_reason).
+    block_reason is None if trade is allowed, string if blocked.
+    """
+    settings = get_risk_settings(db)
+
+    if settings["trading_halt"]:
+        return 0.0, "Trading halt is active"
+
+    open_trades = crud.get_recent_trades(db, 1000)
+    open_count = sum(1 for t in open_trades if t.result == "OPEN")
+    if open_count >= settings["max_open_trades"]:
+        return 0.0, f"Max open trades limit reached ({settings['max_open_trades']})"
+
+    symbol_lots = sum(
+        (t.lot_size or 0) for t in open_trades
+        if t.result == "OPEN" and t.symbol.upper() == symbol.upper()
+    )
+    if symbol_lots >= settings["symbol_exposure_limit"]:
+        return 0.0, f"Symbol exposure limit reached for {symbol}"
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    closed_trades = crud.get_closed_trades(db, 10000)
+    today_pnl = sum(
+        (t.pnl or 0) for t in closed_trades
+        if t.closed_at and t.closed_at.replace(tzinfo=timezone.utc) >= today_start
+    )
+    balance = settings["account_balance"]
+    if balance > 0:
+        daily_loss_pct = (-today_pnl / balance) * 100
+        if daily_loss_pct >= settings["max_daily_loss_pct"]:
+            return 0.0, f"Daily loss limit reached ({daily_loss_pct:.1f}%)"
+
+    stats = crud.get_stats(db)
+    if balance > 0 and stats.get("max_drawdown", 0) / balance * 100 >= settings["max_drawdown_pct"]:
+        return 0.0, "Max drawdown limit reached"
+
+    mode = settings["lot_size_mode"]
+    if mode == "DYNAMIC":
+        lot_size = compute_dynamic_lot_size(
+            account_balance=balance,
+            risk_per_trade_pct=settings["risk_per_trade_pct"],
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            symbol=symbol,
+            leverage=int(settings["leverage"]),
+        )
+    else:
+        lot_size = default_lot_size
+
+    return lot_size, None
+
+
+def get_risk_status(db: Session) -> dict:
+    settings = get_risk_settings(db)
+    open_trades = crud.get_recent_trades(db, 1000)
+    open_count = sum(1 for t in open_trades if t.result == "OPEN")
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    closed_trades = crud.get_closed_trades(db, 10000)
+    today_pnl = sum(
+        (t.pnl or 0) for t in closed_trades
+        if t.closed_at and t.closed_at.replace(tzinfo=timezone.utc) >= today_start
+    )
+    stats = crud.get_stats(db)
+    balance = settings["account_balance"]
+
+    return {
+        "open_trades_count": open_count,
+        "daily_pnl": round(today_pnl, 4),
+        "daily_loss_pct": round((-today_pnl / balance * 100) if balance > 0 else 0.0, 2),
+        "current_drawdown": round(stats.get("max_drawdown", 0.0), 4),
+        "current_drawdown_pct": round((stats.get("max_drawdown", 0.0) / balance * 100) if balance > 0 else 0.0, 2),
+        "trading_halt": settings["trading_halt"],
+        "settings": settings,
+    }

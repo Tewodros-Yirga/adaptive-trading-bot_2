@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from .base import BaseStrategy
+
 
 @dataclass
 class DTCParams:
@@ -79,3 +81,27 @@ def compute_levels(direction: str, price: float, params: DTCParams) -> dict[str,
 
 def compute_mtf_state(mtf_pairs: dict[str, tuple[float, float]]) -> dict[str, bool]:
     return {k: fast > slow for k, (fast, slow) in mtf_pairs.items()}
+
+
+class DTCStrategy(BaseStrategy):
+    name = "DTC"
+    display_name = "Dynamic Trend Cascade"
+    description = "Uses 6 EMAs in a cascade for trend-following entries with adaptive stop loss and take profit levels."
+
+    @classmethod
+    def default_params(cls) -> dict:
+        return DEFAULT_PARAMS.copy()
+
+    def signal(self, market_data: dict) -> str | None:
+        ema_values = market_data.get("ema_values", {})
+        if not ema_values:
+            return None
+        previous_bull = market_data.get("previous_bull", False)
+        previous_bear = market_data.get("previous_bear", False)
+        current_bull = bullish_trend(ema_values)
+        current_bear = bearish_trend(ema_values)
+        return trend_shift_signal(previous_bull, previous_bear, current_bull, current_bear)
+
+    def compute_levels(self, direction: str, price: float, params: dict) -> dict:
+        p = resolve_params(params)
+        return compute_levels(direction, price, p)
