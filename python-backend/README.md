@@ -55,3 +55,9 @@ This service can ping another service every 14 minutes to keep both warm.
 - `PEER_HEALTHCHECK_INTERVAL_SECONDS` (default `840`)
 - `PEER_HEALTHCHECK_TIMEOUT_SECONDS` (default `20`)
 - `PEER_HEALTHCHECK_BEARER_TOKEN` (optional, for private HF Space access)
+
+## Bridge auth for private HF Space
+
+If your MT5 bridge Space is private, set:
+
+- `MT_BRIDGE_HF_TOKEN` (HF bearer token used for `/account`, `/positions`, `/order`, `/close`)

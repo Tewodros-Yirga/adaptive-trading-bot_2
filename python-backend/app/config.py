@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:password@localhost:5432/trading_bot"
     mt_bridge_url: str = "http://localhost:5555"
     mt_bridge_secret: str = "bridge_secret_token"
+    mt_bridge_hf_token: str = ""
 
     adaptation_min_closed_trades: int = 20
     adaptation_cooldown_trades: int = 20

@@ -8,10 +8,13 @@ from ..config import settings
 
 class MT5BridgeClient:
     def __init__(self) -> None:
+        headers = {"Content-Type": "application/json", "X-Bridge-Secret": settings.mt_bridge_secret}
+        if settings.mt_bridge_hf_token:
+            headers["Authorization"] = f"Bearer {settings.mt_bridge_hf_token}"
         self._client = httpx.Client(
             base_url=settings.mt_bridge_url,
             timeout=10.0,
-            headers={"Content-Type": "application/json", "X-Bridge-Secret": settings.mt_bridge_secret},
+            headers=headers,
         )
 
     @retry(wait=wait_exponential(multiplier=0.5, min=0.5, max=3), stop=stop_after_attempt(3), reraise=True)
