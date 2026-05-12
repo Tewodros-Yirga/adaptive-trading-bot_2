@@ -18,3 +18,6 @@ mt5_v5430.zip
 *.exe
 *.zip
 mt5-diagnostics-export/
+
+# Local / deploy scratch (do not commit)
+.hf-space-deploy/
