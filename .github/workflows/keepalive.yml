@@ -12,11 +12,17 @@
 # private without HF_TOKEN — not a cold start.
 #
 # Scheduled workflows only run on the repository default branch.
+#
+# If the schedule never fires: (1) Fork? Open Actions tab and enable workflows. (2) Public repo
+# inactive 60+ days? GitHub auto-disables schedules — push a commit or re-enable the workflow
+# under Actions → … → Enable workflow. (3) GitHub queues are heaviest at :00 UTC; cron below
+# avoids the top of the hour (see docs: "schedule" event).
 name: Keep MT5 Bridge Alive
 
 on:
   schedule:
-    - cron: "*/14 * * * *"
+    # ~every 14 min (minutes 3,17,31,45,59 UTC) — avoids :00 when Actions load is highest
+    - cron: "3,17,31,45,59 * * * *"
   workflow_dispatch:
 
 jobs:
