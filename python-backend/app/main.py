@@ -42,7 +42,7 @@ async def _peer_keepalive_loop() -> None:
         logger.info("Peer keepalive disabled (PEER_HEALTHCHECK_URL not set)")
         return
 
-    health_url = f"{base}/health"
+    health_url = f"{base}"
     headers: dict[str, str] = {}
     if settings.peer_healthcheck_bearer_token:
         headers["Authorization"] = f"Bearer {settings.peer_healthcheck_bearer_token}"
