@@ -1,3 +1,13 @@
+---
+title: Adaptive Trading Backend
+emoji: 🤖
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # Adaptive Trading Bot - Python Backend
 
 FastAPI migration of the adaptive trading backend, based on DTC v1.35 strategy defaults.
@@ -36,3 +46,12 @@ Open `http://localhost:8000/` for the dashboard.
 - Low learning rate (`ADAPTATION_LR`)
 - Confidence gate (`ADAPTATION_CONFIDENCE_THRESHOLD`)
 - Min sample gate (`ADAPTATION_MIN_CLOSED_TRADES`)
+
+## Peer keepalive (service-to-service)
+
+This service can ping another service every 14 minutes to keep both warm.
+
+- `PEER_HEALTHCHECK_URL` (example: `https://loriloha-mt5-bridge-service.hf.space`)
+- `PEER_HEALTHCHECK_INTERVAL_SECONDS` (default `840`)
+- `PEER_HEALTHCHECK_TIMEOUT_SECONDS` (default `20`)
+- `PEER_HEALTHCHECK_BEARER_TOKEN` (optional, for private HF Space access)

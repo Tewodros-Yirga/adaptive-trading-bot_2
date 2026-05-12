@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # If true, mock responses are returned when MetaTrader5 package/session is unavailable.
     mt_fallback_mode: bool = Field(default=True, alias="MT_FALLBACK_MODE")
 
+    # Optional peer keepalive (ping backend service /health periodically).
+    peer_healthcheck_url: str = Field(default="", alias="PEER_HEALTHCHECK_URL")
+    peer_healthcheck_interval_seconds: int = Field(default=14 * 60, alias="PEER_HEALTHCHECK_INTERVAL_SECONDS")
+    peer_healthcheck_timeout_seconds: int = Field(default=20, alias="PEER_HEALTHCHECK_TIMEOUT_SECONDS")
+    peer_healthcheck_bearer_token: str = Field(default="", alias="PEER_HEALTHCHECK_BEARER_TOKEN")
+
 
 settings = Settings()
 

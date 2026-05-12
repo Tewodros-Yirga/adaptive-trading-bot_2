@@ -23,5 +23,12 @@ class Settings(BaseSettings):
     adaptation_confidence_threshold: float = 0.05
     adaptation_rollback_pf_drop: float = 0.15
 
+    # Optional peer keepalive: this service periodically pings the other service's
+    # health endpoint to keep both warm without relying only on external cron jobs.
+    peer_healthcheck_url: str = ""
+    peer_healthcheck_interval_seconds: int = 14 * 60
+    peer_healthcheck_timeout_seconds: int = 20
+    peer_healthcheck_bearer_token: str = ""
+
 
 settings = Settings()

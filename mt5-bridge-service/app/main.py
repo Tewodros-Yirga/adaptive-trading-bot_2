@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import os
 import re
 import socket
 from pathlib import Path
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .config import settings, validate_required_settings
@@ -11,6 +13,7 @@ from .mt5_adapter import adapter
 from .schemas import CloseRequest, OrderRequest
 
 app = FastAPI(title="Adaptive MT5 Bridge")
+logger = logging.getLogger(__name__)
 
 
 async def _background_connect_loop() -> None:
@@ -34,12 +37,41 @@ async def _background_connect_loop() -> None:
         await asyncio.sleep(60)
 
 
+async def _peer_keepalive_loop() -> None:
+    base = settings.peer_healthcheck_url.strip().rstrip("/")
+    if not base:
+        logger.info("Peer keepalive disabled (PEER_HEALTHCHECK_URL not set)")
+        return
+
+    health_url = f"{base}/health"
+    headers: dict[str, str] = {}
+    if settings.peer_healthcheck_bearer_token:
+        headers["Authorization"] = f"Bearer {settings.peer_healthcheck_bearer_token}"
+
+    await asyncio.sleep(20)
+    timeout = settings.peer_healthcheck_timeout_seconds
+    interval = settings.peer_healthcheck_interval_seconds
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        while True:
+            try:
+                response = await client.get(health_url, headers=headers)
+                if response.status_code == 200:
+                    logger.info("Peer keepalive OK: %s", health_url)
+                else:
+                    logger.warning("Peer keepalive non-200 (%s): %s", response.status_code, health_url)
+            except Exception as exc:
+                logger.warning("Peer keepalive failed (%s): %s", health_url, exc)
+            await asyncio.sleep(interval)
+
+
 @app.on_event("startup")
 async def startup_validation() -> None:
     validate_required_settings()
     # Kick off the background reconnect loop so the adapter connects
     # proactively without waiting for the first HTTP request.
     asyncio.create_task(_background_connect_loop())
+    asyncio.create_task(_peer_keepalive_loop())
 
 
 def require_secret(x_bridge_secret: str = Header(default="")) -> None:

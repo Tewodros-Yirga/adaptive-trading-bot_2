@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 pydantic-settings
+httpx
 # mt5linux and rpyc versions MUST match the Wine-side packages.
 # Wine-side is installed in the base image Dockerfile (Step 6).
 mt5linux>=1.0.3
