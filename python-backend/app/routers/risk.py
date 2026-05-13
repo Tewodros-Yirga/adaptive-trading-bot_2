@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends
+from ..auth_deps import require_write_access
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -13,7 +14,7 @@ def get_settings(db: Session = Depends(get_db)):
 
 
 @router.post("/settings")
-def update_settings(body: dict, db: Session = Depends(get_db)):
+def update_settings(body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     return update_risk_settings(db, body)
 
 
@@ -23,12 +24,12 @@ def get_status(db: Session = Depends(get_db)):
 
 
 @router.post("/halt")
-def halt_trading(db: Session = Depends(get_db)):
+def halt_trading(db: Session = Depends(get_db), _w=Depends(require_write_access)):
     update_risk_settings(db, {"trading_halt": True})
     return {"status": "halted", "trading_halt": True}
 
 
 @router.post("/resume")
-def resume_trading(db: Session = Depends(get_db)):
+def resume_trading(db: Session = Depends(get_db), _w=Depends(require_write_access)):
     update_risk_settings(db, {"trading_halt": False})
     return {"status": "resumed", "trading_halt": False}

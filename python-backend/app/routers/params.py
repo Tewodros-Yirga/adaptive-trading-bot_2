@@ -4,6 +4,7 @@ Params router — learning settings and parameter version history.
 import json
 
 from fastapi import APIRouter, Depends, Query
+from ..auth_deps import require_write_access
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -19,7 +20,7 @@ def get_learning(db: Session = Depends(get_db)):
 
 
 @router.post("/learning")
-def update_learning(body: dict, db: Session = Depends(get_db)):
+def update_learning(body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     return update_learning_settings(db, body)
 
 

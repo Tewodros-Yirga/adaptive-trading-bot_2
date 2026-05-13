@@ -1,6 +1,7 @@
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
+from ..auth_deps import require_write_access
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -12,7 +13,7 @@ router = APIRouter(prefix="/backtest", tags=["backtest"])
 
 
 @router.post("/run")
-def run(body: dict, db: Session = Depends(get_db)):
+def run(body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     strategy_name = body.get("strategy_name", "DTC")
     symbol = body.get("symbol", "XAUUSD")
     from_date = body.get("from_date", "2024-01-01")

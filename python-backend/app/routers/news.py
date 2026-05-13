@@ -5,8 +5,10 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from .. import crud
+from ..auth_deps import require_write_access
 from ..db import get_db
 from ..models import NewsItem
+
 from ..services.news_intelligence import (
     fetch_and_store_news,
     get_global_context,
@@ -58,7 +60,7 @@ def get_context(db: Session = Depends(get_db)):
 
 
 @router.post("/fetch")
-def trigger_fetch(body: dict | None = None, db: Session = Depends(get_db)):
+def trigger_fetch(body: dict | None = None, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     symbol = (body or {}).get("symbol")
     count = fetch_and_store_news(db, symbol)
     context = update_global_context(db)
@@ -66,12 +68,12 @@ def trigger_fetch(body: dict | None = None, db: Session = Depends(get_db)):
 
 
 @router.post("/context/refresh")
-def refresh_context(db: Session = Depends(get_db)):
+def refresh_context(db: Session = Depends(get_db), _w=Depends(require_write_access)):
     return update_global_context(db)
 
 
 @router.post("/learn")
-def trigger_learning(db: Session = Depends(get_db)):
+def trigger_learning(db: Session = Depends(get_db), _w=Depends(require_write_access)):
     updated = run_retrospective_learning(db)
     return {"updated_items": updated}
 

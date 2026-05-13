@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from ..auth_deps import require_write_access
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -59,7 +60,7 @@ def get_ens_config(db: Session = Depends(get_db)):
 
 
 @router.post("/ensemble/config")
-def update_ens_config(body: dict, db: Session = Depends(get_db)):
+def update_ens_config(body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     return set_ensemble_config(db, body)
 
 
@@ -85,7 +86,7 @@ def get_one(name: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{name}/activate")
-def activate(name: str, db: Session = Depends(get_db)):
+def activate(name: str, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     _ensure_strategies_exist(db)
     row = db.scalar(select(Strategy).where(Strategy.name == name))
     if not row:
@@ -97,7 +98,7 @@ def activate(name: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{name}/deactivate")
-def deactivate(name: str, db: Session = Depends(get_db)):
+def deactivate(name: str, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     _ensure_strategies_exist(db)
     row = db.scalar(select(Strategy).where(Strategy.name == name))
     if not row:
@@ -111,7 +112,7 @@ def deactivate(name: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{name}/set-live")
-def make_live(name: str, db: Session = Depends(get_db)):
+def make_live(name: str, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     _ensure_strategies_exist(db)
     if name not in STRATEGY_REGISTRY:
         raise HTTPException(404, f"Strategy {name} not in registry")
@@ -123,7 +124,7 @@ def make_live(name: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{name}/params")
-def update_params(name: str, body: dict, db: Session = Depends(get_db)):
+def update_params(name: str, body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
     _ensure_strategies_exist(db)
     row = db.scalar(select(Strategy).where(Strategy.name == name))
     if not row:

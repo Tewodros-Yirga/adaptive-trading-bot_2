@@ -4,6 +4,7 @@ Adaptation router — trigger adaptation and view logs.
 import json
 
 from fastapi import APIRouter, Depends, Query
+from ..auth_deps import require_write_access
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
@@ -15,7 +16,7 @@ router = APIRouter(prefix="/adapt", tags=["adaptation"])
 
 
 @router.post("")
-def trigger_adaptation(db: Session = Depends(get_db)):
+def trigger_adaptation(db: Session = Depends(get_db), _w=Depends(require_write_access)):
     result = run_adaptation(db)
     return result
 

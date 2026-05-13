@@ -6,6 +6,7 @@ Runs in ProcessPoolExecutor to avoid blocking the event loop.
 import json
 import logging
 import math
+import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
@@ -21,8 +22,18 @@ logger = logging.getLogger(__name__)
 _EXECUTOR = ProcessPoolExecutor(max_workers=2)
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize broker-specific suffixes (XAUUSDm → XAUUSD)."""
+    s = symbol.upper().rstrip('M').rstrip('.')
+    # Handle common broker suffixes like .pro, .raw, etc.
+    for suffix in ('.PRO', '.RAW', '.STD', '.ECN'):
+        if s.endswith(suffix):
+            s = s[:-len(suffix)]
+    return s
+
+
 def _fetch_ohlcv_yfinance(symbol: str, from_date: str, to_date: str) -> list[dict]:
-    """Fetch OHLCV data using yfinance."""
+    """Fetch OHLCV data using yfinance with retry on rate limits."""
     try:
         import yfinance as yf
         ticker_map = {
@@ -30,11 +41,31 @@ def _fetch_ohlcv_yfinance(symbol: str, from_date: str, to_date: str) -> list[dic
             "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X", "US30": "^DJI",
             "NAS100": "^NDX", "SPX500": "^GSPC",
         }
-        yf_symbol = ticker_map.get(symbol.upper(), symbol)
-        df = yf.download(yf_symbol, start=from_date, end=to_date, interval="1d", progress=False)
-        if df is None or df.empty:
-            logger.warning(f"yfinance returned empty data for {yf_symbol}")
+        norm_symbol = _normalize_symbol(symbol)
+        yf_symbol = ticker_map.get(norm_symbol, symbol)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(yf_symbol, start=from_date, end=to_date, interval="1d", progress=False)
+                if df is not None and not df.empty:
+                    break
+                logger.warning(f"yfinance returned empty data for {yf_symbol} (attempt {attempt + 1})")
+            except Exception as e:
+                err_str = str(e).lower()
+                if 'rate' in err_str or 'too many' in err_str:
+                    delay = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                    logger.warning(f"yfinance rate limited for {yf_symbol}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                raise
+        else:
+            logger.warning(f"yfinance exhausted retries for {yf_symbol}")
             return []
+
+        if df is None or df.empty:
+            return []
+
         records = []
         for ts, row in df.iterrows():
             records.append({
@@ -60,12 +91,14 @@ def _fetch_ohlcv_alphavantage(symbol: str, api_key: str) -> list[dict]:
         return []
     try:
         av_map = {
-            "XAUUSD": ("COMMODITY", "GOLD"),
+            "XAUUSD": ("FX_DAILY", "XAU", "USD"),
+            "XAGUSD": ("FX_DAILY", "XAG", "USD"),
             "EURUSD": ("FX_DAILY", "EUR", "USD"),
             "GBPUSD": ("FX_DAILY", "GBP", "USD"),
             "USDJPY": ("FX_DAILY", "USD", "JPY"),
         }
-        mapping = av_map.get(symbol.upper())
+        norm_symbol = _normalize_symbol(symbol)
+        mapping = av_map.get(norm_symbol)
 
         if mapping and mapping[0] == "FX_DAILY":
             url = (
