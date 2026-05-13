@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
+from pydantic import Field
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
@@ -13,9 +13,9 @@ class Settings(BaseSettings):
     simulation_mode: bool = True
 
     # Auth — set these in HuggingFace secrets
-    admin_username: str = "admin"
-    admin_password: str = ""
-    jwt_secret_key: str = ""
+    admin_username: str = Field(default="admin", validation_alias="ADMIN_USERNAME")
+    admin_password: str = Field(default="", validation_alias="ADMIN_PASSWORD")
+    jwt_secret_key: str = Field(default="", validation_alias="JWT_SECRET_KEY")
 
     database_url: str = "postgresql://postgres:password@localhost:5432/trading_bot"
     mt_bridge_url: str = "http://localhost:5555"
