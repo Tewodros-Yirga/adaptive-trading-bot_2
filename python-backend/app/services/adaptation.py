@@ -18,7 +18,7 @@ def _tiny_step(current: float, target_delta: float, max_change_pct: float) -> tu
     return current + bounded_delta, bounded_delta
 
 
-def run_adaptation(db: Session, window: int = 20) -> dict:
+def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") -> dict:
     learning = get_learning_settings(db)
     params = crud.get_current_params(db) or DEFAULT_PARAMS.copy()
     all_closed = crud.get_closed_trades(db, 100000)
@@ -53,7 +53,7 @@ def run_adaptation(db: Session, window: int = 20) -> dict:
     sl_signal = (0.5 - win_rate) * 0.2
     sl_target_delta = sl_signal * lr * 100
     new_sl, sl_delta = _tiny_step(float(params["stop_loss_pct"]), sl_target_delta, learning["adaptation_max_change_pct"])
-    new_sl = _clamp(new_sl, params["min_stop_loss_pct"], params["max_stop_loss_pct"])
+    new_sl = _clamp(new_sl, params.get("min_stop_loss_pct", 0.1), params.get("max_stop_loss_pct", 1.5))
     if abs(new_sl - params["stop_loss_pct"]) > 0:
         new_params["stop_loss_pct"] = round(new_sl, 5)
         deltas.append(sl_delta)
@@ -62,9 +62,11 @@ def run_adaptation(db: Session, window: int = 20) -> dict:
     tp_signal = (profit_factor - 1.0) * 0.02
     tp_target_delta = tp_signal * lr * 100
     for key in ["tp1_multiplier", "tp2_multiplier", "tp3_multiplier", "tp4_multiplier"]:
+        if key not in params:
+            continue
         current = float(params[key])
         next_value, delta = _tiny_step(current, tp_target_delta, learning["adaptation_max_change_pct"])
-        next_value = _clamp(next_value, params["min_tp_multiplier"], params["max_tp_multiplier"])
+        next_value = _clamp(next_value, params.get("min_tp_multiplier", 0.5), params.get("max_tp_multiplier", 6.0))
         if abs(next_value - current) > 0:
             new_params[key] = round(next_value, 5)
             deltas.append(delta)
@@ -72,12 +74,14 @@ def run_adaptation(db: Session, window: int = 20) -> dict:
     if avg_atr:
         atr_signal = -0.01 if profit_factor > 1.0 else 0.01
         for key in ["ema_1", "ema_2", "ema_3", "ema_4", "ema_5", "ema_6"]:
+            if key not in params:
+                continue
             current = float(params[key])
             next_value, delta = _tiny_step(current, atr_signal * lr * current, learning["adaptation_max_change_pct"])
             if key == "ema_1":
-                next_value = _clamp(next_value, params["min_ema_1"], params["max_ema_1"])
+                next_value = _clamp(next_value, params.get("min_ema_1", 20), params.get("max_ema_1", 40))
             if key == "ema_6":
-                next_value = _clamp(next_value, params["min_ema_6"], params["max_ema_6"])
+                next_value = _clamp(next_value, params.get("min_ema_6", 45), params.get("max_ema_6", 100))
             next_value = round(next_value)
             if next_value != int(current):
                 new_params[key] = int(next_value)
@@ -107,6 +111,7 @@ def run_adaptation(db: Session, window: int = 20) -> dict:
             "confidence_score": confidence,
             "delta_magnitude": delta_magnitude,
             "rollback_triggered": 0,
+            "strategy_name": strategy_name,
         },
     )
     crud.set_setting(db, "last_adapt_closed_count", str(len(all_closed)))

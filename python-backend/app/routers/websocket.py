@@ -36,4 +36,3 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         if websocket in _connections:
             _connections.remove(websocket)
-            

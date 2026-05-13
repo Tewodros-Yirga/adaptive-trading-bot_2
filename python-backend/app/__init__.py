@@ -1,1 +1,1 @@
-"""Adaptive trading bot Python backend package."""
+# app package

@@ -1,80 +1,187 @@
+"""
+AlgoTrade Pro — FastAPI Application Entry Point
+"""
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .config import settings
-from .crud import get_current_params, save_params
-from .db import Base, SessionLocal, engine
-from .routers import adapt, bridge, dashboard, params, simulate, trades, webhook
-from .strategy.dtc import DEFAULT_PARAMS
+from .db import SessionLocal, engine
+from .models import Base
+from .startup_migrations import run_startup_migrations
 
-app = FastAPI(title=settings.app_name)
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
 logger = logging.getLogger(__name__)
 
-app.include_router(webhook.router)
-app.include_router(trades.router)
-app.include_router(params.router)
-app.include_router(adapt.router)
-app.include_router(simulate.router)
-app.include_router(bridge.router)
-app.include_router(dashboard.router)
 
-
-@app.on_event("startup")
-async def startup() -> None:
-    Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── 1. Run DDL migrations FIRST, before any ORM queries ───────────────
     db = SessionLocal()
     try:
-        if not get_current_params(db):
-            save_params(db, DEFAULT_PARAMS.copy(), reason="Initial seed on startup", trigger="SYSTEM")
+        logger.info("Running startup migrations...")
+        run_startup_migrations(db)
+        logger.info("Startup migrations complete.")
+    except Exception as e:
+        logger.error(f"Startup migration failed: {e}")
+        raise
     finally:
         db.close()
-    asyncio.create_task(_peer_keepalive_loop())
+
+    # ── 2. Ensure default params exist ────────────────────────────────────
+    db = SessionLocal()
+    try:
+        from .crud import get_current_params, save_params
+        from .strategy.dtc import DEFAULT_PARAMS
+        if not get_current_params(db):
+            save_params(db, DEFAULT_PARAMS.copy(), reason="Initial defaults", trigger="SYSTEM")
+            logger.info("Seeded default DTC parameters.")
+    except Exception as e:
+        logger.warning(f"Could not seed default params: {e}")
+    finally:
+        db.close()
+
+    # ── 3. Seed strategy registry into DB ─────────────────────────────────
+    db = SessionLocal()
+    try:
+        from .routers.strategies import _ensure_strategies_exist
+        _ensure_strategies_exist(db)
+        logger.info("Strategy registry seeded.")
+    except Exception as e:
+        logger.warning(f"Could not seed strategies: {e}")
+    finally:
+        db.close()
+
+    # ── 4. Start background tasks ─────────────────────────────────────────
+    bg_tasks = []
+    bg_tasks.append(asyncio.create_task(_news_fetch_loop()))
+    bg_tasks.append(asyncio.create_task(_news_learning_loop()))
+    bg_tasks.append(asyncio.create_task(_global_context_loop()))
+
+    logger.info("Application startup complete.")
+    yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────
+    for task in bg_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Application shutdown complete.")
 
 
-async def _peer_keepalive_loop() -> None:
-    base = settings.peer_healthcheck_url.strip().rstrip("/")
-    if not base:
-        logger.info("Peer keepalive disabled (PEER_HEALTHCHECK_URL not set)")
-        return
-
-    health_url = f"{base}"
-    headers: dict[str, str] = {}
-    if settings.peer_healthcheck_bearer_token:
-        headers["Authorization"] = f"Bearer {settings.peer_healthcheck_bearer_token}"
-
-    # Small initial delay to avoid hammering peers during cold startup.
-    await asyncio.sleep(20)
-    timeout = settings.peer_healthcheck_timeout_seconds
-    interval = settings.peer_healthcheck_interval_seconds
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        while True:
-            try:
-                response = await client.get(health_url, headers=headers)
-                if response.status_code == 200:
-                    logger.info("Peer keepalive OK: %s", health_url)
-                else:
-                    logger.warning("Peer keepalive non-200 (%s): %s", response.status_code, health_url)
-            except Exception as exc:
-                logger.warning("Peer keepalive failed (%s): %s", health_url, exc)
-            await asyncio.sleep(interval)
+async def _news_fetch_loop():
+    """Fetch news every 30 minutes."""
+    await asyncio.sleep(60)  # initial delay
+    while True:
+        try:
+            db = SessionLocal()
+            from .services.news_intelligence import fetch_and_store_news
+            from .config import settings
+            fetch_and_store_news(db, getattr(settings, "symbol", "XAUUSD"))
+        except Exception as e:
+            logger.warning(f"News fetch loop error: {e}")
+        finally:
+            db.close()
+        await asyncio.sleep(1800)  # 30 min
 
 
-@app.get("/api/status")
-def status():
-    return {
-        "status": "running",
-        "mode": "SIMULATION" if settings.simulation_mode else "LIVE",
-        "symbol": settings.symbol,
-        "bridge": settings.mt_bridge_url,
-    }
+async def _news_learning_loop():
+    """Run retrospective learning every 2 hours."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            db = SessionLocal()
+            from .services.news_intelligence import run_retrospective_learning
+            updated = run_retrospective_learning(db)
+            if updated:
+                logger.info(f"Retrospective learning updated {updated} news items.")
+        except Exception as e:
+            logger.warning(f"News learning loop error: {e}")
+        finally:
+            db.close()
+        await asyncio.sleep(7200)  # 2 hours
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+async def _global_context_loop():
+    """Update global market context every 30 minutes."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            db = SessionLocal()
+            from .services.news_intelligence import update_global_context
+            update_global_context(db)
+        except Exception as e:
+            logger.warning(f"Global context loop error: {e}")
+        finally:
+            db.close()
+        await asyncio.sleep(1800)
+
+
+# ── App factory ────────────────────────────────────────────────────────────────
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="AlgoTrade Pro",
+        version="2.0.0",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ── Register all routers ───────────────────────────────────────────────
+    from .routers.webhook import router as webhook_router
+    from .routers.strategies import router as strategies_router
+    from .routers.risk import router as risk_router
+    from .routers.news import router as news_router
+    from .routers.backtest import router as backtest_router
+    from .routers.websocket import router as ws_router
+    from .routers.settings import router as settings_router
+
+    app.include_router(webhook_router)
+    app.include_router(strategies_router)
+    app.include_router(risk_router)
+    app.include_router(news_router)
+    app.include_router(backtest_router)
+    app.include_router(ws_router)
+    app.include_router(settings_router)
+
+    # ── Conditionally include pre-existing routers if they exist ──────────
+    _try_include(app, ".routers.trades", "router")
+    _try_include(app, ".routers.params", "router")
+    _try_include(app, ".routers.adapt", "router")
+    _try_include(app, ".routers.simulate", "router")
+    _try_include(app, ".routers.bridge", "router")
+
+    # ── Serve frontend SPA ────────────────────────────────────────────────
+    import os
+    frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+    if os.path.exists(frontend_dist):
+        app.mount("/app", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "version": "2.0.0"}
+
+    return app
+
+
+def _try_include(app: FastAPI, module: str, attr: str):
+    try:
+        import importlib
+        mod = importlib.import_module(module, package="app")
+        router = getattr(mod, attr)
+        app.include_router(router)
+    except Exception:
+        pass
+
+
+app = create_app()
