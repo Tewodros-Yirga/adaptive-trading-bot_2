@@ -9,3 +9,7 @@ tenacity
 pytest
 jinja2
 python-multipart
+pyjwt
+passlib[bcrypt]
+bcrypt
+yfinance

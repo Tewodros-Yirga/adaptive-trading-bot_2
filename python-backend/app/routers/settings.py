@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from .. import crud
@@ -7,8 +7,9 @@ from ..db import get_db
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 
+# ── Bulk endpoints — MUST be before /{key} to avoid path conflict ──────────
 @router.get("/bulk")
-def get_bulk(keys: list[str], db: Session = Depends(get_db)):
+def get_bulk(keys: list[str] = Query(default=[]), db: Session = Depends(get_db)):
     return crud.get_settings(db, keys)
 
 
@@ -20,6 +21,7 @@ def set_bulk(body: dict, db: Session = Depends(get_db)):
     return {"saved": list(body.keys())}
 
 
+# ── Single key endpoints ──────────────────────────────────────────────────
 @router.post("/{key}")
 def set_one(key: str, body: dict, db: Session = Depends(get_db)):
     value = body.get("value", "")

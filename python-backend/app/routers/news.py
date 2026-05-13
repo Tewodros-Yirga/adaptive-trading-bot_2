@@ -58,7 +58,8 @@ def get_context(db: Session = Depends(get_db)):
 
 
 @router.post("/fetch")
-def trigger_fetch(symbol: str | None = None, db: Session = Depends(get_db)):
+def trigger_fetch(body: dict | None = None, db: Session = Depends(get_db)):
+    symbol = (body or {}).get("symbol")
     count = fetch_and_store_news(db, symbol)
     context = update_global_context(db)
     return {"stored": count, "context_updated": True, "context": context}

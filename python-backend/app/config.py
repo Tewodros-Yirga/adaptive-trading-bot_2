@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     adaptation_interval: int = 20
     simulation_mode: bool = True
 
+    # Auth — set these in HuggingFace secrets
+    admin_username: str = "admin"
+    admin_password: str = ""
+    jwt_secret_key: str = ""
+
     database_url: str = "postgresql://postgres:password@localhost:5432/trading_bot"
     mt_bridge_url: str = "http://localhost:5555"
     mt_bridge_secret: str = "bridge_secret_token"

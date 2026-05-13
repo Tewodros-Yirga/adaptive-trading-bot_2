@@ -4,20 +4,24 @@ Uses yfinance as primary OHLCV source, Alpha Vantage as fallback.
 Runs in ProcessPoolExecutor to avoid blocking the event loop.
 """
 import json
+import logging
 import math
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
+import httpx
 from sqlalchemy.orm import Session
 
 from .. import crud
 from ..models import BacktestResult, OHLCVCache
 from ..strategy.registry import get_strategy
 
+logger = logging.getLogger(__name__)
+
 _EXECUTOR = ProcessPoolExecutor(max_workers=2)
 
 
-def _fetch_ohlcv(symbol: str, from_date: str, to_date: str) -> list[dict]:
+def _fetch_ohlcv_yfinance(symbol: str, from_date: str, to_date: str) -> list[dict]:
     """Fetch OHLCV data using yfinance."""
     try:
         import yfinance as yf
@@ -29,6 +33,7 @@ def _fetch_ohlcv(symbol: str, from_date: str, to_date: str) -> list[dict]:
         yf_symbol = ticker_map.get(symbol.upper(), symbol)
         df = yf.download(yf_symbol, start=from_date, end=to_date, interval="1d", progress=False)
         if df is None or df.empty:
+            logger.warning(f"yfinance returned empty data for {yf_symbol}")
             return []
         records = []
         for ts, row in df.iterrows():
@@ -41,8 +46,85 @@ def _fetch_ohlcv(symbol: str, from_date: str, to_date: str) -> list[dict]:
                 "volume": float(row.get("Volume", 0) or 0),
             })
         return records
-    except Exception:
+    except ImportError:
+        logger.warning("yfinance not installed — skipping yfinance source")
         return []
+    except Exception as e:
+        logger.warning(f"yfinance fetch failed for {symbol}: {e}")
+        return []
+
+
+def _fetch_ohlcv_alphavantage(symbol: str, api_key: str) -> list[dict]:
+    """Fetch daily OHLCV from Alpha Vantage (up to 20 years of history)."""
+    if not api_key:
+        return []
+    try:
+        av_map = {
+            "XAUUSD": ("COMMODITY", "GOLD"),
+            "EURUSD": ("FX_DAILY", "EUR", "USD"),
+            "GBPUSD": ("FX_DAILY", "GBP", "USD"),
+            "USDJPY": ("FX_DAILY", "USD", "JPY"),
+        }
+        mapping = av_map.get(symbol.upper())
+
+        if mapping and mapping[0] == "FX_DAILY":
+            url = (
+                f"https://www.alphavantage.co/query?function=FX_DAILY"
+                f"&from_symbol={mapping[1]}&to_symbol={mapping[2]}"
+                f"&outputsize=full&apikey={api_key}"
+            )
+            key = "Time Series FX (Daily)"
+        else:
+            # Use generic daily for stocks/indices
+            url = (
+                f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY"
+                f"&symbol={symbol}&outputsize=full&apikey={api_key}"
+            )
+            key = "Time Series (Daily)"
+
+        resp = httpx.get(url, timeout=30)
+        data = resp.json()
+        series = data.get(key, {})
+        if not series:
+            logger.warning(f"Alpha Vantage returned no data for {symbol}: {list(data.keys())}")
+            return []
+
+        records = []
+        for date_str, values in sorted(series.items()):
+            try:
+                records.append({
+                    "date": date_str,
+                    "open": float(values.get("1. open", 0)),
+                    "high": float(values.get("2. high", 0)),
+                    "low": float(values.get("3. low", 0)),
+                    "close": float(values.get("4. close", 0)),
+                    "volume": float(values.get("5. volume", 0) or 0),
+                })
+            except (ValueError, KeyError):
+                continue
+        logger.info(f"Alpha Vantage returned {len(records)} bars for {symbol}")
+        return records
+    except Exception as e:
+        logger.warning(f"Alpha Vantage fetch failed for {symbol}: {e}")
+        return []
+
+
+def _fetch_ohlcv(symbol: str, from_date: str, to_date: str, alphavantage_key: str = "") -> list[dict]:
+    """Fetch OHLCV — tries yfinance first, then Alpha Vantage as fallback."""
+    # Try yfinance first
+    records = _fetch_ohlcv_yfinance(symbol, from_date, to_date)
+    if records:
+        return records
+
+    # Fallback: Alpha Vantage (returns full history, filter by date range)
+    logger.info(f"Falling back to Alpha Vantage for {symbol}")
+    records = _fetch_ohlcv_alphavantage(symbol, alphavantage_key)
+    if records:
+        filtered = [r for r in records if from_date <= r["date"] <= to_date]
+        return filtered
+
+    logger.error(f"All OHLCV sources failed for {symbol}")
+    return []
 
 
 def _compute_rsi(closes: list[float], period: int = 14) -> list[float | None]:
@@ -283,7 +365,8 @@ def run_backtest(
     if cached:
         ohlcv = json.loads(cached.data_json)
     else:
-        ohlcv = _fetch_ohlcv(symbol, from_date, to_date)
+        alphavantage_key = crud.get_setting(db, "alphavantage_key") or ""
+        ohlcv = _fetch_ohlcv(symbol, from_date, to_date, alphavantage_key=alphavantage_key)
         if ohlcv:
             cache_row = OHLCVCache(
                 symbol=symbol,

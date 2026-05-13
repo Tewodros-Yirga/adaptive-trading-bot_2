@@ -109,6 +109,16 @@ _STMTS = [
         impact_learning_weight  FLOAT DEFAULT 1.0,
         fetched_at              TIMESTAMP DEFAULT NOW()
     );""",
+
+    """CREATE TABLE IF NOT EXISTS users (
+        id            SERIAL PRIMARY KEY,
+        username      VARCHAR UNIQUE NOT NULL,
+        password_hash VARCHAR NOT NULL,
+        role          VARCHAR NOT NULL DEFAULT 'viewer',
+        full_access   BOOLEAN DEFAULT FALSE,
+        is_active     BOOLEAN DEFAULT TRUE,
+        created_at    TIMESTAMP DEFAULT NOW()
+    );""",
 ]
 
 

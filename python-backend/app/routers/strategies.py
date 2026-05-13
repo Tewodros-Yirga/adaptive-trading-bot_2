@@ -52,6 +52,18 @@ def list_all(db: Session = Depends(get_db)):
     return result
 
 
+# ── Ensemble config — MUST be before /{name} to avoid path conflict ───────
+@router.get("/ensemble/config")
+def get_ens_config(db: Session = Depends(get_db)):
+    return get_ensemble_config(db)
+
+
+@router.post("/ensemble/config")
+def update_ens_config(body: dict, db: Session = Depends(get_db)):
+    return set_ensemble_config(db, body)
+
+
+# ── Single strategy by name ───────────────────────────────────────────────
 @router.get("/{name}")
 def get_one(name: str, db: Session = Depends(get_db)):
     _ensure_strategies_exist(db)
@@ -140,16 +152,6 @@ def params_history(name: str, limit: int = 30, db: Session = Depends(get_db)):
         }
         for p in history
     ]
-
-
-@router.get("/ensemble/config")
-def get_ens_config(db: Session = Depends(get_db)):
-    return get_ensemble_config(db)
-
-
-@router.post("/ensemble/config")
-def update_ens_config(body: dict, db: Session = Depends(get_db)):
-    return set_ensemble_config(db, body)
 
 
 def _get_strategy_stats(db: Session, strategy_name: str) -> dict:
