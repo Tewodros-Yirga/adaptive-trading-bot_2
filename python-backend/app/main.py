@@ -5,7 +5,9 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -117,6 +119,13 @@ async def _global_context_loop():
             db.close()
         await asyncio.sleep(1800)
 
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+    expected = os.environ.get("APP_API_KEY")
+    if not expected or api_key != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return api_key
 
 # ── App factory ────────────────────────────────────────────────────────────────
 def create_app() -> FastAPI:
@@ -143,13 +152,13 @@ def create_app() -> FastAPI:
     from .routers.websocket import router as ws_router
     from .routers.settings import router as settings_router
 
-    app.include_router(webhook_router)
-    app.include_router(strategies_router)
-    app.include_router(risk_router)
-    app.include_router(news_router)
-    app.include_router(backtest_router)
-    app.include_router(ws_router)
-    app.include_router(settings_router)
+    app.include_router(webhook_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(strategies_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(risk_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(news_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(backtest_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(ws_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(settings_router, dependencies=[Depends(verify_api_key)])
 
     # ── Conditionally include pre-existing routers if they exist ──────────
     _try_include(app, ".routers.trades", "router")
