@@ -19,16 +19,13 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── 1. Run DDL migrations FIRST, before any ORM queries ───────────────
-    db = SessionLocal()
     try:
         logger.info("Running startup migrations...")
-        run_startup_migrations(db)
+        run_startup_migrations()
         logger.info("Startup migrations complete.")
     except Exception as e:
         logger.error(f"Startup migration failed: {e}")
         raise
-    finally:
-        db.close()
 
     # ── 2. Ensure default params exist ────────────────────────────────────
     db = SessionLocal()
