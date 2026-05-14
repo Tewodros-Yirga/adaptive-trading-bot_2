@@ -141,7 +141,10 @@ def _build_mtf_bars_for_index(
     current_date_str = primary_ohlcv[i].get("date", "")
 
     def _list_to_df(ohlcv_list: list[dict], cutoff_date: str) -> pd.DataFrame:
-        filtered = [r for r in ohlcv_list if r.get("date", "") <= cutoff_date]
+        # Compare only the date portion (first 10 chars) so intraday timestamps
+        # like "2023-01-15 08:00:00" are not excluded by a date-only cutoff "2023-01-15".
+        cutoff_prefix = cutoff_date[:10]
+        filtered = [r for r in ohlcv_list if r.get("date", "")[:10] <= cutoff_prefix]
         if not filtered:
             return pd.DataFrame()
         df = pd.DataFrame(filtered)
@@ -155,13 +158,12 @@ def _build_mtf_bars_for_index(
     primary_df = _list_to_df(primary_ohlcv[: i + 1], current_date_str)
 
     # Build the bars_by_tf dict from the extra timeframes.
-    # Only fall back to primary (daily) as "1h" if no real 1h data was provided,
-    # to avoid feeding daily bars to 1h-based strategy checks (e.g. Alchemist CRT).
+    # Do NOT fall back to daily bars as "1h" — feeding daily bars to the 1h
+    # slot causes CRT / structure checks to operate on wrong candle granularity.
+    # Strategy internal guards already handle missing timeframes gracefully.
     bars_by_tf: dict[str, "pd.DataFrame"] = {}
     for tf, ohlcv_list in extra_ohlcv_by_tf.items():
         bars_by_tf[tf] = _list_to_df(ohlcv_list, current_date_str)
-    if "1h" not in bars_by_tf:
-        bars_by_tf["1h"] = primary_df
 
     return bars_by_tf
 
@@ -409,6 +411,11 @@ def _run_backtest_sync(
                 levels = strat.compute_levels(signal, price, current_params)
             else:
                 levels = {}
+        elif is_mtf_strategy:
+            # MTF strategy but no extra_ohlcv_by_tf available — skip bar entirely
+            # rather than calling strategy with non-MTF data missing required DataFrames.
+            equity_curve.append({"date": bar_date, "equity": round(balance, 2)})
+            continue
         else:
             # ── Universal market_data_bar — all indicators for all strategies ──
             ema_vals = {f"ema_{j+1}": ema_series_list[j][i] for j in range(6)}
