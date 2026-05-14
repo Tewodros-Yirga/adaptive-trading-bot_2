@@ -529,7 +529,7 @@ def seed_default_settings(db: Session) -> None:
         "newsapi_key": "",
         "alphavantage_key": "",
         "finnhub_key": "",
-        "anthropic_api_key": "",
+        "groq_api_key": "",
         "twelve_data_key": "",
         "news_lookback_hours": "4",
         "news_block_threshold": "0.7",

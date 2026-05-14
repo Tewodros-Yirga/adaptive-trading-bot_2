@@ -233,39 +233,48 @@ def apply_news_adjustments(
 
 
 # ---------------------------------------------------------------------------
-# Claude reasoning (optional)
+# Groq reasoning (optional — free tier, replaces Claude)
 # ---------------------------------------------------------------------------
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-async def _call_claude_reasoning(selected, scores, news_influence, api_key: str) -> str:
+async def _call_groq_reasoning(selected, scores, news_influence, api_key: str) -> str:
     import httpx
 
     payload = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "llama-3.1-8b-instant",
         "max_tokens": 1000,
-        "system": (
-            "You are a trading system assistant. Given strategy scores and news context, "
-            "provide a 1-2 sentence plain-English explanation of why the selected strategy "
-            "was chosen and what the main risk is. Respond ONLY in JSON: "
-            '{"reasoning": "...", "main_risk": "..."}'
-        ),
+        "temperature": 0.1,
         "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a trading system assistant. Given strategy scores and news context, "
+                    "provide a 1-2 sentence plain-English explanation of why the selected strategy "
+                    "was chosen and what the main risk is. Respond ONLY in JSON: "
+                    '{"reasoning": "...", "main_risk": "..."}'
+                ),
+            },
             {
                 "role": "user",
                 "content": json.dumps(
                     {"selected": selected, "scores": scores, "news": news_influence}
                 ),
-            }
+            },
         ],
     }
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
             json=payload,
         )
         resp.raise_for_status()
-        text = resp.json()["content"][0]["text"]
+        import re
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        text = re.sub(r"^```json\s*|```$", "", text, flags=re.MULTILINE).strip()
         parsed = json.loads(text)
         return parsed.get("reasoning", "") + " Risk: " + parsed.get("main_risk", "")
 
@@ -276,13 +285,13 @@ async def _generate_reasoning(
     news_influence: dict,
     db: Session,
 ) -> str:
-    api_key = crud.get_setting(db, "anthropic_api_key")
+    api_key = crud.get_setting(db, "groq_api_key")
     if not api_key:
         return ""
     try:
-        return await _call_claude_reasoning(selected, scores, news_influence, api_key)
+        return await _call_groq_reasoning(selected, scores, news_influence, api_key)
     except Exception as e:
-        logger.warning(f"Claude reasoning call failed: {e}")
+        logger.warning(f"Groq reasoning call failed: {e}")
         return ""
 
 

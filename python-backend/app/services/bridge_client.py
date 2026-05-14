@@ -75,5 +75,37 @@ class MT5BridgeClient:
         data = self._request("GET", "/positions")
         return data.get("positions", data)
 
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        from_date: str,
+        to_date: str,
+    ) -> list[dict]:
+        """
+        Fetch OHLCV candle data from the MT5 bridge.
+
+        Args:
+            symbol: e.g. "XAUUSD"
+            timeframe: e.g. "1h", "4h", "1d"
+            from_date: ISO date string e.g. "2024-01-01"
+            to_date: ISO date string e.g. "2024-12-31"
+
+        Returns:
+            List of dicts with keys: datetime, open, high, low, close, volume
+        """
+        response = self._client.get(
+            "/candles",
+            params={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "from_date": from_date,
+                "to_date": to_date,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("candles", data) if isinstance(data, dict) else data
+
 
 bridge_client = MT5BridgeClient()

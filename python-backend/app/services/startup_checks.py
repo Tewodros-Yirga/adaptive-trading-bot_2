@@ -108,8 +108,8 @@ async def run_startup_checks(db) -> list[dict]:
     # ── 4. Critical AppSetting keys ────────────────────────────────────────
     key_checks = [
         (
-            "anthropic_api_key",
-            "Claude API — news sentiment scoring and pair analysis narratives will not work",
+            "groq_api_key",
+            "Groq API — AI-powered strategy reasoning and pair analysis narratives will not work",
         ),
         (
             "newsapi_key",
@@ -125,7 +125,7 @@ async def run_startup_checks(db) -> list[dict]:
         ),
         (
             "twelve_data_key",
-            "Twelve Data — OHLCV fallback source 3 will be skipped",
+            "Twelve Data — last-resort OHLCV fallback will be skipped (MT5 bridge is preferred)",
         ),
     ]
 

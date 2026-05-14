@@ -1006,7 +1006,7 @@ async def _compute_pair_analyses(
         except Exception:
             scored_map[r.strategy_name] = 0.0
 
-    anthropic_key = crud.get_setting(db, "anthropic_api_key") or ""
+    groq_key = crud.get_setting(db, "groq_api_key") or ""
 
     strategy_names = list(result_map.keys())
     combo_sizes = [2]
@@ -1029,13 +1029,13 @@ async def _compute_pair_analyses(
             recommended = synergy > 1.05
 
             analysis_json = None
-            if anthropic_key:
+            if groq_key:
                 try:
-                    analysis_json = await _fetch_claude_narrative(
-                        anthropic_key, combo_list, pair_metrics, individual_scores
+                    analysis_json = await _fetch_groq_narrative(
+                        groq_key, combo_list, pair_metrics, individual_scores
                     )
                 except Exception as e:
-                    logger.warning("Claude narrative failed for %s: %s", combo_list, e)
+                    logger.warning("Groq narrative failed for %s: %s", combo_list, e)
 
             row = StrategyPairAnalysis(
                 batch_id=batch_id,
@@ -1132,13 +1132,14 @@ def _simulate_pair_ensemble(results: list[BacktestResult]) -> dict:
     }
 
 
-async def _fetch_claude_narrative(
+async def _fetch_groq_narrative(
     api_key: str,
     strategy_names: list[str],
     pair_metrics: dict,
     individual_scores: dict[str, float],
 ) -> dict | None:
     try:
+        import re
         from tenacity import retry, stop_after_attempt, wait_exponential
 
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -1161,26 +1162,28 @@ async def _fetch_claude_narrative(
             )
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
+                    "https://api.groq.com/openai/v1/chat/completions",
                     headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
                     },
                     json={
-                        "model": "claude-sonnet-4-20250514",
+                        "model": "llama-3.1-8b-instant",
                         "max_tokens": 1000,
-                        "system": system_prompt,
-                        "messages": [{"role": "user", "content": user_prompt}],
+                        "temperature": 0.1,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
                     },
                 )
             resp.raise_for_status()
             data = resp.json()
-            text = data["content"][0]["text"] if data.get("content") else ""
-            text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            text = data["choices"][0]["message"]["content"].strip()
+            text = re.sub(r"^```json\s*|```$", "", text, flags=re.MULTILINE).strip()
             return json.loads(text)
 
         return await _call()
     except Exception as e:
-        logger.warning("Claude narrative call failed: %s", e)
+        logger.warning("Groq narrative call failed: %s", e)
         return None

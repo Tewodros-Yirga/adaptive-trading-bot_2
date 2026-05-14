@@ -2,11 +2,12 @@
 app/services/ohlcv.py — Shared OHLCV Data Fetching Layer
 
 All OHLCV fetching logic lives here. The backtester and continuous backtest service
-both import from this module. Provides a 4-source fallback chain:
+both import from this module. Provides a 5-source fallback chain:
   1. yfinance
   2. Alpha Vantage
-  3. Twelve Data
+  3. MT5 Bridge (uses broker's data via the bridge service)
   4. OANDA (forex only)
+  5. Twelve Data (last resort, requires API key)
 
 Also provides:
   - build_mtf_market_data() — assembles the multi-timeframe market_data dict
@@ -406,6 +407,61 @@ async def fetch_oanda_public(symbol: str, from_date: str, to_date: str, timefram
 
 
 # ---------------------------------------------------------------------------
+# Source 3: MT5 Bridge (uses broker's data)
+# ---------------------------------------------------------------------------
+
+async def fetch_mt5_bridge(
+    symbol: str, from_date: str, to_date: str, timeframe: str
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV from the MT5 bridge service.
+    Uses the bridge_client.get_candles() method which calls /candles on the bridge.
+    """
+    from .bridge_client import bridge_client
+    from ..config import settings
+
+    if settings.simulation_mode:
+        raise ValueError("MT5 bridge OHLCV not available in simulation mode")
+
+    candles = bridge_client.get_candles(
+        symbol=_normalize_symbol(symbol),
+        timeframe=timeframe,
+        from_date=from_date,
+        to_date=to_date,
+    )
+
+    if not candles:
+        raise ValueError(f"MT5 bridge returned no candles for {symbol}")
+
+    records = []
+    for c in candles:
+        try:
+            records.append({
+                "datetime": c.get("datetime") or c.get("time") or c.get("date", ""),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "volume": float(c.get("volume", 0) or 0),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if not records:
+        raise ValueError(f"MT5 bridge parsed 0 candles for {symbol}")
+
+    df = pd.DataFrame(records)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    df = df[(df.index >= pd.Timestamp(from_date)) & (df.index <= pd.Timestamp(to_date))]
+
+    if df.empty:
+        raise ValueError(f"MT5 bridge returned no data for {symbol} in range {from_date}–{to_date}")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Unified fallback chain
 # ---------------------------------------------------------------------------
 
@@ -420,8 +476,9 @@ async def fetch_ohlcv_with_fallback(
     Returns (dataframe, source_name_used). Tries each source in order:
       1. yfinance (sync, wrapped)
       2. Alpha Vantage (sync, wrapped)
-      3. Twelve Data (async)
+      3. MT5 Bridge (sync, via bridge_client)
       4. OANDA (async, forex only)
+      5. Twelve Data (async, last resort)
 
     Raises RuntimeError if all sources fail.
     """
@@ -448,13 +505,13 @@ async def fetch_ohlcv_with_fallback(
     except Exception as exc:
         errors.append(f"alpha_vantage: {exc}")
 
-    # Source 3: Twelve Data
+    # Source 3: MT5 Bridge
     try:
-        df = await fetch_twelve_data(symbol, from_date, to_date, timeframe, api_key=td_key)
+        df = await fetch_mt5_bridge(symbol, from_date, to_date, timeframe)
         if not df.empty:
-            return df, "twelve_data"
+            return df, "mt5_bridge"
     except Exception as exc:
-        errors.append(f"twelve_data: {exc}")
+        errors.append(f"mt5_bridge: {exc}")
 
     # Source 4: OANDA (forex only)
     try:
@@ -463,6 +520,14 @@ async def fetch_ohlcv_with_fallback(
             return df, "oanda"
     except Exception as exc:
         errors.append(f"oanda: {exc}")
+
+    # Source 5: Twelve Data (last resort)
+    try:
+        df = await fetch_twelve_data(symbol, from_date, to_date, timeframe, api_key=td_key)
+        if not df.empty:
+            return df, "twelve_data"
+    except Exception as exc:
+        errors.append(f"twelve_data: {exc}")
 
     raise RuntimeError(
         f"All OHLCV sources failed for {symbol}.\n" + "\n".join(errors)
