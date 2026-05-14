@@ -102,12 +102,18 @@ async def lifespan(app: FastAPI):
     try:
         from .strategy.registry import STRATEGY_REGISTRY
         from .services.continuous_backtest import start_continuous_backtest
-        for strategy_name in STRATEGY_REGISTRY:
+        # Stagger starts by 60 s per strategy to avoid hammering the bridge
+        # and yfinance with simultaneous requests at boot.
+        for idx, strategy_name in enumerate(STRATEGY_REGISTRY):
+            startup_delay = idx * 60  # 0s, 60s, 120s, ...
             task = asyncio.create_task(
-                start_continuous_backtest(strategy_name, _EXECUTOR)
+                start_continuous_backtest(strategy_name, _EXECUTOR, startup_delay=startup_delay)
             )
             bg_tasks.append(task)
-            logger.info(f"Started continuous backtest loop for strategy: {strategy_name}")
+            logger.info(
+                "Registered continuous backtest loop for %s (starts in %ds)",
+                strategy_name, startup_delay,
+            )
     except Exception as e:
         logger.warning(f"Could not start continuous backtest loops: {e}")
     finally:

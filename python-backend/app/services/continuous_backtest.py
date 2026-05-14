@@ -79,11 +79,17 @@ def get_search_status(strategy_name: str) -> dict:
 # Main loop
 # ---------------------------------------------------------------------------
 
-async def start_continuous_backtest(strategy_name: str, executor) -> None:
+async def start_continuous_backtest(strategy_name: str, executor, startup_delay: int = 0) -> None:
     """
     Main loop for one strategy. Call from startup via:
       asyncio.create_task(start_continuous_backtest(name, executor))
+
+    startup_delay: seconds to wait before the first iteration (stagger at boot).
     """
+    if startup_delay > 0:
+        logger.info("Continuous backtest for %s: waiting %ds before first run", strategy_name, startup_delay)
+        await asyncio.sleep(startup_delay)
+
     cancel_flag = asyncio.Event()
     pause_flag = asyncio.Event()
     _cancel_flags[strategy_name] = cancel_flag

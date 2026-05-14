@@ -569,40 +569,68 @@ def fetch_ohlcv_sync(
     """
     errors: list[str] = []
 
-    # ── Source 1: MT5 Bridge (sync, full history) ─────────────────────────
-    # NOTE: simulation_mode only gates order placement, NOT data reading.
+    # ── Source 1: MT5 Bridge — chunked to avoid HF Spaces nginx 60s timeout ──
+    # Large ranges (e.g. 6 months × 15m = ~17k bars) cause 502.
+    # Chunking keeps each request small (~1-2k bars) and fast.
+    _BRIDGE_CHUNK_DAYS: dict[str, int] = {
+        "15m": 20, "1h": 60, "4h": 90, "1d": 365, "1w": 730,
+    }
     try:
+        from datetime import datetime as _dt, timedelta as _td
         from .bridge_client import bridge_client
 
-        candles = bridge_client.get_candles(
-            symbol=_normalize_symbol(symbol),  # strip .PRO/.RAW suffixes
-            timeframe=timeframe,
-            from_date=from_date,
-            to_date=to_date,
-        )
-        if candles:
-            records: list[dict] = []
-            for c in candles:
-                try:
-                    raw_dt = c.get("datetime") or c.get("time") or c.get("date", "")
-                    date_str = str(raw_dt)[:10]
-                    records.append({
-                        "date": date_str,
-                        "open": float(c["open"]),
-                        "high": float(c["high"]),
-                        "low": float(c["low"]),
-                        "close": float(c["close"]),
-                        "volume": float(c.get("volume", 0) or 0),
-                    })
-                except (KeyError, ValueError, TypeError):
-                    continue
-            if records:
-                logger.info("fetch_ohlcv_sync: mt5_bridge for %s %s (%d bars)", symbol, timeframe, len(records))
-                return records
+        chunk_days = _BRIDGE_CHUNK_DAYS.get(timeframe, 30)
+        start_dt = _dt.fromisoformat(from_date)
+        end_dt   = _dt.fromisoformat(to_date)
+
+        all_bridge_records: list[dict] = []
+        seen_keys: set[str] = set()
+        chunk_start = start_dt
+
+        while chunk_start <= end_dt:
+            chunk_end = min(chunk_start + _td(days=chunk_days - 1), end_dt)
+            try:
+                candles = bridge_client.get_candles(
+                    symbol=_normalize_symbol(symbol),
+                    timeframe=timeframe,
+                    from_date=chunk_start.date().isoformat(),
+                    to_date=chunk_end.date().isoformat(),
+                )
+                for c in candles or []:
+                    try:
+                        raw_dt = c.get("datetime") or c.get("time") or c.get("date", "")
+                        dedup_key = str(raw_dt)
+                        if dedup_key in seen_keys:
+                            continue
+                        seen_keys.add(dedup_key)
+                        all_bridge_records.append({
+                            "date":   str(raw_dt)[:10],
+                            "open":   float(c["open"]),
+                            "high":   float(c["high"]),
+                            "low":    float(c["low"]),
+                            "close":  float(c["close"]),
+                            "volume": float(c.get("volume", 0) or 0),
+                        })
+                    except (KeyError, ValueError, TypeError):
+                        continue
+            except Exception as chunk_exc:
+                logger.warning(
+                    "bridge chunk %s–%s failed for %s %s: %s",
+                    chunk_start.date(), chunk_end.date(), symbol, timeframe, chunk_exc,
+                )
+            chunk_start = chunk_end + _td(days=1)
+
+        if all_bridge_records:
+            logger.info(
+                "fetch_ohlcv_sync: mt5_bridge %s %s — %d bars (chunked %dd)",
+                symbol, timeframe, len(all_bridge_records), chunk_days,
+            )
+            return all_bridge_records
+        errors.append("mt5_bridge: 0 candles returned across all chunks")
     except Exception as exc:
         errors.append(f"mt5_bridge: {exc}")
 
-    # ── Source 2: yfinance ─────────────────────────────────────────────────
+    # ── Source 2: yfinance (fallback — limited history for intraday) ───────
     try:
         df = fetch_yfinance(symbol, from_date, to_date, timeframe)
         if not df.empty:
@@ -625,6 +653,7 @@ def fetch_ohlcv_sync(
         f"fetch_ohlcv_sync: all sources failed for {symbol} {timeframe} "
         f"{from_date}–{to_date}.\n" + "\n".join(errors)
     )
+
 
 
 

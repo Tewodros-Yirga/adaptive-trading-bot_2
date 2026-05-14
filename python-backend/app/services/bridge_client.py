@@ -13,7 +13,14 @@ class MT5BridgeClient:
             headers["Authorization"] = f"Bearer {settings.mt_bridge_hf_token}"
         self._client = httpx.Client(
             base_url=settings.mt_bridge_url,
-            timeout=10.0,
+            timeout=10.0,      # default timeout for fast calls (account, positions)
+            headers=headers,
+        )
+        # Separate client with a much longer timeout for /candles
+        # (MT5 fetching months of 15m bars can take 30-90 seconds on HF Spaces)
+        self._candle_client = httpx.Client(
+            base_url=settings.mt_bridge_url,
+            timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=5.0),
             headers=headers,
         )
 
@@ -81,31 +88,39 @@ class MT5BridgeClient:
         timeframe: str,
         from_date: str,
         to_date: str,
+        max_retries: int = 3,
     ) -> list[dict]:
         """
         Fetch OHLCV candle data from the MT5 bridge.
-
-        Args:
-            symbol: e.g. "XAUUSD"
-            timeframe: e.g. "1h", "4h", "1d"
-            from_date: ISO date string e.g. "2024-01-01"
-            to_date: ISO date string e.g. "2024-12-31"
-
-        Returns:
-            List of dicts with keys: datetime, open, high, low, close, volume
+        Uses a 120-second read timeout (fetching months of 15m bars is slow).
+        Retries up to max_retries times on transient 5xx/connection errors.
         """
-        response = self._client.get(
-            "/candles",
-            params={
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "from_date": from_date,
-                "to_date": to_date,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("candles", data) if isinstance(data, dict) else data
+        import time as _time
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                response = self._candle_client.get(
+                    "/candles",
+                    params={
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "from_date": from_date,
+                        "to_date": to_date,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data.get("candles", data) if isinstance(data, dict) else data
+            except (httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                _time.sleep(2 ** attempt)   # 1s, 2s, 4s
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (502, 503, 504):
+                    last_exc = exc
+                    _time.sleep(2 ** attempt)
+                else:
+                    raise  # 4xx errors — don't retry
+        raise last_exc or RuntimeError(f"get_candles failed after {max_retries} attempts")
 
 
 bridge_client = MT5BridgeClient()

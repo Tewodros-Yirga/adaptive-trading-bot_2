@@ -33,9 +33,14 @@ async def websocket_endpoint(
     WebSocket endpoint with JWT authentication.
 
     Clients must pass a valid JWT as ?token=<jwt> in the upgrade URL.
-    Connection is rejected with code 4001 if the token is missing, invalid,
-    expired, or belongs to an inactive user.
+    The connection is accepted first (so the upgrade succeeds), then closed
+    with code 4001 if the token is missing, invalid, or belongs to an
+    inactive user. This prevents Starlette from emitting an HTTP 403.
     """
+    # Accept the WS upgrade unconditionally — auth rejection is a WS close,
+    # NOT an HTTP 403, so the browser can read the close code.
+    await websocket.accept()
+
     db = SessionLocal()
     try:
         user = get_current_user_from_token(token, db)
@@ -46,7 +51,6 @@ async def websocket_endpoint(
         await websocket.close(code=4001)
         return
 
-    await websocket.accept()
     _connections.append(websocket)
     try:
         while True:
