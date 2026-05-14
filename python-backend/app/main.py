@@ -113,6 +113,13 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    # ── 9. Start live trading loop (polls bridge price → orchestrator → trade) ──
+    try:
+        bg_tasks.append(asyncio.create_task(_live_trading_loop()))
+        logger.info("Started live trading loop.")
+    except Exception as e:
+        logger.warning(f"Could not start live trading loop: {e}")
+
     logger.info("Application startup complete.")
     yield
 
@@ -174,6 +181,86 @@ async def _global_context_loop():
         finally:
             db.close()
         await asyncio.sleep(1800)
+
+
+async def _live_trading_loop():
+    """
+    Autonomous live trading loop.
+
+    Every 60 seconds (configurable via ``live_trading_interval_seconds`` AppSetting):
+      1. Skip if simulation_mode is True.
+      2. Fetch the latest price from the MT5 bridge for each configured symbol.
+      3. Pass price + minimal market_data to process_signal().
+      4. The orchestrator + picker handle signal gathering, strategy selection,
+         risk checks, and order placement.
+
+    Shadow signals are always logged regardless of simulation_mode, so you can
+    watch what the strategies *would* do before going live.
+    """
+    await asyncio.sleep(30)  # brief initial delay so the bridge has time to connect
+    while True:
+        interval = 60  # default; overridden by AppSetting each iteration
+        try:
+            db = SessionLocal()
+            try:
+                from .config import settings as _settings
+                from .services.orchestrator import process_signal
+                from . import crud as _crud
+
+                interval = float(
+                    _crud.get_setting(db, "live_trading_interval_seconds") or 60
+                )
+
+                if _settings.simulation_mode:
+                    logger.debug("Live trading loop: simulation_mode=True, skipping order placement.")
+                else:
+                    active_symbols_raw = _crud.get_setting(db, "live_trading_symbols") or "XAUUSD"
+                    symbols = [s.strip() for s in active_symbols_raw.split(",") if s.strip()]
+
+                    for symbol in symbols:
+                        try:
+                            from datetime import date, timedelta
+                            from .services.ohlcv import fetch_ohlcv_with_fallback
+                            from_dt = (date.today() - timedelta(days=2)).isoformat()
+                            to_dt = date.today().isoformat()
+                            df, _src = await fetch_ohlcv_with_fallback(
+                                symbol, from_dt, to_dt, "1h", db
+                            )
+                            if df.empty:
+                                logger.warning("Live loop: no price data for %s", symbol)
+                                continue
+
+                            price = float(df["close"].iloc[-1])
+                            atr = float((df["high"] - df["low"]).tail(14).mean()) if len(df) >= 14 else price * 0.005
+
+                            market_data = {
+                                "symbol": symbol,
+                                "price": price,
+                                "current_price": price,
+                                "atr": atr,
+                            }
+
+                            result = await process_signal(db, market_data, symbol, price)
+                            status = result.get("status", "?")
+
+                            if status == "OK":
+                                logger.info(
+                                    "Live trade placed: %s %s @ %.5f (trade_id=%s)",
+                                    result.get("signal"), symbol, price, result.get("trade_id")
+                                )
+                            elif status not in ("NO_SIGNAL", "NO_ACTIVE_STRATEGIES"):
+                                logger.info("Live loop %s: %s", symbol, status)
+
+                        except Exception as sym_exc:
+                            logger.warning("Live loop error for %s: %s", symbol, sym_exc)
+
+            finally:
+                db.close()
+
+        except Exception as exc:
+            logger.error("Live trading loop crashed: %s", exc, exc_info=True)
+
+        await asyncio.sleep(interval)
 
 
 # ── API key guard for webhook (machine-to-machine) ────────────────────────────

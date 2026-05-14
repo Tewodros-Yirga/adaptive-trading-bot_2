@@ -567,7 +567,12 @@ def seed_default_settings(db: Session) -> None:
         "picker_weight_parameter_freshness": "0.05",
     }
 
-    # ── Per-strategy continuous backtest defaults ──────────────────────────
+    # ── Live trading loop ──────────────────────────────────────────────────
+    live_trading_defaults: dict[str, str] = {
+        "live_trading_interval_seconds": "60",   # poll every 60 s
+        "live_trading_symbols": "XAUUSD",        # comma-separated symbols
+    }
+
     per_strategy_defaults: dict[str, str] = {
         "qualify_threshold_win_rate": "55.0",
         "score_weight_win_rate": "0.6",
@@ -599,6 +604,9 @@ def seed_default_settings(db: Session) -> None:
         _maybe_add(key, value)
 
     for key, value in picker_defaults.items():
+        _maybe_add(key, value)
+
+    for key, value in live_trading_defaults.items():
         _maybe_add(key, value)
 
     for strategy_name in STRATEGY_REGISTRY.keys():

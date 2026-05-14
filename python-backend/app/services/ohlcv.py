@@ -3,10 +3,10 @@ app/services/ohlcv.py — Shared OHLCV Data Fetching Layer
 
 All OHLCV fetching logic lives here. The backtester and continuous backtest service
 both import from this module. Provides a 5-source fallback chain:
-  1. yfinance
-  2. Alpha Vantage
-  3. MT5 Bridge (uses broker's data via the bridge service)
-  4. OANDA (forex only)
+  1. MT5 Bridge (uses broker's live data via the bridge service — most accurate)
+  2. yfinance   (free, wide coverage)
+  3. Alpha Vantage (requires API key)
+  4. OANDA      (forex only, public endpoint)
   5. Twelve Data (last resort, requires API key)
 
 Also provides:
@@ -414,14 +414,10 @@ async def fetch_mt5_bridge(
     symbol: str, from_date: str, to_date: str, timeframe: str
 ) -> pd.DataFrame:
     """
-    Fetch OHLCV from the MT5 bridge service.
-    Uses the bridge_client.get_candles() method which calls /candles on the bridge.
+    Fetch OHLCV from the MT5 bridge service (async wrapper around the sync client).
+    NOTE: simulation_mode does NOT block this call — it only prevents order placement.
     """
     from .bridge_client import bridge_client
-    from ..config import settings
-
-    if settings.simulation_mode:
-        raise ValueError("MT5 bridge OHLCV not available in simulation mode")
 
     candles = bridge_client.get_candles(
         symbol=_normalize_symbol(symbol),
@@ -552,6 +548,85 @@ def df_to_ohlcv_list(df: pd.DataFrame) -> list[dict]:
         except (KeyError, ValueError, TypeError):
             continue
     return records
+
+
+def fetch_ohlcv_sync(
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    timeframe: str = "1d",
+    av_key: str = "",
+) -> list[dict]:
+    """
+    Fully synchronous OHLCV fetch with a 3-source fallback chain:
+      1. MT5 Bridge   — broker's live data, full history, no date limits
+      2. yfinance     — free, but 1h data limited to last ~730 days
+      3. Alpha Vantage — requires API key
+
+    Safe to call from subprocesses (ProcessPoolExecutor) and threads.
+    Returns a list[dict] with keys: date, open, high, low, close, volume.
+    Raises RuntimeError if all sources fail.
+    """
+    errors: list[str] = []
+
+    # ── Source 1: MT5 Bridge (sync, full history) ─────────────────────────
+    # NOTE: simulation_mode only gates order placement, NOT data reading.
+    try:
+        from .bridge_client import bridge_client
+
+        candles = bridge_client.get_candles(
+            symbol=_normalize_symbol(symbol),  # strip .PRO/.RAW suffixes
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        if candles:
+            records: list[dict] = []
+            for c in candles:
+                try:
+                    raw_dt = c.get("datetime") or c.get("time") or c.get("date", "")
+                    date_str = str(raw_dt)[:10]
+                    records.append({
+                        "date": date_str,
+                        "open": float(c["open"]),
+                        "high": float(c["high"]),
+                        "low": float(c["low"]),
+                        "close": float(c["close"]),
+                        "volume": float(c.get("volume", 0) or 0),
+                    })
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if records:
+                logger.info("fetch_ohlcv_sync: mt5_bridge for %s %s (%d bars)", symbol, timeframe, len(records))
+                return records
+    except Exception as exc:
+        errors.append(f"mt5_bridge: {exc}")
+
+    # ── Source 2: yfinance ─────────────────────────────────────────────────
+    try:
+        df = fetch_yfinance(symbol, from_date, to_date, timeframe)
+        if not df.empty:
+            logger.info("fetch_ohlcv_sync: yfinance for %s %s", symbol, timeframe)
+            return df_to_ohlcv_list(df)
+    except Exception as exc:
+        errors.append(f"yfinance: {exc}")
+
+    # ── Source 3: Alpha Vantage ────────────────────────────────────────────
+    if av_key:
+        try:
+            df = fetch_alpha_vantage(symbol, from_date, to_date, timeframe, api_key=av_key)
+            if not df.empty:
+                logger.info("fetch_ohlcv_sync: alpha_vantage for %s %s", symbol, timeframe)
+                return df_to_ohlcv_list(df)
+        except Exception as exc:
+            errors.append(f"alpha_vantage: {exc}")
+
+    raise RuntimeError(
+        f"fetch_ohlcv_sync: all sources failed for {symbol} {timeframe} "
+        f"{from_date}–{to_date}.\n" + "\n".join(errors)
+    )
+
+
 
 
 # ---------------------------------------------------------------------------

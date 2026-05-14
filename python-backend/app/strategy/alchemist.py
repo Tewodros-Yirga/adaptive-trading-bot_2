@@ -153,7 +153,10 @@ class Alchemist(BaseStrategy):
 
         md = getattr(self, "_market_data", {})
         atr = md.get("atr", price * 0.005)
+        # Prefer 1h bars; fall back to 4h when unavailable (e.g. historical backtests)
         bars_1h: pd.DataFrame = md.get("1h_bars", pd.DataFrame())
+        if bars_1h.empty or len(bars_1h) < 3:
+            bars_1h = md.get("4h_bars", pd.DataFrame())
         atr_buffer = params.get("atr_sl_buffer", 0.5)
         min_rr = params.get("min_rr_ratio", 1.5)
 
@@ -387,13 +390,20 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _crt_bullish_sweep_confirmed(self, market_data: dict) -> bool:
+        # Prefer 1h bars; fall back to 4h for historical backtests where 1h is unavailable
         bars: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 3:
+            bars = market_data.get("4h_bars", pd.DataFrame())
         if len(bars) < 3:
             return False
         range_candle = bars.iloc[-3]
         manip_candle = bars.iloc[-2]
         dist_candle = bars.iloc[-1]
-        min_sweep = self.params.get("crt_sweep_min_pips", 3) * 0.0001
+        # For gold (XAUUSD), use price-relative sweep threshold instead of fixed pips
+        min_sweep = max(
+            self.params.get("crt_sweep_min_pips", 3) * 0.0001,
+            float(range_candle["low"]) * 0.0002,  # 0.02% of price
+        )
 
         swept = float(manip_candle["low"]) < float(range_candle["low"]) - min_sweep
         closed_back = float(manip_candle["close"]) > float(range_candle["low"])
@@ -404,13 +414,19 @@ class Alchemist(BaseStrategy):
         return swept and dist_bullish
 
     def _crt_bearish_sweep_confirmed(self, market_data: dict) -> bool:
+        # Prefer 1h bars; fall back to 4h for historical backtests where 1h is unavailable
         bars: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 3:
+            bars = market_data.get("4h_bars", pd.DataFrame())
         if len(bars) < 3:
             return False
         range_candle = bars.iloc[-3]
         manip_candle = bars.iloc[-2]
         dist_candle = bars.iloc[-1]
-        min_sweep = self.params.get("crt_sweep_min_pips", 3) * 0.0001
+        min_sweep = max(
+            self.params.get("crt_sweep_min_pips", 3) * 0.0001,
+            float(range_candle["high"]) * 0.0002,
+        )
 
         swept = float(manip_candle["high"]) > float(range_candle["high"]) + min_sweep
         closed_back = float(manip_candle["close"]) < float(range_candle["high"])
@@ -425,7 +441,12 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _structure_shift_to_bullish(self, market_data: dict) -> bool:
+        # Prefer 15m; fall back through 1h → 4h when finer data unavailable
         bars: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 4:
+            bars = market_data.get("1h_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 4:
+            bars = market_data.get("4h_bars", pd.DataFrame())
         n = self.params.get("structure_shift_candles", 3)
         if len(bars) < n + 1:
             return False
@@ -434,7 +455,12 @@ class Alchemist(BaseStrategy):
         return float(bars["close"].iloc[-1]) > recent_high
 
     def _structure_shift_to_bearish(self, market_data: dict) -> bool:
+        # Prefer 15m; fall back through 1h → 4h when finer data unavailable
         bars: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 4:
+            bars = market_data.get("1h_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 4:
+            bars = market_data.get("4h_bars", pd.DataFrame())
         n = self.params.get("structure_shift_candles", 3)
         if len(bars) < n + 1:
             return False
@@ -447,7 +473,12 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _liquidity_swept(self, market_data: dict, side: str) -> bool:
+        # Prefer 15m; fall back through 1h → 4h when finer data unavailable
         bars: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 6:
+            bars = market_data.get("1h_bars", pd.DataFrame())
+        if bars.empty or len(bars) < 6:
+            bars = market_data.get("4h_bars", pd.DataFrame())
         if len(bars) < 6:
             return False
         window = bars.iloc[-6:-1]  # last 5 complete bars
@@ -485,10 +516,25 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _check_storyline(self, market_data: dict) -> bool:
+        """
+        Scores multiple confirmations. Requires a configurable minimum number
+        to pass (default 3 out of available checks).
+        Checks that depend on unavailable timeframes are skipped rather than
+        counted as failures — this lets the strategy work in daily backtests
+        where 1h/15m data is beyond yfinance's history window.
+        """
         checks: dict[str, bool] = {}
+        available: set[str] = set()  # only checks we could actually evaluate
+
+        bars_1d: pd.DataFrame = market_data.get("1d_bars", pd.DataFrame())
+        bars_1h: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
+        bars_15m: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
+        # Effective intraday bars after fallback (same logic as other methods)
+        eff_1h = bars_1h if (not bars_1h.empty and len(bars_1h) >= 3) else market_data.get("4h_bars", pd.DataFrame())
+        eff_15m = bars_15m if (not bars_15m.empty and len(bars_15m) >= 4) else eff_1h
 
         # 1. Price on correct side of weekly OCL
-        bars_1d: pd.DataFrame = market_data.get("1d_bars", pd.DataFrame())
+        available.add("weekly_ocl_side")
         if not bars_1d.empty:
             weekly_ocl = float(
                 bars_1d["close"].iloc[-5] if len(bars_1d) >= 5 else bars_1d["close"].iloc[-1]
@@ -502,40 +548,56 @@ class Alchemist(BaseStrategy):
         else:
             checks["weekly_ocl_side"] = False
 
-        # 2. Daily CRT manipulation confirmed
-        checks["daily_crt_confirmed"] = (
-            self._crt_bullish_sweep_confirmed(market_data)
-            or self._crt_bearish_sweep_confirmed(market_data)
-        )
-
-        # 3. Fresh OB or QML on 4H in direction of trade
-        zones = self._find_msnr_zones(market_data)
+        # 2. CRT manipulation confirmed (uses effective intraday bars with fallback)
         htf = self._htf_bias(market_data)
+        if not eff_1h.empty and len(eff_1h) >= 3:
+            available.add("crt_confirmed")
+            checks["crt_confirmed"] = (
+                self._crt_bullish_sweep_confirmed(market_data)
+                or self._crt_bearish_sweep_confirmed(market_data)
+            )
+        # else: skip — unavailable, don't count as failure
+
+        # 3. Fresh OB or QML zone in direction of bias
+        available.add("fresh_zone")
+        zones = self._find_msnr_zones(market_data)
         target_direction = "SUPPORT" if htf == "BULLISH" else "RESISTANCE"
         fresh_zones = [z for z in zones if z["direction"] == target_direction and z.get("freshness", 99) <= 5]
-        checks["fresh_4h_zone"] = len(fresh_zones) > 0
+        checks["fresh_zone"] = len(fresh_zones) > 0
 
-        # 4. 1H structure aligned (no opposing swing between price and target)
-        bars_1h: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
-        if not bars_1h.empty and len(bars_1h) >= 10:
+        # 4. Structure aligned (intraday or 4h fallback)
+        if not eff_1h.empty and len(eff_1h) >= 10:
+            available.add("structure_aligned")
             price = market_data.get("current_price", 0.0)
             if htf == "BULLISH":
-                intervening_lows = bars_1h["low"].iloc[-10:][bars_1h["low"].iloc[-10:] < price]
-                checks["1h_structure_aligned"] = len(intervening_lows) == 0
+                intervening_lows = eff_1h["low"].iloc[-10:][eff_1h["low"].iloc[-10:] < price]
+                checks["structure_aligned"] = len(intervening_lows) == 0
             else:
-                intervening_highs = bars_1h["high"].iloc[-10:][bars_1h["high"].iloc[-10:] > price]
-                checks["1h_structure_aligned"] = len(intervening_highs) == 0
-        else:
-            checks["1h_structure_aligned"] = False
+                intervening_highs = eff_1h["high"].iloc[-10:][eff_1h["high"].iloc[-10:] > price]
+                checks["structure_aligned"] = len(intervening_highs) == 0
+        # else: skip — unavailable
 
-        # 5. Valid 15M entry pattern (structure shift confirmed)
-        checks["15m_entry_valid"] = (
-            self._structure_shift_to_bullish(market_data)
-            or self._structure_shift_to_bearish(market_data)
-        )
+        # 5. Entry pattern: structure shift (uses effective bars with fallback)
+        if not eff_15m.empty and len(eff_15m) >= 4:
+            available.add("entry_pattern")
+            checks["entry_pattern"] = (
+                self._structure_shift_to_bullish(market_data)
+                or self._structure_shift_to_bearish(market_data)
+            )
+        # else: skip — unavailable
 
         self._confidence_components["storyline_checks"] = checks
-        return all(checks.values())
+
+        # Require min_storyline_checks out of the checks we could actually run
+        n_available = len(available)
+        if n_available == 0:
+            return False
+        passed = sum(checks.get(k, False) for k in available)
+        min_required = min(
+            self.params.get("min_storyline_checks", 3),
+            n_available,          # can't require more than we have
+        )
+        return passed >= min_required
 
     # -------------------------------------------------------------------------
     # Confidence scoring

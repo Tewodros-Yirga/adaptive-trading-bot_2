@@ -704,36 +704,33 @@ def run_backtest_sync_standalone(
 ) -> dict:
     """
     Standalone sync function suitable for ProcessPoolExecutor.
-    Fetches its own OHLCV (sync only — yfinance + Alpha Vantage).
+    Fetches data via MT5 Bridge → yfinance → Alpha Vantage (all sync).
     Returns metrics dict; does NOT write to DB.
     """
-    from .ohlcv import fetch_yfinance, df_to_ohlcv_list
+    from .ohlcv import fetch_ohlcv_sync
 
     ohlcv: list[dict] = []
 
     try:
-        df = fetch_yfinance(symbol, from_date, to_date, timeframe)
-        ohlcv = df_to_ohlcv_list(df)
+        ohlcv = fetch_ohlcv_sync(symbol, from_date, to_date, timeframe)
     except Exception as exc:
-        logger.warning("run_backtest_sync_standalone yfinance failed for %s: %s", symbol, exc)
+        logger.warning("run_backtest_sync_standalone fetch failed for %s: %s", symbol, exc)
 
     if not ohlcv:
         return {"error": f"No OHLCV data for {symbol} {from_date}–{to_date}"}
 
-    # For MTF strategies (e.g. Alchemist), fetch sub-daily timeframes so
-    # the killzone, CRT, and structure-shift checks have real intraday data.
+    # For MTF strategies (e.g. Alchemist), fetch sub-daily timeframes.
+    # MT5 Bridge is tried first — it has full historical 1h/15m data.
     extra_ohlcv_by_tf: dict[str, list[dict]] = {}
     try:
         strat_check = get_strategy(strategy_name, params)
         if getattr(strat_check, "requires_mtf", False):
-            for tf in ("1d", "1h", "4h", "15m"):
+            for tf in ("1d", "4h", "1h", "15m"):
                 try:
-                    df_tf = fetch_yfinance(symbol, from_date, to_date, tf)
-                    extra_ohlcv_by_tf[tf] = df_to_ohlcv_list(df_tf)
+                    extra_ohlcv_by_tf[tf] = fetch_ohlcv_sync(symbol, from_date, to_date, tf)
+                    logger.info("MTF standalone %s %s: %d bars", symbol, tf, len(extra_ohlcv_by_tf[tf]))
                 except Exception as exc:
-                    logger.warning(
-                        "MTF standalone fetch failed for %s %s: %s", symbol, tf, exc
-                    )
+                    logger.warning("MTF standalone fetch failed %s %s: %s", symbol, tf, exc)
     except Exception as exc:
         logger.warning("MTF strategy check failed for %s: %s", strategy_name, exc)
 
@@ -768,9 +765,10 @@ def run_backtest(
     Create a backtest record and run synchronously.
     Returns backtest ID.
     """
-    from .ohlcv import fetch_yfinance, fetch_alpha_vantage, df_to_ohlcv_list
+    from .ohlcv import fetch_ohlcv_sync
 
     adapt_every_n = int(crud.get_setting(db, "backtest_adapt_every_n_trades") or "20")
+    av_key = crud.get_setting(db, "alphavantage_key") or ""
 
     # Try cache first
     cached = db.query(OHLCVCache).filter(
@@ -786,20 +784,10 @@ def run_backtest(
         ohlcv = json.loads(cached.data_json)
     else:
         try:
-            df = fetch_yfinance(symbol, from_date, to_date, "1d")
-            ohlcv = df_to_ohlcv_list(df)
-            data_source = "yfinance"
+            ohlcv = fetch_ohlcv_sync(symbol, from_date, to_date, "1d", av_key=av_key)
+            data_source = "mt5_bridge_or_yfinance"
         except Exception as exc:
-            logger.warning("Backtest yfinance failed for %s: %s", symbol, exc)
-
-        if not ohlcv:
-            try:
-                av_key = crud.get_setting(db, "alphavantage_key") or ""
-                df = fetch_alpha_vantage(symbol, from_date, to_date, "1d", api_key=av_key)
-                ohlcv = df_to_ohlcv_list(df)
-                data_source = "alpha_vantage"
-            except Exception as exc:
-                logger.warning("Backtest Alpha Vantage failed for %s: %s", symbol, exc)
+            logger.warning("Backtest fetch failed for %s: %s", symbol, exc)
 
         if ohlcv:
             cache_row = OHLCVCache(
@@ -813,16 +801,16 @@ def run_backtest(
             db.add(cache_row)
             db.commit()
 
-    # For MTF strategies, fetch extra timeframes (sync, best-effort)
+    # For MTF strategies, fetch all extra timeframes via MT5 Bridge first.
     extra_ohlcv_by_tf: dict[str, list[dict]] = {}
     strat_check = get_strategy(strategy_name, params)
     if getattr(strat_check, "requires_mtf", False):
-        for tf in ("1d", "1h", "4h", "15m"):  # include 1h for Alchemist CRT/structure checks
+        for tf in ("1d", "4h", "1h", "15m"):
             try:
-                df_tf = fetch_yfinance(symbol, from_date, to_date, tf)
-                extra_ohlcv_by_tf[tf] = df_to_ohlcv_list(df_tf)
+                extra_ohlcv_by_tf[tf] = fetch_ohlcv_sync(symbol, from_date, to_date, tf, av_key=av_key)
+                logger.info("MTF backtest %s %s: %d bars", symbol, tf, len(extra_ohlcv_by_tf[tf]))
             except Exception as exc:
-                logger.warning("MTF backtest fetch failed for %s %s: %s", symbol, tf, exc)
+                logger.warning("MTF backtest fetch failed %s %s: %s", symbol, tf, exc)
 
     result_row = BacktestResult(
         strategy_name=strategy_name,
