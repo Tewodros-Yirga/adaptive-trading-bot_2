@@ -497,5 +497,12 @@ def candles(payload: CandlesRequest = Depends()):
             to_date=payload.to_date,
         )
         return {"candles": data, "count": len(data), "symbol": payload.symbol, "timeframe": payload.timeframe}
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        # "mt5 not connected" → 503 Service Unavailable so callers know
+        # the bridge is up but MT5 terminal is not reachable (yet).
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=f"MT5 not connected: {err_msg}")
+        raise HTTPException(status_code=502, detail=err_msg)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))

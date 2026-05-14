@@ -604,15 +604,55 @@ class MT5Adapter:
             hour=23, minute=59, second=59, tzinfo=timezone.utc
         )
 
-        try:
-            rates = self._mt.copy_rates_range(symbol, mt5_timeframe, dt_from, dt_to)
-        except Exception as exc:
-            self.connected = False
-            self._mt = None
-            raise RuntimeError(f"copy_rates_range exception: {exc}") from exc
+        # Build a list of symbol names to try in order.
+        # Brokers often register gold/metals with an "m" suffix (XAUUSDm).
+        # We try the exact name supplied first, then the alternate variant.
+        def _alt_symbol(s: str) -> str | None:
+            """Return the alternate broker suffix variant, or None if not applicable."""
+            if s.upper().endswith("M"):
+                return s[:-1]   # XAUUSDm → XAUUSD
+            # Only add "m" for known commodity/metal pairs where brokers commonly do this
+            _candidates = {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}
+            if s.upper() in _candidates:
+                return s + "m"  # XAUUSD → XAUUSDm
+            return None
+
+        symbols_to_try = [symbol]
+        alt = _alt_symbol(symbol)
+        if alt:
+            symbols_to_try.append(alt)
+
+        rates = None
+        used_symbol = symbol
+        last_error: str | None = None
+
+        for sym in symbols_to_try:
+            try:
+                # symbol_select is REQUIRED — copy_rates_range silently returns
+                # None for symbols not currently in the Market Watch.
+                try:
+                    self._mt.symbol_select(sym, True)
+                except Exception:
+                    pass  # not fatal — some mt5linux versions don't expose this
+
+                rates = self._mt.copy_rates_range(sym, mt5_timeframe, dt_from, dt_to)
+                if rates is not None and (not hasattr(rates, '__len__') or len(rates) > 0):
+                    used_symbol = sym
+                    break  # success
+                last_error = f"copy_rates_range returned no data for {sym} {timeframe}"
+                rates = None
+            except Exception as exc:
+                self.connected = False
+                self._mt = None
+                raise RuntimeError(f"copy_rates_range exception: {exc}") from exc
 
         if rates is None or (hasattr(rates, '__len__') and len(rates) == 0):
-            raise RuntimeError(f"copy_rates_range returned no data for {symbol} {timeframe}")
+            tried = " / ".join(symbols_to_try)
+            raise RuntimeError(
+                last_error or f"copy_rates_range returned no data for {tried} {timeframe}"
+            )
+
+        logger.debug("copy_rates_range: using symbol %r (%d bars)", used_symbol, len(rates))
 
         candles: list[dict[str, Any]] = []
         for r in rates:
