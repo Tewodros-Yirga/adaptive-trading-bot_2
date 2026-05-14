@@ -419,8 +419,10 @@ async def fetch_mt5_bridge(
     """
     from .bridge_client import bridge_client
 
+    # Pass raw symbol — the bridge adapter handles XAUUSDm ↔ XAUUSD fallback itself.
+    # _normalize_symbol is only needed for yfinance/AV ticker mapping, not for MT5.
     candles = bridge_client.get_candles(
-        symbol=_normalize_symbol(symbol),
+        symbol=symbol,
         timeframe=timeframe,
         from_date=from_date,
         to_date=to_date,
@@ -590,8 +592,9 @@ def fetch_ohlcv_sync(
         while chunk_start <= end_dt:
             chunk_end = min(chunk_start + _td(days=chunk_days - 1), end_dt)
             try:
+                # Pass raw symbol — bridge adapter handles XAUUSDm ↔ XAUUSD internally.
                 candles = bridge_client.get_candles(
-                    symbol=_normalize_symbol(symbol),
+                    symbol=symbol,
                     timeframe=timeframe,
                     from_date=chunk_start.date().isoformat(),
                     to_date=chunk_end.date().isoformat(),

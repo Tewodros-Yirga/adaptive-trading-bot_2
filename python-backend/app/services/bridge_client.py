@@ -115,7 +115,7 @@ class MT5BridgeClient:
                 last_exc = exc
                 _time.sleep(2 ** attempt)   # 1s, 2s, 4s
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in (502, 503, 504):
+                if exc.response.status_code in (502, 503, 504):  # 503 = MT5 not connected yet
                     last_exc = exc
                     _time.sleep(2 ** attempt)
                 else:
