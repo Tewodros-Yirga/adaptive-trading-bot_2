@@ -15,7 +15,8 @@ try:
     from mt5linux import MetaTrader5 as mt5linux_cls  # type: ignore
 except Exception:
     mt5linux_cls = None
-
+import logging
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # How long to wait before retrying after a failed connection attempt.
