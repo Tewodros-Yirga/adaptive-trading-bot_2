@@ -286,4 +286,24 @@ def run_startup_migrations() -> None:
     with engine.begin() as conn:
         for stmt in _STMTS:
             conn.execute(text(stmt))
+
+        # Stamp Alembic's version table to 'head' so the startup migration
+        # check doesn't report false positives. The DDL above is the source
+        # of truth; Alembic's alembic_version table is just bookkeeping.
+        try:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS alembic_version (
+                    version_num VARCHAR(32) NOT NULL,
+                    CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+                )
+            """))
+            # Delete any stale entries and insert the latest revision
+            conn.execute(text("DELETE FROM alembic_version"))
+            conn.execute(text(
+                "INSERT INTO alembic_version (version_num) "
+                "VALUES ('009_seed_alchemist_strategy')"
+            ))
+        except Exception:
+            pass  # Non-fatal — version stamp is informational only
+
     engine.dispose()

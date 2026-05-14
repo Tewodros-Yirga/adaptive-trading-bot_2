@@ -193,6 +193,34 @@ def list_weight_history(
 
 
 # ---------------------------------------------------------------------------
+# GET /picker/weights/current  (alias used by the frontend)
+# Returns only the active_weights dict for lightweight polling
+# ---------------------------------------------------------------------------
+
+@router.get("/weights/current")
+def get_current_weights(
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Return the active normalised factor weights (frontend alias)."""
+    return _load_active_weights(db)
+
+
+# ---------------------------------------------------------------------------
+# GET /picker/weights/history  (alias used by the frontend)
+# ---------------------------------------------------------------------------
+
+@router.get("/weights/history", response_model=list[PickerWeightHistoryOut])
+def list_weights_history_alias(
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Alias for /picker/weight-history (frontend compatibility)."""
+    return crud.get_picker_weight_history(db, limit=limit)
+
+
+# ---------------------------------------------------------------------------
 # GET /picker/performance
 # ---------------------------------------------------------------------------
 

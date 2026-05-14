@@ -36,7 +36,11 @@ async def run_startup_checks(db) -> list[dict]:
         })
 
     # ── 2. Alembic migration state ─────────────────────────────────────────
+    # NOTE: Use a separate raw engine connection (NOT the ORM session) so that
+    # MigrationContext doesn't invalidate the shared session for later checks.
     try:
+        import os
+        from sqlalchemy import create_engine as _ce
         from alembic.runtime.migration import MigrationContext
         from alembic.script import ScriptDirectory
         from alembic.config import Config
@@ -44,10 +48,13 @@ async def run_startup_checks(db) -> list[dict]:
         alembic_cfg = Config("alembic.ini")
         script = ScriptDirectory.from_config(alembic_cfg)
 
-        # Use a raw connection so MigrationContext can inspect the DB
-        with db.connection() as conn:
-            context = MigrationContext.configure(conn)
+        _check_engine = _ce(
+            os.environ["DATABASE_URL"], future=True, pool_pre_ping=True
+        )
+        with _check_engine.connect() as raw_conn:
+            context = MigrationContext.configure(raw_conn)
             current = set(context.get_current_heads())
+        _check_engine.dispose()
 
         heads = set(script.get_heads())
 
