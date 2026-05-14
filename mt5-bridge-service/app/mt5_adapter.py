@@ -549,5 +549,89 @@ class MT5Adapter:
         ok = result.retcode == self._mt.TRADE_RETCODE_DONE
         return {"closed": ok, "ticket": ticket, "retcode": result.retcode}
 
+    # ── Timeframe mapping for copy_rates_range ────────────────────────────
+    _TIMEFRAME_MAP: dict[str, str] = {
+        "1m": "TIMEFRAME_M1",
+        "5m": "TIMEFRAME_M5",
+        "15m": "TIMEFRAME_M15",
+        "30m": "TIMEFRAME_M30",
+        "1h": "TIMEFRAME_H1",
+        "4h": "TIMEFRAME_H4",
+        "1d": "TIMEFRAME_D1",
+        "1w": "TIMEFRAME_W1",
+    }
+
+    def copy_rates_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        from_date: str,
+        to_date: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch historical OHLCV candles using MT5's copy_rates_range.
+
+        Args:
+            symbol: e.g. "XAUUSD", "XAUUSDm"
+            timeframe: e.g. "1h", "4h", "1d"
+            from_date: ISO date string e.g. "2024-01-01"
+            to_date: ISO date string e.g. "2024-12-31"
+
+        Returns:
+            List of dicts with keys: datetime, open, high, low, close, volume
+        """
+        from datetime import datetime, timezone
+
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: "
+                f"{self.last_error or 'connection unavailable'}"
+            )
+
+        # Resolve the MT5 timeframe constant
+        tf_attr = self._TIMEFRAME_MAP.get(timeframe.lower())
+        if not tf_attr:
+            raise ValueError(f"Unsupported timeframe: {timeframe}. Use one of: {list(self._TIMEFRAME_MAP.keys())}")
+
+        mt5_timeframe = getattr(self._mt, tf_attr, None)
+        if mt5_timeframe is None:
+            raise ValueError(f"MT5 adapter has no attribute {tf_attr}")
+
+        # Parse dates
+        dt_from = datetime.strptime(from_date[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        dt_to = datetime.strptime(to_date[:10], "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
+
+        try:
+            rates = self._mt.copy_rates_range(symbol, mt5_timeframe, dt_from, dt_to)
+        except Exception as exc:
+            self.connected = False
+            self._mt = None
+            raise RuntimeError(f"copy_rates_range exception: {exc}") from exc
+
+        if rates is None or (hasattr(rates, '__len__') and len(rates) == 0):
+            raise RuntimeError(f"copy_rates_range returned no data for {symbol} {timeframe}")
+
+        candles: list[dict[str, Any]] = []
+        for r in rates:
+            # rates is a numpy structured array with fields:
+            # time, open, high, low, close, tick_volume, spread, real_volume
+            try:
+                ts = int(r[0]) if not hasattr(r, 'time') else int(r.time)
+                candles.append({
+                    "datetime": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "open": float(r[1]) if not hasattr(r, 'open') else float(r.open),
+                    "high": float(r[2]) if not hasattr(r, 'high') else float(r.high),
+                    "low": float(r[3]) if not hasattr(r, 'low') else float(r.low),
+                    "close": float(r[4]) if not hasattr(r, 'close') else float(r.close),
+                    "volume": float(r[5]) if not hasattr(r, 'tick_volume') else float(r.tick_volume),
+                })
+            except (IndexError, ValueError, TypeError):
+                continue
+
+        return candles
+
 
 adapter = MT5Adapter()

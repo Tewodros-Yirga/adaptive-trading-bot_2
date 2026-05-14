@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .config import settings, validate_required_settings
 from .mt5_adapter import adapter
-from .schemas import CloseRequest, OrderRequest
+from .schemas import CandlesRequest, CloseRequest, OrderRequest
 
 app = FastAPI(title="Adaptive MT5 Bridge")
 logger = logging.getLogger(__name__)
@@ -476,3 +476,26 @@ def order(payload: OrderRequest):
 @app.post("/close", dependencies=[Depends(require_secret)])
 def close(payload: CloseRequest):
     return adapter.close_position(payload.ticket, payload.volume)
+
+
+@app.get("/candles", dependencies=[Depends(require_secret)])
+def candles(payload: CandlesRequest = Depends()):
+    """
+    Fetch historical OHLCV candles from the MT5 terminal.
+
+    Query params:
+        symbol: e.g. XAUUSD
+        timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (default: 1h)
+        from_date: ISO date e.g. 2024-01-01
+        to_date: ISO date e.g. 2024-12-31
+    """
+    try:
+        data = adapter.copy_rates_range(
+            symbol=payload.symbol,
+            timeframe=payload.timeframe,
+            from_date=payload.from_date,
+            to_date=payload.to_date,
+        )
+        return {"candles": data, "count": len(data), "symbol": payload.symbol, "timeframe": payload.timeframe}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
