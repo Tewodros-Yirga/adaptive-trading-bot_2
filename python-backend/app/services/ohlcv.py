@@ -474,10 +474,10 @@ async def fetch_ohlcv_with_fallback(
 ) -> tuple[pd.DataFrame, str]:
     """
     Returns (dataframe, source_name_used). Tries each source in order:
-      1. yfinance (sync, wrapped)
-      2. Alpha Vantage (sync, wrapped)
-      3. MT5 Bridge (sync, via bridge_client)
-      4. OANDA (async, forex only)
+      1. MT5 Bridge  (broker's live data — most accurate for the traded symbol)
+      2. yfinance    (free, wide coverage)
+      3. Alpha Vantage (requires API key)
+      4. OANDA      (async, forex only)
       5. Twelve Data (async, last resort)
 
     Raises RuntimeError if all sources fail.
@@ -489,7 +489,16 @@ async def fetch_ohlcv_with_fallback(
 
     errors: list[str] = []
 
-    # Source 1: yfinance
+    # Source 1: MT5 Bridge (broker's data — preferred for accuracy)
+    try:
+        df = await fetch_mt5_bridge(symbol, from_date, to_date, timeframe)
+        if not df.empty:
+            logger.info("OHLCV source: mt5_bridge for %s", symbol)
+            return df, "mt5_bridge"
+    except Exception as exc:
+        errors.append(f"mt5_bridge: {exc}")
+
+    # Source 2: yfinance
     try:
         df = fetch_yfinance(symbol, from_date, to_date, timeframe)
         if not df.empty:
@@ -497,21 +506,13 @@ async def fetch_ohlcv_with_fallback(
     except Exception as exc:
         errors.append(f"yfinance: {exc}")
 
-    # Source 2: Alpha Vantage
+    # Source 3: Alpha Vantage
     try:
         df = fetch_alpha_vantage(symbol, from_date, to_date, timeframe, api_key=av_key)
         if not df.empty:
             return df, "alpha_vantage"
     except Exception as exc:
         errors.append(f"alpha_vantage: {exc}")
-
-    # Source 3: MT5 Bridge
-    try:
-        df = await fetch_mt5_bridge(symbol, from_date, to_date, timeframe)
-        if not df.empty:
-            return df, "mt5_bridge"
-    except Exception as exc:
-        errors.append(f"mt5_bridge: {exc}")
 
     # Source 4: OANDA (forex only)
     try:

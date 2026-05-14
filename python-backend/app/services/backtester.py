@@ -192,16 +192,72 @@ def _run_backtest_sync(
     strat = get_strategy(strategy_name, params)
     is_mtf_strategy = getattr(strat, "requires_mtf", False)
     closes = [r["close"] for r in ohlcv]
+    highs  = [r["high"]  for r in ohlcv]
+    lows   = [r["low"]   for r in ohlcv]
+    volumes = [r.get("volume", 0) for r in ohlcv]
 
-    # Pre-compute indicators (for non-MTF strategies)
+    # ── Pre-compute ALL indicators for ALL strategies ──────────────────────
     rsi_series = _compute_rsi(closes, int(params.get("rsi_period", 14)))
     atr_series = _compute_atr(ohlcv, 14)
+
+    # EMA ribbons (used by DTC, Multi_EMA_Scalper)
     ema_periods = [
         int(params.get("ema_1", 30)), int(params.get("ema_2", 35)),
         int(params.get("ema_3", 40)), int(params.get("ema_4", 45)),
         int(params.get("ema_5", 50)), int(params.get("ema_6", 60)),
     ]
     ema_series_list = [_ema_series(closes, p) for p in ema_periods]
+
+    # MACD (used by MACD_Momentum)
+    fast_p  = int(params.get("fast_period",  12))
+    slow_p  = int(params.get("slow_period",  26))
+    sig_p   = int(params.get("signal_period", 9))
+    ema_fast = _ema_series(closes, fast_p)
+    ema_slow = _ema_series(closes, slow_p)
+    macd_line_series: list[float | None] = [
+        (f - s) if (f is not None and s is not None) else None
+        for f, s in zip(ema_fast, ema_slow)
+    ]
+    _macd_valid = [v for v in macd_line_series if v is not None]
+    macd_signal_series: list[float | None] = [None] * len(macd_line_series)
+    if len(_macd_valid) >= sig_p:
+        # compute EMA of the macd_line where available
+        _filled = [v if v is not None else 0.0 for v in macd_line_series]
+        _sig = _ema_series(_filled, sig_p)
+        macd_signal_series = [s if m is not None else None for m, s in zip(macd_line_series, _sig)]
+    macd_histogram_series: list[float | None] = [
+        (m - s) if (m is not None and s is not None) else None
+        for m, s in zip(macd_line_series, macd_signal_series)
+    ]
+
+    # Bollinger Bands (used by Bollinger_Breakout)
+    bb_period = int(params.get("bb_period", 20))
+    bb_std    = float(params.get("bb_std", 2.0))
+    bb_upper_series: list[float | None] = [None] * len(closes)
+    bb_lower_series: list[float | None] = [None] * len(closes)
+    for _bi in range(bb_period - 1, len(closes)):
+        _window = closes[_bi - bb_period + 1: _bi + 1]
+        _mean = sum(_window) / bb_period
+        _std  = math.sqrt(sum((c - _mean) ** 2 for c in _window) / bb_period)
+        bb_upper_series[_bi] = _mean + bb_std * _std
+        bb_lower_series[_bi] = _mean - bb_std * _std
+
+    # VWAP (rolling daily-reset approximation using cumulative price*vol / vol)
+    vwap_series: list[float | None] = [None] * len(closes)
+    _cum_pv = 0.0
+    _cum_v  = 0.0
+    _prev_date = ""
+    for _vi, bar in enumerate(ohlcv):
+        _d = bar.get("date", "")[:10]
+        if _d != _prev_date:          # new day — reset
+            _cum_pv = 0.0
+            _cum_v  = 0.0
+            _prev_date = _d
+        _tp = (bar["high"] + bar["low"] + bar["close"]) / 3.0
+        _v  = volumes[_vi] or 1.0
+        _cum_pv += _tp * _v
+        _cum_v  += _v
+        vwap_series[_vi] = _cum_pv / _cum_v
 
     balance = initial_balance
     equity_curve = [{"date": ohlcv[0]["date"], "equity": balance}]
@@ -218,7 +274,7 @@ def _run_backtest_sync(
     peak_equity = balance
     trade_index = 0
 
-    start_idx = max(ema_periods[5], 30)
+    start_idx = max(ema_periods[5], slow_p + sig_p, bb_period, 30)
 
     for i in range(start_idx, len(ohlcv)):
         bar = ohlcv[i]
@@ -345,12 +401,9 @@ def _run_backtest_sync(
             else:
                 levels = {}
         else:
-            # Standard non-MTF path
+            # ── Universal market_data_bar — all indicators for all strategies ──
             ema_vals = {f"ema_{j+1}": ema_series_list[j][i] for j in range(6)}
             prev_ema_vals = {f"ema_{j+1}": ema_series_list[j][i - 1] for j in range(6)}
-            if any(v is None for v in ema_vals.values()):
-                equity_curve.append({"date": bar_date, "equity": round(balance, 2)})
-                continue
 
             prev_bull = all(
                 (prev_ema_vals.get(f"ema_{k}") or 0) > (prev_ema_vals.get(f"ema_{k+1}") or 0)
@@ -362,12 +415,30 @@ def _run_backtest_sync(
             )
 
             market_data_bar = {
-                "price": price,
-                "ema_values": ema_vals,
-                "previous_bull": prev_bull,
-                "previous_bear": prev_bear,
-                "rsi": rsi_series[i],
-                "prev_rsi": rsi_series[i - 1],
+                # Common
+                "price":          price,
+                "prev_price":     ohlcv[i - 1]["close"],
+                "atr":            atr_series[i],
+                # EMA ribbon (DTC, Multi_EMA_Scalper)
+                "ema_values":     ema_vals,
+                "previous_bull":  prev_bull,
+                "previous_bear":  prev_bear,
+                # RSI (DTC, RSI_Reversal)
+                "rsi":            rsi_series[i],
+                "prev_rsi":       rsi_series[i - 1],
+                # MACD (MACD_Momentum)
+                "macd_line":      macd_line_series[i],
+                "macd_signal":    macd_signal_series[i],
+                "macd_histogram": macd_histogram_series[i],
+                "prev_macd_line":   macd_line_series[i - 1],
+                "prev_macd_signal": macd_signal_series[i - 1],
+                # Bollinger Bands (Bollinger_Breakout)
+                "bb_upper":       bb_upper_series[i],
+                "bb_lower":       bb_lower_series[i],
+                "prev_bb_upper":  bb_upper_series[i - 1],
+                "prev_bb_lower":  bb_lower_series[i - 1],
+                # VWAP (VWAP_Reversion)
+                "vwap":           vwap_series[i],
             }
 
             signal = strat.signal(market_data_bar)

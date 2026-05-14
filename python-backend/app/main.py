@@ -97,18 +97,17 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(_news_learning_loop()))
     bg_tasks.append(asyncio.create_task(_global_context_loop()))
 
-    # ── 8. Start continuous backtest loops for all active strategies ───────
+    # ── 8. Start continuous backtest loops for ALL registered strategies ──────
     db = SessionLocal()
     try:
-        from .crud import get_active_strategies
+        from .strategy.registry import STRATEGY_REGISTRY
         from .services.continuous_backtest import start_continuous_backtest
-        active_strategies = get_active_strategies(db)
-        for strategy in active_strategies:
+        for strategy_name in STRATEGY_REGISTRY:
             task = asyncio.create_task(
-                start_continuous_backtest(strategy.name, _EXECUTOR)
+                start_continuous_backtest(strategy_name, _EXECUTOR)
             )
             bg_tasks.append(task)
-            logger.info(f"Started continuous backtest loop for strategy: {strategy.name}")
+            logger.info(f"Started continuous backtest loop for strategy: {strategy_name}")
     except Exception as e:
         logger.warning(f"Could not start continuous backtest loops: {e}")
     finally:
