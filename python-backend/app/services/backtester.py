@@ -154,11 +154,14 @@ def _build_mtf_bars_for_index(
 
     primary_df = _list_to_df(primary_ohlcv[: i + 1], current_date_str)
 
-    bars_by_tf: dict[str, "pd.DataFrame"] = {
-        "1h": primary_df,
-    }
+    # Build the bars_by_tf dict from the extra timeframes.
+    # Only fall back to primary (daily) as "1h" if no real 1h data was provided,
+    # to avoid feeding daily bars to 1h-based strategy checks (e.g. Alchemist CRT).
+    bars_by_tf: dict[str, "pd.DataFrame"] = {}
     for tf, ohlcv_list in extra_ohlcv_by_tf.items():
         bars_by_tf[tf] = _list_to_df(ohlcv_list, current_date_str)
+    if "1h" not in bars_by_tf:
+        bars_by_tf["1h"] = primary_df
 
     return bars_by_tf
 
@@ -379,6 +382,12 @@ def _run_backtest_sync(
                 bar_ts = datetime.fromisoformat(bar_date)
             except ValueError:
                 bar_ts = datetime.utcnow()
+
+            # For daily bars, bar_date is date-only (e.g. "2023-01-15") → midnight.
+            # Midnight is outside all trading session killzones (London 07-10, NY 12-15).
+            # Simulate a London-open entry time so session-aware strategies can fire.
+            if len(bar_date) == 10 and bar_ts.hour == 0 and bar_ts.minute == 0:
+                bar_ts = bar_ts.replace(hour=8, minute=30)
 
             atr_val = atr_series[i] or price * 0.005
             market_data_bar = build_mtf_market_data(
@@ -711,9 +720,27 @@ def run_backtest_sync_standalone(
     if not ohlcv:
         return {"error": f"No OHLCV data for {symbol} {from_date}–{to_date}"}
 
+    # For MTF strategies (e.g. Alchemist), fetch sub-daily timeframes so
+    # the killzone, CRT, and structure-shift checks have real intraday data.
+    extra_ohlcv_by_tf: dict[str, list[dict]] = {}
+    try:
+        strat_check = get_strategy(strategy_name, params)
+        if getattr(strat_check, "requires_mtf", False):
+            for tf in ("1d", "1h", "4h", "15m"):
+                try:
+                    df_tf = fetch_yfinance(symbol, from_date, to_date, tf)
+                    extra_ohlcv_by_tf[tf] = df_to_ohlcv_list(df_tf)
+                except Exception as exc:
+                    logger.warning(
+                        "MTF standalone fetch failed for %s %s: %s", symbol, tf, exc
+                    )
+    except Exception as exc:
+        logger.warning("MTF strategy check failed for %s: %s", strategy_name, exc)
+
     result = _run_backtest_sync(
         strategy_name, symbol, from_date, to_date,
         params, initial_balance, leverage, risk_per_trade_pct, ohlcv,
+        extra_ohlcv_by_tf=extra_ohlcv_by_tf or None,
     )
     result.pop("equity_curve", None)
     result.pop("trade_log", None)
@@ -790,7 +817,7 @@ def run_backtest(
     extra_ohlcv_by_tf: dict[str, list[dict]] = {}
     strat_check = get_strategy(strategy_name, params)
     if getattr(strat_check, "requires_mtf", False):
-        for tf in ("1d", "4h", "15m"):
+        for tf in ("1d", "1h", "4h", "15m"):  # include 1h for Alchemist CRT/structure checks
             try:
                 df_tf = fetch_yfinance(symbol, from_date, to_date, tf)
                 extra_ohlcv_by_tf[tf] = df_to_ohlcv_list(df_tf)
