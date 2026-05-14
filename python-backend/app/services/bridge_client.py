@@ -1,9 +1,13 @@
 import random
-
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
-
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from ..config import settings
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (502, 503, 504)
+    return isinstance(exc, (httpx.TimeoutException, httpx.RemoteProtocolError, httpx.ConnectError))
 
 
 class MT5BridgeClient:
@@ -13,18 +17,16 @@ class MT5BridgeClient:
             headers["Authorization"] = f"Bearer {settings.mt_bridge_hf_token}"
         self._client = httpx.Client(
             base_url=settings.mt_bridge_url,
-            timeout=10.0,      # default timeout for fast calls (account, positions)
+            timeout=10.0,
             headers=headers,
         )
-        # Separate client with a much longer timeout for /candles
-        # (MT5 fetching months of 15m bars can take 30-90 seconds on HF Spaces)
         self._candle_client = httpx.Client(
             base_url=settings.mt_bridge_url,
             timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=5.0),
             headers=headers,
         )
 
-    @retry(wait=wait_exponential(multiplier=0.5, min=0.5, max=3), stop=stop_after_attempt(3), reraise=True)
+    @retry(retry=retry_if_exception(_is_retryable_error), wait=wait_exponential(multiplier=0.5, min=0.5, max=3), stop=stop_after_attempt(3), reraise=True)
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
         response = self._client.request(method, path, json=payload)
         response.raise_for_status()
