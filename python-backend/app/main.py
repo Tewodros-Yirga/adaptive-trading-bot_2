@@ -4,6 +4,7 @@ AlgoTrade Pro — FastAPI Application Entry Point
 import asyncio
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Security
@@ -17,6 +18,9 @@ from .startup_migrations import run_startup_migrations
 from .auth_deps import get_current_user, require_admin, require_write_access, seed_admin_user
 
 logger = logging.getLogger(__name__)
+
+# Shared ProcessPoolExecutor for backtesting workers
+_EXECUTOR = ProcessPoolExecutor(max_workers=2)
 
 
 @asynccontextmanager
@@ -63,11 +67,52 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    # ── 5. Start background tasks ─────────────────────────────────────────
+    # ── 5. Seed default AppSettings for continuous backtest + picker ───────
+    db = SessionLocal()
+    try:
+        from .crud import seed_default_settings
+        seed_default_settings(db)
+        logger.info("Default AppSettings seeded.")
+    except Exception as e:
+        logger.warning(f"Could not seed default settings: {e}")
+    finally:
+        db.close()
+
+    # ── 6. Run startup health checks ───────────────────────────────────────
+    db = SessionLocal()
+    try:
+        from .services.startup_checks import run_startup_checks
+        checks = await run_startup_checks(db)
+        app.state.startup_checks = checks
+        logger.info(f"Startup checks complete: {len(checks)} checks run.")
+    except Exception as e:
+        logger.warning(f"Startup checks failed: {e}")
+        app.state.startup_checks = []
+    finally:
+        db.close()
+
+    # ── 7. Start background tasks ─────────────────────────────────────────
     bg_tasks = []
     bg_tasks.append(asyncio.create_task(_news_fetch_loop()))
     bg_tasks.append(asyncio.create_task(_news_learning_loop()))
     bg_tasks.append(asyncio.create_task(_global_context_loop()))
+
+    # ── 8. Start continuous backtest loops for all active strategies ───────
+    db = SessionLocal()
+    try:
+        from .crud import get_active_strategies
+        from .services.continuous_backtest import start_continuous_backtest
+        active_strategies = get_active_strategies(db)
+        for strategy in active_strategies:
+            task = asyncio.create_task(
+                start_continuous_backtest(strategy.name, _EXECUTOR)
+            )
+            bg_tasks.append(task)
+            logger.info(f"Started continuous backtest loop for strategy: {strategy.name}")
+    except Exception as e:
+        logger.warning(f"Could not start continuous backtest loops: {e}")
+    finally:
+        db.close()
 
     logger.info("Application startup complete.")
     yield
@@ -79,6 +124,8 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+
+    _EXECUTOR.shutdown(wait=False)
     logger.info("Application shutdown complete.")
 
 
@@ -171,6 +218,9 @@ def create_app() -> FastAPI:
     from .routers.params import router as params_router
     from .routers.bridge import router as bridge_router
     from .routers.shadow_signals import router as shadow_router
+    from .routers.ensemble import router as ensemble_router
+    from .routers.picker import router as picker_router
+    from .routers.system import router as system_router       # NEW
 
     # ── Auth router (public — no auth required for login) ──────────────────
     app.include_router(auth_router)
@@ -185,13 +235,16 @@ def create_app() -> FastAPI:
     app.include_router(risk_router, dependencies=jwt_deps)
     app.include_router(news_router, dependencies=jwt_deps)
     app.include_router(backtest_router, dependencies=jwt_deps)
-    app.include_router(ws_router)  # WebSocket handles auth separately
+    app.include_router(ws_router)  # WebSocket handles auth separately via ?token=
     app.include_router(settings_router, dependencies=jwt_deps)
     app.include_router(trades_router, dependencies=jwt_deps)
     app.include_router(adapt_router, dependencies=jwt_deps)
     app.include_router(params_router, dependencies=jwt_deps)
     app.include_router(bridge_router, dependencies=jwt_deps)
     app.include_router(shadow_router, dependencies=jwt_deps)
+    app.include_router(ensemble_router, dependencies=jwt_deps)
+    app.include_router(picker_router, dependencies=jwt_deps)
+    app.include_router(system_router, dependencies=jwt_deps)  # NEW
 
     # ── Serve frontend SPA ────────────────────────────────────────────────
     frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")

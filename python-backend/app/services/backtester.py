@@ -1,20 +1,35 @@
 """
 Backtesting Engine
-Uses yfinance as primary OHLCV source, Alpha Vantage as fallback.
+Uses the shared ohlcv.py module for data fetching (yfinance → Alpha Vantage → Twelve Data → OANDA).
 Runs in ProcessPoolExecutor to avoid blocking the event loop.
+
+Phase 2 extensions:
+  - Per-trade detail log (trade_log_json)
+  - Monthly breakdown (monthly_breakdown_json)
+  - Parameter evolution log (parameter_evolution_log_json)
+  - Drawdown periods (drawdown_periods_json)
+  - Batch orchestration with cross-analysis and pair analysis
+
+Phase 4 additions:
+  - MTF (multi-timeframe) simulation support for strategies with requires_mtf=True.
+    At each bar in the simulation loop, a rolling window of bars for each timeframe
+    is assembled via build_mtf_market_data().
+  - Alchemist (and any future requires_mtf strategy) receives the full MTF dict.
 """
+import asyncio
 import json
 import logging
 import math
-import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from itertools import combinations
 
 import httpx
 from sqlalchemy.orm import Session
 
 from .. import crud
-from ..models import BacktestResult, OHLCVCache
+from ..models import BacktestResult, OHLCVCache, StrategyPairAnalysis
 from ..strategy.registry import get_strategy
 
 logger = logging.getLogger(__name__)
@@ -22,143 +37,9 @@ logger = logging.getLogger(__name__)
 _EXECUTOR = ProcessPoolExecutor(max_workers=2)
 
 
-def _normalize_symbol(symbol: str) -> str:
-    """Normalize broker-specific suffixes (XAUUSDm → XAUUSD)."""
-    s = symbol.upper().rstrip('M').rstrip('.')
-    # Handle common broker suffixes like .pro, .raw, etc.
-    for suffix in ('.PRO', '.RAW', '.STD', '.ECN'):
-        if s.endswith(suffix):
-            s = s[:-len(suffix)]
-    return s
-
-
-def _fetch_ohlcv_yfinance(symbol: str, from_date: str, to_date: str) -> list[dict]:
-    """Fetch OHLCV data using yfinance with retry on rate limits."""
-    try:
-        import yfinance as yf
-        ticker_map = {
-            "XAUUSD": "GC=F", "XAGUSD": "SI=F", "EURUSD": "EURUSD=X",
-            "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X", "US30": "^DJI",
-            "NAS100": "^NDX", "SPX500": "^GSPC",
-        }
-        norm_symbol = _normalize_symbol(symbol)
-        yf_symbol = ticker_map.get(norm_symbol, symbol)
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                df = yf.download(yf_symbol, start=from_date, end=to_date, interval="1d", progress=False)
-                if df is not None and not df.empty:
-                    break
-                logger.warning(f"yfinance returned empty data for {yf_symbol} (attempt {attempt + 1})")
-            except Exception as e:
-                err_str = str(e).lower()
-                if 'rate' in err_str or 'too many' in err_str:
-                    delay = 2 ** (attempt + 1)  # 2, 4, 8 seconds
-                    logger.warning(f"yfinance rate limited for {yf_symbol}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(delay)
-                    continue
-                raise
-        else:
-            logger.warning(f"yfinance exhausted retries for {yf_symbol}")
-            return []
-
-        if df is None or df.empty:
-            return []
-
-        records = []
-        for ts, row in df.iterrows():
-            records.append({
-                "date": str(ts.date()),
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
-                "volume": float(row.get("Volume", 0) or 0),
-            })
-        return records
-    except ImportError:
-        logger.warning("yfinance not installed — skipping yfinance source")
-        return []
-    except Exception as e:
-        logger.warning(f"yfinance fetch failed for {symbol}: {e}")
-        return []
-
-
-def _fetch_ohlcv_alphavantage(symbol: str, api_key: str) -> list[dict]:
-    """Fetch daily OHLCV from Alpha Vantage (up to 20 years of history)."""
-    if not api_key:
-        return []
-    try:
-        av_map = {
-            "XAUUSD": ("FX_DAILY", "XAU", "USD"),
-            "XAGUSD": ("FX_DAILY", "XAG", "USD"),
-            "EURUSD": ("FX_DAILY", "EUR", "USD"),
-            "GBPUSD": ("FX_DAILY", "GBP", "USD"),
-            "USDJPY": ("FX_DAILY", "USD", "JPY"),
-        }
-        norm_symbol = _normalize_symbol(symbol)
-        mapping = av_map.get(norm_symbol)
-
-        if mapping and mapping[0] == "FX_DAILY":
-            url = (
-                f"https://www.alphavantage.co/query?function=FX_DAILY"
-                f"&from_symbol={mapping[1]}&to_symbol={mapping[2]}"
-                f"&outputsize=full&apikey={api_key}"
-            )
-            key = "Time Series FX (Daily)"
-        else:
-            # Use generic daily for stocks/indices
-            url = (
-                f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY"
-                f"&symbol={symbol}&outputsize=full&apikey={api_key}"
-            )
-            key = "Time Series (Daily)"
-
-        resp = httpx.get(url, timeout=30)
-        data = resp.json()
-        series = data.get(key, {})
-        if not series:
-            logger.warning(f"Alpha Vantage returned no data for {symbol}: {list(data.keys())}")
-            return []
-
-        records = []
-        for date_str, values in sorted(series.items()):
-            try:
-                records.append({
-                    "date": date_str,
-                    "open": float(values.get("1. open", 0)),
-                    "high": float(values.get("2. high", 0)),
-                    "low": float(values.get("3. low", 0)),
-                    "close": float(values.get("4. close", 0)),
-                    "volume": float(values.get("5. volume", 0) or 0),
-                })
-            except (ValueError, KeyError):
-                continue
-        logger.info(f"Alpha Vantage returned {len(records)} bars for {symbol}")
-        return records
-    except Exception as e:
-        logger.warning(f"Alpha Vantage fetch failed for {symbol}: {e}")
-        return []
-
-
-def _fetch_ohlcv(symbol: str, from_date: str, to_date: str, alphavantage_key: str = "") -> list[dict]:
-    """Fetch OHLCV — tries yfinance first, then Alpha Vantage as fallback."""
-    # Try yfinance first
-    records = _fetch_ohlcv_yfinance(symbol, from_date, to_date)
-    if records:
-        return records
-
-    # Fallback: Alpha Vantage (returns full history, filter by date range)
-    logger.info(f"Falling back to Alpha Vantage for {symbol}")
-    records = _fetch_ohlcv_alphavantage(symbol, alphavantage_key)
-    if records:
-        filtered = [r for r in records if from_date <= r["date"] <= to_date]
-        return filtered
-
-    logger.error(f"All OHLCV sources failed for {symbol}")
-    return []
-
+# ---------------------------------------------------------------------------
+# Indicator helpers
+# ---------------------------------------------------------------------------
 
 def _compute_rsi(closes: list[float], period: int = 14) -> list[float | None]:
     rsi = [None] * len(closes)
@@ -197,6 +78,95 @@ def _ema_series(values: list[float], period: int) -> list[float | None]:
     return result
 
 
+def _compute_atr(ohlcv: list[dict], period: int = 14) -> list[float | None]:
+    atr: list[float | None] = [None] * len(ohlcv)
+    if len(ohlcv) < period + 1:
+        return atr
+    trs = []
+    for i in range(1, len(ohlcv)):
+        h = ohlcv[i]["high"]
+        l = ohlcv[i]["low"]
+        pc = ohlcv[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr_val = sum(trs[:period]) / period
+    atr[period] = atr_val
+    for i in range(period + 1, len(ohlcv)):
+        atr_val = (atr_val * (period - 1) + trs[i - 1]) / period
+        atr[i] = atr_val
+    return atr
+
+
+def _session_name(date_str: str) -> str:
+    try:
+        hour = int(date_str[11:13]) if len(date_str) > 13 else 0
+    except (ValueError, IndexError):
+        return "Unknown"
+    if 7 <= hour < 16:
+        return "London"
+    if 13 <= hour < 22:
+        return "New York"
+    if 0 <= hour < 8:
+        return "Tokyo"
+    return "Sydney"
+
+
+def _day_of_week(date_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(date_str[:10])
+        return dt.strftime("%A")
+    except ValueError:
+        return "Unknown"
+
+
+# ---------------------------------------------------------------------------
+# MTF helpers for simulation
+# ---------------------------------------------------------------------------
+
+def _build_mtf_bars_for_index(
+    i: int,
+    primary_ohlcv: list[dict],
+    extra_ohlcv_by_tf: dict[str, list[dict]],
+) -> dict:
+    """
+    Build per-timeframe DataFrames sliced up to bar index ``i`` in the
+    primary timeframe (1h by default). Used during backtesting for MTF strategies.
+
+    Returns dict: {"1d": DataFrame, "4h": DataFrame, "1h": DataFrame, "15m": DataFrame}
+
+    The primary OHLCV list is treated as the 1h frame. Higher/lower timeframes
+    are supplied via extra_ohlcv_by_tf and sliced by date up to the current bar's date.
+    """
+    import pandas as pd
+
+    current_date_str = primary_ohlcv[i].get("date", "")
+
+    def _list_to_df(ohlcv_list: list[dict], cutoff_date: str) -> pd.DataFrame:
+        filtered = [r for r in ohlcv_list if r.get("date", "") <= cutoff_date]
+        if not filtered:
+            return pd.DataFrame()
+        df = pd.DataFrame(filtered)
+        df["datetime"] = pd.to_datetime(df["date"])
+        df = df.set_index("datetime")
+        for col in ("open", "high", "low", "close", "volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["close"])
+
+    primary_df = _list_to_df(primary_ohlcv[: i + 1], current_date_str)
+
+    bars_by_tf: dict[str, "pd.DataFrame"] = {
+        "1h": primary_df,
+    }
+    for tf, ohlcv_list in extra_ohlcv_by_tf.items():
+        bars_by_tf[tf] = _list_to_df(ohlcv_list, current_date_str)
+
+    return bars_by_tf
+
+
+# ---------------------------------------------------------------------------
+# Core backtest function (subprocess-safe pure function)
+# ---------------------------------------------------------------------------
+
 def _run_backtest_sync(
     strategy_name: str,
     symbol: str,
@@ -207,16 +177,25 @@ def _run_backtest_sync(
     leverage: int,
     risk_per_trade_pct: float,
     ohlcv: list[dict],
+    adapt_every_n_trades: int = 20,
+    extra_ohlcv_by_tf: dict | None = None,
 ) -> dict:
-    """Pure function — runs in subprocess."""
+    """
+    Pure function — runs in subprocess. Returns metrics dict with extended report fields.
+
+    ``extra_ohlcv_by_tf`` is used for MTF strategies (e.g. Alchemist):
+      {"1d": [...], "4h": [...], "15m": [...]}
+    """
     if not ohlcv or len(ohlcv) < 30:
         return {"error": "Insufficient OHLCV data"}
 
     strat = get_strategy(strategy_name, params)
+    is_mtf_strategy = getattr(strat, "requires_mtf", False)
     closes = [r["close"] for r in ohlcv]
 
-    # Pre-compute indicators
+    # Pre-compute indicators (for non-MTF strategies)
     rsi_series = _compute_rsi(closes, int(params.get("rsi_period", 14)))
+    atr_series = _compute_atr(ohlcv, 14)
     ema_periods = [
         int(params.get("ema_1", 30)), int(params.get("ema_2", 35)),
         int(params.get("ema_3", 40)), int(params.get("ema_4", 45)),
@@ -227,67 +206,177 @@ def _run_backtest_sync(
     balance = initial_balance
     equity_curve = [{"date": ohlcv[0]["date"], "equity": balance}]
     trades: list[dict] = []
+    trade_log: list[dict] = []
     open_trade: dict | None = None
+    adaptation_events: list[dict] = []
+    current_params = dict(params)
 
-    for i in range(max(ema_periods[5], 30), len(ohlcv)):
+    drawdown_periods: list[dict] = []
+    in_drawdown = False
+    dd_start_date: str | None = None
+    dd_start_equity = balance
+    peak_equity = balance
+    trade_index = 0
+
+    start_idx = max(ema_periods[5], 30)
+
+    for i in range(start_idx, len(ohlcv)):
         bar = ohlcv[i]
         price = bar["close"]
+        bar_date = bar.get("date", str(i))
 
         if open_trade:
+            exit_reason = None
+            exit_price = None
             if open_trade["direction"] == "BUY":
                 if bar["low"] <= open_trade["sl"]:
-                    pnl = (open_trade["sl"] - open_trade["entry"]) * open_trade["lots"] * 100000
+                    exit_price = open_trade["sl"]
+                    exit_reason = "SL_HIT"
+                    pnl = (exit_price - open_trade["entry"]) * open_trade["lots"] * 100000
                     balance += pnl
-                    trades.append({**open_trade, "result": "LOSS", "pnl": round(pnl, 4), "exit": open_trade["sl"]})
+                    trades.append({**open_trade, "result": "LOSS", "pnl": round(pnl, 4), "exit": exit_price})
+                    open_trade["result"] = "LOSS"
+                    open_trade["exit_price"] = exit_price
+                    open_trade["pnl"] = round(pnl, 4)
+                    open_trade["exit_reason"] = exit_reason
+                    open_trade["closed_at"] = bar_date
+                    trade_log.append(_build_trade_log_entry(trade_index, open_trade, symbol, current_params))
                     open_trade = None
+                    trade_index += 1
                 elif bar["high"] >= open_trade["tp"]:
-                    pnl = (open_trade["tp"] - open_trade["entry"]) * open_trade["lots"] * 100000
+                    exit_price = open_trade["tp"]
+                    exit_reason = "TP1_HIT"
+                    pnl = (exit_price - open_trade["entry"]) * open_trade["lots"] * 100000
                     balance += pnl
-                    trades.append({**open_trade, "result": "WIN", "pnl": round(pnl, 4), "exit": open_trade["tp"]})
+                    trades.append({**open_trade, "result": "WIN", "pnl": round(pnl, 4), "exit": exit_price})
+                    open_trade["result"] = "WIN"
+                    open_trade["exit_price"] = exit_price
+                    open_trade["pnl"] = round(pnl, 4)
+                    open_trade["exit_reason"] = exit_reason
+                    open_trade["closed_at"] = bar_date
+                    trade_log.append(_build_trade_log_entry(trade_index, open_trade, symbol, current_params))
                     open_trade = None
-            else:
+                    trade_index += 1
+            else:  # SELL
                 if bar["high"] >= open_trade["sl"]:
-                    pnl = (open_trade["entry"] - open_trade["sl"]) * open_trade["lots"] * 100000
+                    exit_price = open_trade["sl"]
+                    exit_reason = "SL_HIT"
+                    pnl = (open_trade["entry"] - exit_price) * open_trade["lots"] * 100000
                     balance += pnl
-                    trades.append({**open_trade, "result": "LOSS", "pnl": round(pnl, 4), "exit": open_trade["sl"]})
+                    trades.append({**open_trade, "result": "LOSS", "pnl": round(pnl, 4), "exit": exit_price})
+                    open_trade["result"] = "LOSS"
+                    open_trade["exit_price"] = exit_price
+                    open_trade["pnl"] = round(pnl, 4)
+                    open_trade["exit_reason"] = exit_reason
+                    open_trade["closed_at"] = bar_date
+                    trade_log.append(_build_trade_log_entry(trade_index, open_trade, symbol, current_params))
                     open_trade = None
+                    trade_index += 1
                 elif bar["low"] <= open_trade["tp"]:
-                    pnl = (open_trade["entry"] - open_trade["tp"]) * open_trade["lots"] * 100000
+                    exit_price = open_trade["tp"]
+                    exit_reason = "TP1_HIT"
+                    pnl = (open_trade["entry"] - exit_price) * open_trade["lots"] * 100000
                     balance += pnl
-                    trades.append({**open_trade, "result": "WIN", "pnl": round(pnl, 4), "exit": open_trade["tp"]})
+                    trades.append({**open_trade, "result": "WIN", "pnl": round(pnl, 4), "exit": exit_price})
+                    open_trade["result"] = "WIN"
+                    open_trade["exit_price"] = exit_price
+                    open_trade["pnl"] = round(pnl, 4)
+                    open_trade["exit_reason"] = exit_reason
+                    open_trade["closed_at"] = bar_date
+                    trade_log.append(_build_trade_log_entry(trade_index, open_trade, symbol, current_params))
                     open_trade = None
+                    trade_index += 1
+
+        # Adaptive parameter update
+        if adapt_every_n_trades > 0 and len(trades) > 0 and len(trades) % adapt_every_n_trades == 0:
+            recent = trades[-adapt_every_n_trades:]
+            adaptation_events = _maybe_adapt(
+                strat, current_params, recent, initial_balance, len(trades), adaptation_events, bar_date
+            )
+
+        # Track drawdown
+        peak_equity = max(peak_equity, balance)
+        current_dd = peak_equity - balance
+        if current_dd > 0 and not in_drawdown:
+            in_drawdown = True
+            dd_start_date = bar_date
+            dd_start_equity = peak_equity
+        elif current_dd == 0 and in_drawdown:
+            in_drawdown = False
+            drawdown_periods.append({
+                "start_date": dd_start_date,
+                "end_date": bar_date,
+                "peak_equity": round(dd_start_equity, 2),
+                "trough_equity": round(balance, 2),
+                "drawdown_pct": round((dd_start_equity - balance) / dd_start_equity * 100, 2),
+            })
 
         if open_trade is not None:
-            equity_curve.append({"date": bar["date"], "equity": round(balance, 2)})
+            equity_curve.append({"date": bar_date, "equity": round(balance, 2)})
             continue
 
-        ema_vals = {f"ema_{j+1}": ema_series_list[j][i] for j in range(6)}
-        prev_ema_vals = {f"ema_{j+1}": ema_series_list[j][i - 1] for j in range(6)}
-        if any(v is None for v in ema_vals.values()):
-            equity_curve.append({"date": bar["date"], "equity": round(balance, 2)})
-            continue
+        # ── Build market_data for this bar ───────────────────────────────
+        if is_mtf_strategy and extra_ohlcv_by_tf:
+            bars_by_tf = _build_mtf_bars_for_index(i, ohlcv, extra_ohlcv_by_tf)
+            from .ohlcv import build_mtf_market_data
+            try:
+                bar_ts = datetime.fromisoformat(bar_date)
+            except ValueError:
+                bar_ts = datetime.utcnow()
 
-        prev_bull = all(
-            (prev_ema_vals.get(f"ema_{k}") or 0) > (prev_ema_vals.get(f"ema_{k+1}") or 0)
-            for k in range(1, 6)
-        )
-        prev_bear = all(
-            (prev_ema_vals.get(f"ema_{k}") or 0) < (prev_ema_vals.get(f"ema_{k+1}") or 0)
-            for k in range(1, 6)
-        )
+            atr_val = atr_series[i] or price * 0.005
+            market_data_bar = build_mtf_market_data(
+                symbol=symbol,
+                current_idx=-1,
+                bars_by_tf=bars_by_tf,
+                atr=atr_val,
+            )
+            market_data_bar["timestamp"] = bar_ts
+            market_data_bar["current_price"] = price
 
-        market_data = {
-            "price": price,
-            "ema_values": ema_vals,
-            "previous_bull": prev_bull,
-            "previous_bear": prev_bear,
-            "rsi": rsi_series[i],
-            "prev_rsi": rsi_series[i - 1],
-        }
+            raw_sig = strat.signal(market_data_bar)
+            if isinstance(raw_sig, tuple):
+                signal, _conf = raw_sig
+            else:
+                signal = raw_sig
 
-        signal = strat.signal(market_data)
-        if signal:
-            levels = strat.compute_levels(signal, price, params)
+            if signal:
+                levels = strat.compute_levels(signal, price, current_params)
+            else:
+                levels = {}
+        else:
+            # Standard non-MTF path
+            ema_vals = {f"ema_{j+1}": ema_series_list[j][i] for j in range(6)}
+            prev_ema_vals = {f"ema_{j+1}": ema_series_list[j][i - 1] for j in range(6)}
+            if any(v is None for v in ema_vals.values()):
+                equity_curve.append({"date": bar_date, "equity": round(balance, 2)})
+                continue
+
+            prev_bull = all(
+                (prev_ema_vals.get(f"ema_{k}") or 0) > (prev_ema_vals.get(f"ema_{k+1}") or 0)
+                for k in range(1, 6)
+            )
+            prev_bear = all(
+                (prev_ema_vals.get(f"ema_{k}") or 0) < (prev_ema_vals.get(f"ema_{k+1}") or 0)
+                for k in range(1, 6)
+            )
+
+            market_data_bar = {
+                "price": price,
+                "ema_values": ema_vals,
+                "previous_bull": prev_bull,
+                "previous_bear": prev_bear,
+                "rsi": rsi_series[i],
+                "prev_rsi": rsi_series[i - 1],
+            }
+
+            signal = strat.signal(market_data_bar)
+            if signal:
+                levels = strat.compute_levels(signal, price, current_params)
+            else:
+                levels = {}
+
+        if signal and levels:
             risk_amount = balance * (risk_per_trade_pct / 100)
             sl_dist = abs(price - levels["sl"])
             lots = min(round(risk_amount / (sl_dist * 100000), 2), 10.0) if sl_dist > 0 else 0.01
@@ -298,10 +387,31 @@ def _run_backtest_sync(
                 "tp": levels["tp1"],
                 "direction": signal,
                 "lots": lots,
-                "date": bar["date"],
+                "date": bar_date,
+                "opened_at": bar_date,
+                "atr_at_entry": atr_series[i],
+                "params_snapshot": dict(current_params),
             }
 
-        equity_curve.append({"date": bar["date"], "equity": round(balance, 2)})
+        equity_curve.append({"date": bar_date, "equity": round(balance, 2)})
+
+    # Close any remaining open trade at last bar price
+    if open_trade:
+        last_bar = ohlcv[-1]
+        last_price = last_bar["close"]
+        if open_trade["direction"] == "BUY":
+            pnl = (last_price - open_trade["entry"]) * open_trade["lots"] * 100000
+        else:
+            pnl = (open_trade["entry"] - last_price) * open_trade["lots"] * 100000
+        result = "WIN" if pnl > 0 else "LOSS"
+        trades.append({**open_trade, "result": result, "pnl": round(pnl, 4), "exit": last_price})
+        open_trade["result"] = result
+        open_trade["exit_price"] = last_price
+        open_trade["pnl"] = round(pnl, 4)
+        open_trade["exit_reason"] = "EOD_CLOSE"
+        open_trade["closed_at"] = last_bar.get("date", "")
+        trade_log.append(_build_trade_log_entry(trade_index, open_trade, symbol, current_params))
+        balance += pnl
 
     # ── Compute metrics ────────────────────────────────────────────────────────
     wins = [t for t in trades if t["result"] == "WIN"]
@@ -310,7 +420,6 @@ def _run_backtest_sync(
     gross_loss = abs(sum(t["pnl"] for t in losses)) or 1e-9
     profit_factor = gross_profit / gross_loss
 
-    # Sharpe / Sortino / Calmar
     returns = [t["pnl"] / initial_balance for t in trades]
     avg_ret = sum(returns) / len(returns) if returns else 0
     std_ret = math.sqrt(sum((r - avg_ret) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0
@@ -332,24 +441,22 @@ def _run_backtest_sync(
     total_return_pct = ((balance - initial_balance) / initial_balance) * 100
     calmar = (total_return_pct / max_dd_pct) if max_dd_pct > 0 else 0
 
-    # Expectancy
     win_rate = len(wins) / len(trades) if trades else 0
     avg_win = gross_profit / len(wins) if wins else 0
     avg_loss_val = (gross_loss / len(losses)) if losses else 0
     expectancy = win_rate * avg_win - (1 - win_rate) * avg_loss_val
 
-    # Consecutive
     max_consec_wins = max_consec_losses = 0
     cur_wins = cur_losses = 0
     for t in trades:
         if t["result"] == "WIN":
-            cur_wins += 1
-            cur_losses = 0
+            cur_wins += 1; cur_losses = 0
         else:
-            cur_losses += 1
-            cur_wins = 0
+            cur_losses += 1; cur_wins = 0
         max_consec_wins = max(max_consec_wins, cur_wins)
         max_consec_losses = max(max_consec_losses, cur_losses)
+
+    monthly_breakdown = _compute_monthly_breakdown(trades)
 
     return {
         "total_trades": len(trades),
@@ -359,6 +466,7 @@ def _run_backtest_sync(
         "profit_factor": round(profit_factor, 3),
         "total_pnl": round(balance - initial_balance, 4),
         "total_return_pct": round(total_return_pct, 2),
+        "roi_pct": round(total_return_pct, 2),
         "max_drawdown": round(max_dd, 4),
         "max_drawdown_pct": round(max_dd_pct, 2),
         "sharpe_ratio": round(sharpe, 3),
@@ -373,8 +481,178 @@ def _run_backtest_sync(
         "consecutive_losses": max_consec_losses,
         "final_balance": round(balance, 2),
         "equity_curve": equity_curve,
+        "trade_log": trade_log,
+        "monthly_breakdown": monthly_breakdown,
+        "parameter_evolution_log": {"adaptation_events": adaptation_events},
+        "drawdown_periods": drawdown_periods,
     }
 
+
+def _build_trade_log_entry(
+    trade_index: int,
+    trade: dict,
+    symbol: str,
+    params: dict,
+) -> dict:
+    opened_at = trade.get("opened_at") or trade.get("date", "")
+    closed_at = trade.get("closed_at", "")
+    duration_minutes = None
+    try:
+        if opened_at and closed_at:
+            opened_dt = datetime.fromisoformat(opened_at[:19].replace("T", " ").replace("Z", ""))
+            closed_dt = datetime.fromisoformat(closed_at[:19].replace("T", " ").replace("Z", ""))
+            duration_minutes = round((closed_dt - opened_dt).total_seconds() / 60, 1)
+    except (ValueError, TypeError):
+        pass
+
+    return {
+        "trade_index": trade_index + 1,
+        "opened_at": opened_at,
+        "closed_at": closed_at,
+        "symbol": symbol,
+        "direction": trade.get("direction"),
+        "entry_price": trade.get("entry"),
+        "exit_price": trade.get("exit_price") or trade.get("exit"),
+        "stop_loss": trade.get("sl"),
+        "take_profit_1": trade.get("tp"),
+        "lot_size": trade.get("lots", 0.01),
+        "pnl": trade.get("pnl"),
+        "result": trade.get("result"),
+        "exit_reason": trade.get("exit_reason"),
+        "duration_minutes": duration_minutes,
+        "atr_at_entry": trade.get("atr_at_entry"),
+        "params_version_at_open": None,
+        "strategy_signals": [],
+        "news_bias_at_open": None,
+        "market_context": {
+            "session": _session_name(opened_at),
+            "day_of_week": _day_of_week(opened_at),
+            "was_high_volatility": False,
+        },
+    }
+
+
+def _compute_monthly_breakdown(trades: list[dict]) -> dict:
+    breakdown: dict[str, dict] = {}
+    for t in trades:
+        date_str = t.get("date") or t.get("opened_at") or ""
+        try:
+            month_key = date_str[:7]
+        except Exception:
+            continue
+        if not month_key or len(month_key) < 7:
+            continue
+        if month_key not in breakdown:
+            breakdown[month_key] = {"wins": 0, "losses": 0, "pnl": 0.0}
+        if t.get("result") == "WIN":
+            breakdown[month_key]["wins"] += 1
+        else:
+            breakdown[month_key]["losses"] += 1
+        breakdown[month_key]["pnl"] = round(breakdown[month_key]["pnl"] + (t.get("pnl") or 0), 4)
+    return breakdown
+
+
+def _maybe_adapt(
+    strat,
+    current_params: dict,
+    recent_trades: list[dict],
+    initial_balance: float,
+    trade_count: int,
+    adaptation_events: list[dict],
+    timestamp: str,
+) -> list[dict]:
+    if not hasattr(strat, "adapt"):
+        return adaptation_events
+
+    wins = [t for t in recent_trades if t.get("result") == "WIN"]
+    losses = [t for t in recent_trades if t.get("result") == "LOSS"]
+    win_rate = len(wins) / len(recent_trades) if recent_trades else 0
+    gross_profit = sum(t.get("pnl", 0) for t in wins)
+    gross_loss = abs(sum(t.get("pnl", 0) for t in losses)) or 1e-9
+    profit_factor = gross_profit / gross_loss
+
+    old_params = dict(current_params)
+    composite_before = _compute_composite_score(win_rate * 100, profit_factor)
+
+    try:
+        new_params = strat.adapt(current_params, recent_trades)
+        if new_params:
+            deltas = {
+                k: round(new_params[k] - old_params.get(k, 0), 6)
+                for k in new_params
+                if k in old_params and new_params[k] != old_params.get(k)
+            }
+            current_params.update(new_params)
+            composite_after = _compute_composite_score(win_rate * 100, profit_factor)
+            adaptation_events.append({
+                "after_trade_index": trade_count,
+                "timestamp": timestamp,
+                "win_rate_at_time": round(win_rate, 4),
+                "profit_factor_at_time": round(profit_factor, 4),
+                "old_params": old_params,
+                "new_params": dict(new_params),
+                "param_deltas": deltas,
+                "composite_score_before": round(composite_before, 4),
+                "composite_score_after": round(composite_after, 4),
+            })
+    except Exception as e:
+        logger.debug("Strategy adapt() raised: %s", e)
+
+    return adaptation_events
+
+
+def _compute_composite_score(win_rate_pct: float, profit_factor: float) -> float:
+    wr_norm = min(win_rate_pct / 100.0, 1.0)
+    pf_norm = min(profit_factor / 3.0, 1.0)
+    return 0.6 * wr_norm + 0.4 * pf_norm
+
+
+# ---------------------------------------------------------------------------
+# Standalone sync function for ProcessPoolExecutor
+# ---------------------------------------------------------------------------
+
+def run_backtest_sync_standalone(
+    strategy_name: str,
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    params: dict,
+    initial_balance: float = 10000,
+    leverage: int = 100,
+    risk_per_trade_pct: float = 1.0,
+    timeframe: str = "1d",
+) -> dict:
+    """
+    Standalone sync function suitable for ProcessPoolExecutor.
+    Fetches its own OHLCV (sync only — yfinance + Alpha Vantage).
+    Returns metrics dict; does NOT write to DB.
+    """
+    from .ohlcv import fetch_yfinance, df_to_ohlcv_list
+
+    ohlcv: list[dict] = []
+
+    try:
+        df = fetch_yfinance(symbol, from_date, to_date, timeframe)
+        ohlcv = df_to_ohlcv_list(df)
+    except Exception as exc:
+        logger.warning("run_backtest_sync_standalone yfinance failed for %s: %s", symbol, exc)
+
+    if not ohlcv:
+        return {"error": f"No OHLCV data for {symbol} {from_date}–{to_date}"}
+
+    result = _run_backtest_sync(
+        strategy_name, symbol, from_date, to_date,
+        params, initial_balance, leverage, risk_per_trade_pct, ohlcv,
+    )
+    result.pop("equity_curve", None)
+    result.pop("trade_log", None)
+    result.pop("drawdown_periods", None)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Single-run DB-backed backtest
+# ---------------------------------------------------------------------------
 
 def run_backtest(
     db: Session,
@@ -386,8 +664,16 @@ def run_backtest(
     initial_balance: float = 10000,
     leverage: int = 100,
     risk_per_trade_pct: float = 1.0,
+    batch_id: str | None = None,
 ) -> int:
-    """Create a backtest record and kick off async execution. Returns backtest ID."""
+    """
+    Create a backtest record and run synchronously.
+    Returns backtest ID.
+    """
+    from .ohlcv import fetch_yfinance, fetch_alpha_vantage, df_to_ohlcv_list
+
+    adapt_every_n = int(crud.get_setting(db, "backtest_adapt_every_n_trades") or "20")
+
     # Try cache first
     cached = db.query(OHLCVCache).filter(
         OHLCVCache.symbol == symbol,
@@ -395,11 +681,28 @@ def run_backtest(
         OHLCVCache.to_date == to_date,
     ).first()
 
+    ohlcv: list[dict] = []
+    data_source = "cache"
+
     if cached:
         ohlcv = json.loads(cached.data_json)
     else:
-        alphavantage_key = crud.get_setting(db, "alphavantage_key") or ""
-        ohlcv = _fetch_ohlcv(symbol, from_date, to_date, alphavantage_key=alphavantage_key)
+        try:
+            df = fetch_yfinance(symbol, from_date, to_date, "1d")
+            ohlcv = df_to_ohlcv_list(df)
+            data_source = "yfinance"
+        except Exception as exc:
+            logger.warning("Backtest yfinance failed for %s: %s", symbol, exc)
+
+        if not ohlcv:
+            try:
+                av_key = crud.get_setting(db, "alphavantage_key") or ""
+                df = fetch_alpha_vantage(symbol, from_date, to_date, "1d", api_key=av_key)
+                ohlcv = df_to_ohlcv_list(df)
+                data_source = "alpha_vantage"
+            except Exception as exc:
+                logger.warning("Backtest Alpha Vantage failed for %s: %s", symbol, exc)
+
         if ohlcv:
             cache_row = OHLCVCache(
                 symbol=symbol,
@@ -407,9 +710,21 @@ def run_backtest(
                 from_date=from_date,
                 to_date=to_date,
                 data_json=json.dumps(ohlcv),
+                source=data_source,
             )
             db.add(cache_row)
             db.commit()
+
+    # For MTF strategies, fetch extra timeframes (sync, best-effort)
+    extra_ohlcv_by_tf: dict[str, list[dict]] = {}
+    strat_check = get_strategy(strategy_name, params)
+    if getattr(strat_check, "requires_mtf", False):
+        for tf in ("1d", "4h", "15m"):
+            try:
+                df_tf = fetch_yfinance(symbol, from_date, to_date, tf)
+                extra_ohlcv_by_tf[tf] = df_to_ohlcv_list(df_tf)
+            except Exception as exc:
+                logger.warning("MTF backtest fetch failed for %s %s: %s", symbol, tf, exc)
 
     result_row = BacktestResult(
         strategy_name=strategy_name,
@@ -421,6 +736,7 @@ def run_backtest(
         leverage=leverage,
         risk_per_trade_pct=risk_per_trade_pct,
         status="RUNNING" if ohlcv else "FAILED",
+        batch_id=batch_id,
     )
     db.add(result_row)
     db.commit()
@@ -432,20 +748,439 @@ def run_backtest(
         db.commit()
         return result_row.id
 
-    # Run synchronously (in a real deployment this would use executor)
     try:
         metrics = _run_backtest_sync(
             strategy_name, symbol, from_date, to_date,
             params, initial_balance, leverage, risk_per_trade_pct, ohlcv,
+            adapt_every_n_trades=adapt_every_n,
+            extra_ohlcv_by_tf=extra_ohlcv_by_tf or None,
         )
         equity_curve = metrics.pop("equity_curve", [])
+        trade_log = metrics.pop("trade_log", [])
+        monthly_breakdown = metrics.pop("monthly_breakdown", {})
+        parameter_evolution_log = metrics.pop("parameter_evolution_log", {})
+        drawdown_periods = metrics.pop("drawdown_periods", [])
+
         result_row.metrics_json = json.dumps(metrics)
         result_row.equity_curve_json = json.dumps(equity_curve)
+        result_row.trade_log_json = trade_log
+        result_row.monthly_breakdown_json = monthly_breakdown
+        result_row.parameter_evolution_log_json = parameter_evolution_log
+        result_row.drawdown_periods_json = drawdown_periods
         result_row.status = "COMPLETED"
         result_row.completed_at = datetime.utcnow()
-    except Exception as e:
-        result_row.metrics_json = json.dumps({"error": str(e)})
+    except Exception as exc:
+        logger.exception("Backtest run failed for %s/%s", strategy_name, symbol)
+        result_row.metrics_json = json.dumps({"error": str(exc)})
         result_row.status = "FAILED"
 
     db.commit()
     return result_row.id
+
+
+# ---------------------------------------------------------------------------
+# Batch orchestration
+# ---------------------------------------------------------------------------
+
+async def run_batch_backtest(
+    db: Session,
+    batch_id: str,
+    runs: list[dict],
+    shared_settings: dict,
+    executor: ProcessPoolExecutor,
+) -> None:
+    """
+    Background coroutine: runs all backtest jobs concurrently, then computes
+    cross-analysis and pair analysis. Updates BacktestBatch record on completion.
+    """
+    loop = asyncio.get_event_loop()
+    result_ids: list[int] = []
+    failures: list[str] = []
+
+    futures = []
+    for run in runs:
+        futures.append(
+            loop.run_in_executor(
+                executor,
+                run_backtest_sync_standalone,
+                run["strategy_name"],
+                run["symbol"],
+                run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
+                run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
+                run.get("params", {}),
+                float(run.get("initial_balance", 10000)),
+                int(run.get("leverage", 100)),
+                float(run.get("risk_per_trade_pct", 1.0)),
+                "1d",
+            )
+        )
+
+    raw_results = await asyncio.gather(*futures, return_exceptions=True)
+
+    from ..db import SessionLocal
+    for run, result in zip(runs, raw_results):
+        per_db = SessionLocal()
+        try:
+            if isinstance(result, Exception):
+                error_msg = str(result)
+                failures.append(f"{run['strategy_name']}: {error_msg}")
+                result_row = BacktestResult(
+                    strategy_name=run["strategy_name"],
+                    symbol=run.get("symbol", "XAUUSD"),
+                    from_date=run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
+                    to_date=run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
+                    params_json=json.dumps(run.get("params", {})),
+                    initial_balance=float(run.get("initial_balance", 10000)),
+                    leverage=int(run.get("leverage", 100)),
+                    risk_per_trade_pct=float(run.get("risk_per_trade_pct", 1.0)),
+                    metrics_json=json.dumps({"error": error_msg}),
+                    status="FAILED",
+                    batch_id=batch_id,
+                )
+                per_db.add(result_row)
+                per_db.commit()
+                per_db.refresh(result_row)
+                result_ids.append(result_row.id)
+            else:
+                result_row = BacktestResult(
+                    strategy_name=run["strategy_name"],
+                    symbol=run.get("symbol", "XAUUSD"),
+                    from_date=run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
+                    to_date=run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
+                    params_json=json.dumps(run.get("params", {})),
+                    initial_balance=float(run.get("initial_balance", 10000)),
+                    leverage=int(run.get("leverage", 100)),
+                    risk_per_trade_pct=float(run.get("risk_per_trade_pct", 1.0)),
+                    metrics_json=json.dumps({
+                        k: v for k, v in result.items()
+                        if k not in ("equity_curve", "trade_log", "drawdown_periods")
+                    }),
+                    equity_curve_json=json.dumps(result.get("equity_curve", [])),
+                    trade_log_json=result.get("trade_log"),
+                    monthly_breakdown_json=result.get("monthly_breakdown"),
+                    parameter_evolution_log_json=result.get("parameter_evolution_log"),
+                    drawdown_periods_json=result.get("drawdown_periods"),
+                    status="COMPLETED",
+                    completed_at=datetime.utcnow(),
+                    batch_id=batch_id,
+                )
+                per_db.add(result_row)
+                per_db.commit()
+                per_db.refresh(result_row)
+                result_ids.append(result_row.id)
+        except Exception as e:
+            logger.exception("Failed to persist batch result for %s", run.get("strategy_name"))
+            failures.append(f"{run['strategy_name']}: persistence error {e}")
+        finally:
+            per_db.close()
+
+    analysis_db = SessionLocal()
+    try:
+        bt_results = crud.get_backtest_results_for_batch(analysis_db, batch_id)
+        cross_analysis = _compute_cross_analysis(bt_results)
+        await _compute_pair_analyses(analysis_db, batch_id, bt_results)
+        final_status = "PARTIAL_FAILURE" if failures else "COMPLETE"
+        crud.update_backtest_batch(analysis_db, batch_id, final_status, cross_analysis)
+        logger.info("Batch %s completed with status %s", batch_id, final_status)
+    except Exception as e:
+        logger.exception("Batch post-processing failed for batch %s", batch_id)
+        crud.update_backtest_batch(analysis_db, batch_id, "PARTIAL_FAILURE", {})
+    finally:
+        analysis_db.close()
+
+
+def _compute_cross_analysis(bt_results: list[BacktestResult]) -> dict:
+    if not bt_results:
+        return {}
+
+    scored: list[dict] = []
+    for r in bt_results:
+        try:
+            metrics = json.loads(r.metrics_json or "{}")
+            wr = metrics.get("win_rate", 0)
+            roi = metrics.get("roi_pct", 0)
+            pf = metrics.get("profit_factor", 1)
+            composite = _compute_composite_score(wr, pf)
+            scored.append({
+                "strategy_name": r.strategy_name,
+                "composite_score": round(composite, 4),
+                "win_rate": round(wr / 100, 4),
+                "roi_pct": round(roi, 2),
+                "profit_factor": round(pf, 3),
+                "result_id": r.id,
+                "trade_log": r.trade_log_json or [],
+            })
+        except Exception:
+            continue
+
+    ranked = sorted(scored, key=lambda x: x["composite_score"], reverse=True)
+
+    correlation_matrix: dict[str, dict[str, float]] = {}
+    for s in scored:
+        correlation_matrix[s["strategy_name"]] = {}
+
+    for s1, s2 in combinations(scored, 2):
+        corr = _compute_trade_correlation(s1["trade_log"], s2["trade_log"])
+        correlation_matrix[s1["strategy_name"]][s2["strategy_name"]] = round(corr, 3)
+        correlation_matrix[s2["strategy_name"]][s1["strategy_name"]] = round(corr, 3)
+
+    best_wr = max((s["win_rate"] for s in scored), default=0)
+    complementary_pairs: list[dict] = []
+    for s1, s2 in combinations(scored, 2):
+        corr = correlation_matrix.get(s1["strategy_name"], {}).get(s2["strategy_name"], 1.0)
+        combined_wr = (s1["win_rate"] + s2["win_rate"]) / 2
+        if corr < 0.35 and combined_wr > best_wr:
+            complementary_pairs.append({
+                "pair": [s1["strategy_name"], s2["strategy_name"]],
+                "combined_win_rate": round(combined_wr, 4),
+                "correlation": round(corr, 3),
+            })
+
+    dominant = ranked[0]["strategy_name"] if ranked else None
+
+    for s in ranked:
+        s.pop("trade_log", None)
+        s.pop("result_id", None)
+
+    return {
+        "ranked_by_composite_score": ranked,
+        "correlation_matrix": correlation_matrix,
+        "complementary_pairs": complementary_pairs,
+        "dominant_strategy": dominant,
+        "ensemble_simulation": {},
+    }
+
+
+def _compute_trade_correlation(trades_a: list[dict], trades_b: list[dict]) -> float:
+    if not trades_a or not trades_b:
+        return 0.0
+
+    def parse_date(d: str | None) -> datetime | None:
+        if not d:
+            return None
+        try:
+            return datetime.fromisoformat(d[:10])
+        except ValueError:
+            return None
+
+    windows_b: list[tuple[datetime, datetime]] = []
+    for t in trades_b:
+        o = parse_date(t.get("opened_at") or t.get("date"))
+        c = parse_date(t.get("closed_at"))
+        if o and c and c > o:
+            windows_b.append((o, c))
+
+    if not windows_b:
+        return 0.0
+
+    overlap_count = 0
+    for t in trades_a:
+        o = parse_date(t.get("opened_at") or t.get("date"))
+        c = parse_date(t.get("closed_at"))
+        if not (o and c and c > o):
+            continue
+        for wb_o, wb_c in windows_b:
+            if o <= wb_c and c >= wb_o:
+                overlap_count += 1
+                break
+
+    return overlap_count / len(trades_a) if trades_a else 0.0
+
+
+async def _compute_pair_analyses(
+    db: Session,
+    batch_id: str,
+    bt_results: list[BacktestResult],
+) -> None:
+    if len(bt_results) < 2:
+        return
+
+    result_map: dict[str, BacktestResult] = {r.strategy_name: r for r in bt_results}
+    scored_map: dict[str, float] = {}
+    for r in bt_results:
+        try:
+            metrics = json.loads(r.metrics_json or "{}")
+            wr = metrics.get("win_rate", 0)
+            pf = metrics.get("profit_factor", 1)
+            scored_map[r.strategy_name] = _compute_composite_score(wr, pf)
+        except Exception:
+            scored_map[r.strategy_name] = 0.0
+
+    anthropic_key = crud.get_setting(db, "anthropic_api_key") or ""
+
+    strategy_names = list(result_map.keys())
+    combo_sizes = [2]
+    if len(strategy_names) <= 5:
+        combo_sizes.append(3)
+
+    for size in combo_sizes:
+        combo_type = "pair" if size == 2 else "triple"
+        for combo in combinations(strategy_names, size):
+            combo_list = list(combo)
+            results_for_combo = [result_map[n] for n in combo_list]
+
+            pair_metrics = _simulate_pair_ensemble(results_for_combo)
+            individual_scores = {n: round(scored_map.get(n, 0.0), 4) for n in combo_list}
+            max_individual = max(individual_scores.values()) if individual_scores else 0.0
+            synergy = (
+                round(pair_metrics["combined_composite_score"] / max_individual, 4)
+                if max_individual > 0 else 0.0
+            )
+            recommended = synergy > 1.05
+
+            analysis_json = None
+            if anthropic_key:
+                try:
+                    analysis_json = await _fetch_claude_narrative(
+                        anthropic_key, combo_list, pair_metrics, individual_scores
+                    )
+                except Exception as e:
+                    logger.warning("Claude narrative failed for %s: %s", combo_list, e)
+
+            row = StrategyPairAnalysis(
+                batch_id=batch_id,
+                strategy_names_json=combo_list,
+                combination_type=combo_type,
+                combined_win_rate=pair_metrics.get("combined_win_rate"),
+                combined_roi_pct=pair_metrics.get("combined_roi_pct"),
+                combined_profit_factor=pair_metrics.get("combined_profit_factor"),
+                combined_composite_score=pair_metrics.get("combined_composite_score"),
+                individual_scores_json=individual_scores,
+                agreement_rate=pair_metrics.get("agreement_rate"),
+                disagreement_win_rate=pair_metrics.get("disagreement_win_rate"),
+                correlation=pair_metrics.get("correlation"),
+                synergy_score=synergy,
+                recommended=recommended,
+                analysis_json=analysis_json,
+                computed_at=datetime.utcnow(),
+            )
+            crud.create_pair_analysis(db, row)
+
+
+def _simulate_pair_ensemble(results: list[BacktestResult]) -> dict:
+    all_metrics = []
+    all_trade_logs = []
+    for r in results:
+        try:
+            m = json.loads(r.metrics_json or "{}")
+            all_metrics.append(m)
+            all_trade_logs.append(r.trade_log_json or [])
+        except Exception:
+            continue
+
+    if not all_metrics:
+        return {
+            "combined_win_rate": None,
+            "combined_roi_pct": None,
+            "combined_profit_factor": None,
+            "combined_composite_score": None,
+            "agreement_rate": None,
+            "disagreement_win_rate": None,
+            "correlation": None,
+        }
+
+    combined_wr = sum(m.get("win_rate", 0) / 100 for m in all_metrics) / len(all_metrics)
+    combined_roi = sum(m.get("roi_pct", 0) for m in all_metrics) / len(all_metrics)
+    combined_pf = sum(m.get("profit_factor", 1) for m in all_metrics) / len(all_metrics)
+    combined_composite = _compute_composite_score(combined_wr * 100, combined_pf)
+
+    agreement_rate = None
+    disagreement_win_rate = None
+    if len(all_trade_logs) == 2:
+        logs_a, logs_b = all_trade_logs[0], all_trade_logs[1]
+        if logs_a and logs_b:
+            agree = 0
+            disagree_wins = 0
+            disagree_total = 0
+            for ta in logs_a:
+                for tb in logs_b:
+                    ta_open = (ta.get("opened_at") or ta.get("date") or "")[:10]
+                    tb_open = (tb.get("opened_at") or tb.get("date") or "")[:10]
+                    if ta_open and ta_open == tb_open:
+                        if ta.get("direction") == tb.get("direction"):
+                            agree += 1
+                        else:
+                            disagree_total += 1
+                            if ta.get("result") == "WIN" or tb.get("result") == "WIN":
+                                disagree_wins += 1
+                        break
+            total_matched = agree + disagree_total
+            if total_matched > 0:
+                agreement_rate = round(agree / total_matched, 4)
+                disagreement_win_rate = round(disagree_wins / disagree_total, 4) if disagree_total > 0 else 0.0
+
+    if len(all_trade_logs) == 2:
+        corr = _compute_trade_correlation(all_trade_logs[0], all_trade_logs[1])
+    else:
+        pairs = list(combinations(range(len(all_trade_logs)), 2))
+        if pairs:
+            corr = sum(
+                _compute_trade_correlation(all_trade_logs[a], all_trade_logs[b])
+                for a, b in pairs
+            ) / len(pairs)
+        else:
+            corr = 0.0
+
+    return {
+        "combined_win_rate": round(combined_wr, 4),
+        "combined_roi_pct": round(combined_roi, 2),
+        "combined_profit_factor": round(combined_pf, 3),
+        "combined_composite_score": round(combined_composite, 4),
+        "agreement_rate": agreement_rate,
+        "disagreement_win_rate": disagreement_win_rate,
+        "correlation": round(corr, 3),
+    }
+
+
+async def _fetch_claude_narrative(
+    api_key: str,
+    strategy_names: list[str],
+    pair_metrics: dict,
+    individual_scores: dict[str, float],
+) -> dict | None:
+    try:
+        from tenacity import retry, stop_after_attempt, wait_exponential
+
+        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+        async def _call() -> dict:
+            system_prompt = (
+                "You are a quantitative trading analyst. Given performance metrics for individual "
+                "strategies and their combination, provide a concise analysis explaining: "
+                "(1) why this pair works well or poorly together, "
+                "(2) what market conditions favour this combination, "
+                "(3) one specific risk to watch for. "
+                'Respond ONLY in JSON: {"narrative": "...", "works_well_when": "...", "watch_out_for": "..."}'
+            )
+            user_prompt = (
+                f"Strategies: {strategy_names}\n"
+                f"Combined win rate: {pair_metrics.get('combined_win_rate')}\n"
+                f"Combined ROI: {pair_metrics.get('combined_roi_pct')}\n"
+                f"Synergy score: {pair_metrics.get('synergy_score')}\n"
+                f"Agreement rate: {pair_metrics.get('agreement_rate')}\n"
+                f"Individual scores: {individual_scores}"
+            )
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 1000,
+                        "system": system_prompt,
+                        "messages": [{"role": "user", "content": user_prompt}],
+                    },
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["content"][0]["text"] if data.get("content") else ""
+            text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            return json.loads(text)
+
+        return await _call()
+    except Exception as e:
+        logger.warning("Claude narrative call failed: %s", e)
+        return None

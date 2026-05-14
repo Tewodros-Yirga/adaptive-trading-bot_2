@@ -21,6 +21,16 @@ class VWAPReversionStrategy(BaseStrategy):
     display_name = "VWAP Reversion"
     description = "Mean-reversion entries based on price deviation from VWAP."
 
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "vwap_deviation_pct": (0.05, 2.0),
+        "reversion_strength": (0.1, 3.0),
+        "stop_loss_pct": (0.05, 1.0),
+        "tp1_multiplier": (0.5, 6.0),
+        "tp2_multiplier": (0.5, 6.0),
+        "tp3_multiplier": (0.5, 6.0),
+        "tp4_multiplier": (0.5, 6.0),
+    }
+
     @classmethod
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()

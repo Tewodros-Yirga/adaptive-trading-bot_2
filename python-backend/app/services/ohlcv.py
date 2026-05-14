@@ -1,0 +1,604 @@
+"""
+app/services/ohlcv.py — Shared OHLCV Data Fetching Layer
+
+All OHLCV fetching logic lives here. The backtester and continuous backtest service
+both import from this module. Provides a 4-source fallback chain:
+  1. yfinance
+  2. Alpha Vantage
+  3. Twelve Data
+  4. OANDA (forex only)
+
+Also provides:
+  - build_mtf_market_data() — assembles the multi-timeframe market_data dict
+    expected by requires_mtf strategies (e.g. Alchemist).
+"""
+import logging
+from datetime import datetime, timedelta
+
+import httpx
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+YF_SYMBOL_MAP = {
+    "XAUUSD": "GC=F",
+    "XAGUSD": "SI=F",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "USDCAD": "CAD=X",
+    "AUDUSD": "AUDUSD=X",
+    "NZDUSD": "NZDUSD=X",
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+    "US30": "^DJI",
+    "NAS100": "^NDX",
+    "SPX500": "^GSPC",
+}
+
+TIMEFRAME_MAP_YF = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "4h": "1h",   # resample 4h from 1h
+    "1d": "1d",
+    "1w": "1wk",
+}
+
+AV_FX_PAIRS = {
+    "EURUSD": ("EUR", "USD"),
+    "GBPUSD": ("GBP", "USD"),
+    "USDJPY": ("USD", "JPY"),
+    "USDCAD": ("USD", "CAD"),
+    "AUDUSD": ("AUD", "USD"),
+    "NZDUSD": ("NZD", "USD"),
+    "XAUUSD": ("XAU", "USD"),
+    "XAGUSD": ("XAG", "USD"),
+}
+
+OANDA_SUPPORTED = {"EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD"}
+
+OANDA_TIMEFRAME_MAP = {
+    "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
+    "1h": "H1", "4h": "H4", "1d": "D", "1w": "W",
+}
+
+# Minimum bar counts required per timeframe for MTF strategies
+MTF_MIN_BARS: dict[str, int] = {
+    "1d":  30,
+    "4h":  100,
+    "1h":  100,
+    "15m": 100,
+}
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Strip broker-specific suffixes."""
+    s = symbol.upper().rstrip("M").rstrip(".")
+    for suffix in (".PRO", ".RAW", ".STD", ".ECN"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Source 1: yfinance
+# ---------------------------------------------------------------------------
+
+def fetch_yfinance(symbol: str, from_date: str, to_date: str, timeframe: str = "1h") -> pd.DataFrame:
+    """Fetch OHLCV from yfinance with MultiIndex fix and 4h resampling."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise ValueError("yfinance is not installed")
+
+    norm = _normalize_symbol(symbol)
+    yf_symbol = YF_SYMBOL_MAP.get(norm, norm)
+    yf_interval = TIMEFRAME_MAP_YF.get(timeframe, "1h")
+
+    import time as _time
+    max_retries = 3
+    df = None
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(
+                yf_symbol,
+                start=from_date,
+                end=to_date,
+                interval=yf_interval,
+                auto_adjust=True,
+                progress=False,
+            )
+            if df is not None and not df.empty:
+                break
+            logger.warning("yfinance returned empty data for %s (attempt %d)", yf_symbol, attempt + 1)
+        except Exception as exc:
+            err = str(exc).lower()
+            if "rate" in err or "too many" in err:
+                delay = 2 ** (attempt + 1)
+                logger.warning("yfinance rate limited for %s, retrying in %ds", yf_symbol, delay)
+                _time.sleep(delay)
+            else:
+                raise
+
+    if df is None or df.empty:
+        raise ValueError(f"yfinance returned empty DataFrame for {symbol} ({yf_symbol})")
+
+    # FIX 1: Flatten MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0].lower() for col in df.columns]
+    else:
+        df.columns = [c.lower() for c in df.columns]
+
+    # FIX 2: Ensure scalar float series
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].squeeze(), errors="coerce")
+
+    df = df.dropna(subset=["open", "high", "low", "close"])
+
+    # Resample 1h → 4h
+    if timeframe == "4h" and yf_interval == "1h":
+        df = df.resample("4h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+
+    if df.empty:
+        raise ValueError(f"yfinance returned empty DataFrame for {symbol} ({yf_symbol}) after processing")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Source 2: Alpha Vantage
+# ---------------------------------------------------------------------------
+
+AV_TIMEFRAME_MAP = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "60min", "4h": "60min",
+    "1d": None,  # use FX_DAILY / TIME_SERIES_DAILY
+    "1w": None,  # use WEEKLY
+}
+
+
+def fetch_alpha_vantage(symbol: str, from_date: str, to_date: str, timeframe: str = "1h", api_key: str = "") -> pd.DataFrame:
+    """Fetch OHLCV from Alpha Vantage with proper error checking."""
+    if not api_key:
+        raise ValueError("Alpha Vantage API key not configured")
+
+    norm = _normalize_symbol(symbol)
+    is_fx = norm in AV_FX_PAIRS
+    av_interval = AV_TIMEFRAME_MAP.get(timeframe, "60min")
+    base_url = "https://www.alphavantage.co/query"
+
+    if timeframe in ("1d", "1w") or av_interval is None:
+        if is_fx:
+            from_sym, to_sym = AV_FX_PAIRS[norm]
+            func = "FX_DAILY" if timeframe == "1d" else "FX_WEEKLY"
+            params = {
+                "function": func,
+                "from_symbol": from_sym,
+                "to_symbol": to_sym,
+                "outputsize": "full",
+                "apikey": api_key,
+            }
+            ts_key_fragment = "Time Series FX"
+        else:
+            func = "TIME_SERIES_DAILY" if timeframe == "1d" else "TIME_SERIES_WEEKLY"
+            params = {
+                "function": func,
+                "symbol": norm,
+                "outputsize": "full",
+                "apikey": api_key,
+            }
+            ts_key_fragment = "Time Series"
+    else:
+        if is_fx:
+            from_sym, to_sym = AV_FX_PAIRS[norm]
+            params = {
+                "function": "FX_INTRADAY",
+                "from_symbol": from_sym,
+                "to_symbol": to_sym,
+                "interval": av_interval,
+                "outputsize": "full",
+                "apikey": api_key,
+            }
+            ts_key_fragment = "Time Series FX"
+        else:
+            params = {
+                "function": "TIME_SERIES_INTRADAY",
+                "symbol": norm,
+                "interval": av_interval,
+                "outputsize": "full",
+                "apikey": api_key,
+            }
+            ts_key_fragment = "Time Series"
+
+    response = httpx.get(base_url, params=params, timeout=30)
+    data = response.json()
+
+    # FIX: Check for API-level errors
+    if "Information" in data:
+        raise ValueError(f"Alpha Vantage rate limit or key error: {data['Information']}")
+    if "Error Message" in data:
+        raise ValueError(f"Alpha Vantage error: {data['Error Message']}")
+    if "Note" in data:
+        raise ValueError(f"Alpha Vantage note (likely rate limit): {data['Note']}")
+
+    time_series_key = next((k for k in data if ts_key_fragment in k), None)
+    if not time_series_key or not data.get(time_series_key):
+        raise ValueError(f"Alpha Vantage returned no data for {symbol}: {list(data.keys())}")
+
+    series = data[time_series_key]
+    records = []
+    for date_str, values in sorted(series.items()):
+        try:
+            o_key = next((k for k in values if "open" in k.lower()), None)
+            h_key = next((k for k in values if "high" in k.lower()), None)
+            l_key = next((k for k in values if "low" in k.lower()), None)
+            c_key = next((k for k in values if "close" in k.lower()), None)
+            v_key = next((k for k in values if "volume" in k.lower()), None)
+            records.append({
+                "datetime": date_str,
+                "open": float(values[o_key]) if o_key else 0.0,
+                "high": float(values[h_key]) if h_key else 0.0,
+                "low": float(values[l_key]) if l_key else 0.0,
+                "close": float(values[c_key]) if c_key else 0.0,
+                "volume": float(values[v_key]) if v_key else 0.0,
+            })
+        except (ValueError, KeyError, StopIteration):
+            continue
+
+    if not records:
+        raise ValueError(f"Alpha Vantage parsed 0 records for {symbol}")
+
+    df = pd.DataFrame(records)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+
+    # Filter by date range
+    df = df[(df.index >= pd.Timestamp(from_date)) & (df.index <= pd.Timestamp(to_date))]
+
+    # Resample 1h → 4h if needed
+    if timeframe == "4h" and av_interval == "60min":
+        df = df.resample("4h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna()
+
+    if df.empty:
+        raise ValueError(f"Alpha Vantage returned no data for {symbol} in range {from_date}–{to_date}")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Source 3: Twelve Data
+# ---------------------------------------------------------------------------
+
+TWELVE_DATA_TIMEFRAME_MAP = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "4h": "4h", "1d": "1day", "1w": "1week",
+}
+
+
+async def fetch_twelve_data(symbol: str, from_date: str, to_date: str, timeframe: str, api_key: str = "") -> pd.DataFrame:
+    """Fetch OHLCV from Twelve Data API."""
+    if not api_key:
+        raise ValueError("Twelve Data key not configured")
+
+    interval = TWELVE_DATA_TIMEFRAME_MAP.get(timeframe, "1h")
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": _normalize_symbol(symbol),
+        "interval": interval,
+        "start_date": from_date,
+        "end_date": to_date,
+        "apikey": api_key,
+        "format": "JSON",
+        "outputsize": 5000,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(url, params=params)
+
+    data = response.json()
+
+    if data.get("status") == "error":
+        raise ValueError(f"Twelve Data error: {data.get('message', 'unknown error')}")
+
+    values = data.get("values")
+    if not values:
+        raise ValueError(f"Twelve Data returned no values for {symbol}: {list(data.keys())}")
+
+    records = []
+    for item in values:
+        try:
+            records.append({
+                "datetime": item["datetime"],
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+                "volume": float(item.get("volume", 0) or 0),
+            })
+        except (KeyError, ValueError):
+            continue
+
+    if not records:
+        raise ValueError(f"Twelve Data parsed 0 records for {symbol}")
+
+    df = pd.DataFrame(records)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    df = df[(df.index >= pd.Timestamp(from_date)) & (df.index <= pd.Timestamp(to_date))]
+
+    if df.empty:
+        raise ValueError(f"Twelve Data returned no data for {symbol} in range {from_date}–{to_date}")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Source 4: OANDA public (forex only)
+# ---------------------------------------------------------------------------
+
+async def fetch_oanda_public(symbol: str, from_date: str, to_date: str, timeframe: str) -> pd.DataFrame:
+    """Fetch OHLCV from OANDA public endpoint (forex pairs only)."""
+    norm = _normalize_symbol(symbol)
+    if norm not in OANDA_SUPPORTED:
+        raise ValueError(f"OANDA public endpoint does not support {symbol}")
+
+    instrument = f"{norm[:3]}_{norm[3:]}"
+    gran = OANDA_TIMEFRAME_MAP.get(timeframe, "H1")
+    from_ts = datetime.fromisoformat(from_date).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
+    to_ts = datetime.fromisoformat(to_date).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
+
+    url = f"https://api-fxtrade.oanda.com/v3/instruments/{instrument}/candles"
+    headers = {"Accept-Datetime-Format": "RFC3339"}
+    params = {
+        "granularity": gran,
+        "from": from_ts,
+        "to": to_ts,
+        "price": "M",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(url, headers=headers, params=params)
+
+    if response.status_code != 200:
+        raise ValueError(f"OANDA returned status {response.status_code} for {symbol}")
+
+    data = response.json()
+    candles = data.get("candles", [])
+    if not candles:
+        raise ValueError(f"OANDA returned empty candles for {symbol}")
+
+    records = []
+    for c in candles:
+        if not c.get("complete"):
+            continue
+        mid = c.get("mid", {})
+        try:
+            records.append({
+                "datetime": c["time"],
+                "open": float(mid["o"]),
+                "high": float(mid["h"]),
+                "low": float(mid["l"]),
+                "close": float(mid["c"]),
+                "volume": float(c.get("volume", 0)),
+            })
+        except (KeyError, ValueError):
+            continue
+
+    if not records:
+        raise ValueError(f"OANDA parsed 0 complete candles for {symbol}")
+
+    df = pd.DataFrame(records)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+
+    if df.empty:
+        raise ValueError(f"OANDA returned no data for {symbol} in range {from_date}–{to_date}")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Unified fallback chain
+# ---------------------------------------------------------------------------
+
+async def fetch_ohlcv_with_fallback(
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    timeframe: str,
+    db,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Returns (dataframe, source_name_used). Tries each source in order:
+      1. yfinance (sync, wrapped)
+      2. Alpha Vantage (sync, wrapped)
+      3. Twelve Data (async)
+      4. OANDA (async, forex only)
+
+    Raises RuntimeError if all sources fail.
+    """
+    from .. import crud as _crud
+
+    av_key = _crud.get_setting(db, "alphavantage_key") or ""
+    td_key = _crud.get_setting(db, "twelve_data_key") or ""
+
+    errors: list[str] = []
+
+    # Source 1: yfinance
+    try:
+        df = fetch_yfinance(symbol, from_date, to_date, timeframe)
+        if not df.empty:
+            return df, "yfinance"
+    except Exception as exc:
+        errors.append(f"yfinance: {exc}")
+
+    # Source 2: Alpha Vantage
+    try:
+        df = fetch_alpha_vantage(symbol, from_date, to_date, timeframe, api_key=av_key)
+        if not df.empty:
+            return df, "alpha_vantage"
+    except Exception as exc:
+        errors.append(f"alpha_vantage: {exc}")
+
+    # Source 3: Twelve Data
+    try:
+        df = await fetch_twelve_data(symbol, from_date, to_date, timeframe, api_key=td_key)
+        if not df.empty:
+            return df, "twelve_data"
+    except Exception as exc:
+        errors.append(f"twelve_data: {exc}")
+
+    # Source 4: OANDA (forex only)
+    try:
+        df = await fetch_oanda_public(symbol, from_date, to_date, timeframe)
+        if not df.empty:
+            return df, "oanda"
+    except Exception as exc:
+        errors.append(f"oanda: {exc}")
+
+    raise RuntimeError(
+        f"All OHLCV sources failed for {symbol}.\n" + "\n".join(errors)
+    )
+
+
+def df_to_ohlcv_list(df: pd.DataFrame) -> list[dict]:
+    """Convert a DataFrame (index=datetime, cols=open/high/low/close/volume) to list[dict]."""
+    records = []
+    for ts, row in df.iterrows():
+        try:
+            date_str = ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10]
+            records.append({
+                "date": date_str,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row.get("volume", 0) or 0),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe market_data builder
+# ---------------------------------------------------------------------------
+
+def build_mtf_market_data(
+    symbol: str,
+    current_idx: int,
+    bars_by_tf: dict[str, pd.DataFrame],
+    atr: float | None = None,
+    correlated_bars: pd.DataFrame | None = None,
+) -> dict:
+    """
+    Assemble the multi-timeframe ``market_data`` dict expected by
+    ``requires_mtf`` strategies such as Alchemist.
+
+    Parameters
+    ----------
+    symbol:
+        Trading symbol (e.g. "XAUUSD").
+    current_idx:
+        The current bar index in the *primary* (highest-frequency) timeframe.
+        All DataFrames are sliced up to and including this bar so the strategy
+        never looks into the future.
+    bars_by_tf:
+        Dict mapping timeframe string → full DataFrame for that timeframe.
+        Expected keys: "1d", "4h", "1h", "15m".
+        Missing timeframes produce empty DataFrames.
+    atr:
+        Pre-computed ATR for the current bar. If None, derived from 1h close
+        range as a rough proxy.
+    correlated_bars:
+        Optional DataFrame of correlated instrument bars (same slicing applied).
+
+    Returns
+    -------
+    dict with keys:
+        symbol, timestamp, current_price, atr,
+        1d_bars, 4h_bars, 1h_bars, 15m_bars,
+        correlated_bars (pd.DataFrame, may be empty)
+
+    Notes
+    -----
+    - ``current_idx`` is used only for the primary bar's timestamp / price
+      derivation. The individual DataFrames should already be sliced externally
+      (e.g. in the backtest loop) so no double-slicing occurs.  If the
+      DataFrames are full (live trading), pass ``current_idx=-1`` to use the
+      last bar.
+    - Minimum bar counts per timeframe (``MTF_MIN_BARS``) are not enforced
+      here; the strategy's internal guards handle that gracefully.
+    """
+    def _safe_slice(df: pd.DataFrame) -> pd.DataFrame:
+        """Return the dataframe as-is — caller is responsible for slicing."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df
+
+    bars_1d = _safe_slice(bars_by_tf.get("1d"))
+    bars_4h = _safe_slice(bars_by_tf.get("4h"))
+    bars_1h = _safe_slice(bars_by_tf.get("1h"))
+    bars_15m = _safe_slice(bars_by_tf.get("15m"))
+
+    # Determine current price and timestamp from the most granular available frame
+    current_price = 0.0
+    timestamp: datetime = datetime.utcnow()
+
+    for bars in (bars_15m, bars_1h, bars_4h, bars_1d):
+        if not bars.empty:
+            last = bars.iloc[-1]
+            current_price = float(last["close"])
+            idx = bars.index[-1]
+            timestamp = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else datetime.utcnow()
+            break
+
+    # ATR proxy: use provided value or compute a simple 14-bar average true range
+    if atr is None:
+        atr = _compute_atr_simple(bars_1h)
+
+    return {
+        "symbol": symbol,
+        "timestamp": timestamp,
+        "current_price": current_price,
+        "atr": atr,
+        "1d_bars": bars_1d,
+        "4h_bars": bars_4h,
+        "1h_bars": bars_1h,
+        "15m_bars": bars_15m,
+        "correlated_bars": correlated_bars if correlated_bars is not None else pd.DataFrame(),
+    }
+
+
+def _compute_atr_simple(bars: pd.DataFrame, period: int = 14) -> float:
+    """Compute a simple Wilder ATR from a DataFrame with high/low/close columns."""
+    if bars.empty or len(bars) < period + 1:
+        return 0.0
+    highs = bars["high"].values.astype(float)
+    lows = bars["low"].values.astype(float)
+    closes = bars["close"].values.astype(float)
+
+    trs = []
+    for i in range(1, len(bars)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+
+    if len(trs) < period:
+        return float(sum(trs) / len(trs)) if trs else 0.0
+
+    atr_val = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr_val = (atr_val * (period - 1) + trs[i]) / period
+    return float(atr_val)

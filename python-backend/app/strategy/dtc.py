@@ -88,6 +88,20 @@ class DTCStrategy(BaseStrategy):
     display_name = "Dynamic Trend Cascade"
     description = "Uses 6 EMAs in a cascade for trend-following entries with adaptive stop loss and take profit levels."
 
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "ema_1": (20, 40),
+        "ema_2": (25, 50),
+        "ema_3": (30, 60),
+        "ema_4": (35, 70),
+        "ema_5": (40, 80),
+        "ema_6": (45, 100),
+        "stop_loss_pct": (0.1, 1.5),
+        "tp1_multiplier": (0.5, 6.0),
+        "tp2_multiplier": (0.5, 6.0),
+        "tp3_multiplier": (0.5, 6.0),
+        "tp4_multiplier": (0.5, 6.0),
+    }
+
     @classmethod
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()

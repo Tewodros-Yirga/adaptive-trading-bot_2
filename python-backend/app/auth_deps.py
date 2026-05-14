@@ -61,6 +61,24 @@ def decode_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+def get_current_user_from_token(token: str, db: Session) -> User | None:
+    """
+    Decode a raw JWT string and return the matching active User, or None.
+
+    Used by the WebSocket endpoint which receives the token as a query parameter
+    rather than an Authorization header.
+    """
+    try:
+        payload = decode_token(token)
+        user_id = int(payload["sub"])
+        user = db.get(User, user_id)
+        if not user or not user.is_active:
+            return None
+        return user
+    except Exception:
+        return None
+
+
 async def get_current_user(
     creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),

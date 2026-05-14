@@ -22,6 +22,17 @@ class BollingerBreakoutStrategy(BaseStrategy):
     display_name = "Bollinger Breakout"
     description = "Price breakout above/below Bollinger Bands with ATR-based stop loss."
 
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "bb_period": (10, 50),
+        "bb_std": (1.0, 4.0),
+        "atr_period": (5, 30),
+        "atr_sl_multiplier": (0.5, 4.0),
+        "tp1_multiplier": (0.5, 8.0),
+        "tp2_multiplier": (0.5, 8.0),
+        "tp3_multiplier": (0.5, 8.0),
+        "tp4_multiplier": (0.5, 8.0),
+    }
+
     @classmethod
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()

@@ -22,6 +22,17 @@ class RSIReversalStrategy(BaseStrategy):
     display_name = "RSI Reversal"
     description = "Counter-trend entries based on RSI overbought/oversold conditions."
 
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "rsi_period": (5, 30),
+        "oversold_threshold": (10.0, 45.0),
+        "overbought_threshold": (55.0, 90.0),
+        "stop_loss_pct": (0.1, 2.0),
+        "tp1_multiplier": (0.5, 8.0),
+        "tp2_multiplier": (0.5, 8.0),
+        "tp3_multiplier": (0.5, 8.0),
+        "tp4_multiplier": (0.5, 8.0),
+    }
+
     @classmethod
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()

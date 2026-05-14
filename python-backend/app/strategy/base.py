@@ -7,6 +7,9 @@ class BaseStrategy(ABC):
     display_name: str = "Base Strategy"
     description: str = ""
 
+    # Subclasses override this with {param_name: (min_value, max_value)}
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {}
+
     def __init__(self, params: dict[str, Any] | None = None):
         self.params = {**self.default_params(), **(params or {})}
 

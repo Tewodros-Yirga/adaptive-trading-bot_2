@@ -1,4 +1,5 @@
 from .base import BaseStrategy
+from .alchemist import Alchemist
 from .bollinger_breakout import BollingerBreakoutStrategy
 from .dtc import DTCStrategy
 from .macd_momentum import MACDMomentumStrategy
@@ -13,6 +14,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "Bollinger_Breakout": BollingerBreakoutStrategy,
     "Multi_EMA_Scalper": MultiEMAScalperStrategy,
     "VWAP_Reversion": VWAPReversionStrategy,
+    "Alchemist": Alchemist,
 }
 
 

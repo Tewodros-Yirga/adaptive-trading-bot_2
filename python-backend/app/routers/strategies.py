@@ -1,14 +1,15 @@
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
-from ..auth_deps import require_write_access
+from fastapi import APIRouter, Depends, HTTPException, Query
+from ..auth_deps import require_write_access, require_admin
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import crud
 from ..db import get_db
 from ..models import Strategy
+from ..schemas import BacktestCandidateOut, SearchStatusOut, SearchSettingsIn
 from ..services.orchestrator import get_ensemble_config, set_ensemble_config, set_strategy_live
 from ..strategy.registry import STRATEGY_REGISTRY, list_strategies
 
@@ -117,7 +118,6 @@ def make_live(name: str, db: Session = Depends(get_db), _w=Depends(require_write
     if name not in STRATEGY_REGISTRY:
         raise HTTPException(404, f"Strategy {name} not in registry")
     row = set_strategy_live(db, name)
-    # also ensure it's active
     row.is_active = True
     db.commit()
     return {"status": "live", "name": name}
@@ -134,7 +134,7 @@ def update_params(name: str, body: dict, db: Session = Depends(get_db), _w=Depen
     row.params_json = json.dumps(current)
     row.updated_at = datetime.utcnow()
     db.commit()
-    crud.save_params(db, current, reason="Manual update via API", trigger="MANUAL", )
+    crud.save_params(db, current, reason="Manual update via API", trigger="MANUAL")
     return {"status": "updated", "params": current}
 
 
@@ -154,6 +154,105 @@ def params_history(name: str, limit: int = 30, db: Session = Depends(get_db)):
         for p in history
     ]
 
+
+# ── Continuous Backtest / Candidate Endpoints ─────────────────────────────
+
+@router.get("/{name}/backtest-candidates", response_model=list[BacktestCandidateOut])
+def list_backtest_candidates(
+    name: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    qualified_only: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """List all backtest candidates for a strategy (paginated)."""
+    _ensure_strategies_exist(db)
+    row = db.scalar(select(Strategy).where(Strategy.name == name))
+    if not row:
+        raise HTTPException(404, f"Strategy {name} not found")
+    return crud.get_backtest_candidates(db, name, page=page, limit=limit, qualified_only=qualified_only)
+
+
+@router.get("/{name}/backtest-candidates/best", response_model=BacktestCandidateOut | None)
+def get_best_candidate(name: str, db: Session = Depends(get_db)):
+    """Return the highest-scoring qualified candidate for the strategy."""
+    _ensure_strategies_exist(db)
+    row = db.scalar(select(Strategy).where(Strategy.name == name))
+    if not row:
+        raise HTTPException(404, f"Strategy {name} not found")
+    return crud.get_best_backtest_candidate(db, name)
+
+
+@router.get("/{name}/search-status", response_model=SearchStatusOut)
+def search_status(name: str, db: Session = Depends(get_db)):
+    """Return the current search phase, iteration count, best score, and run/pause state."""
+    _ensure_strategies_exist(db)
+    row = db.scalar(select(Strategy).where(Strategy.name == name))
+    if not row:
+        raise HTTPException(404, f"Strategy {name} not found")
+    from ..services.continuous_backtest import get_search_status
+    return get_search_status(name)
+
+
+@router.post("/{name}/search-settings")
+def update_search_settings(
+    name: str,
+    body: SearchSettingsIn,
+    db: Session = Depends(get_db),
+    _a=Depends(require_admin),
+):
+    """Update continuous backtest search settings for a strategy (admin only)."""
+    _ensure_strategies_exist(db)
+    row = db.scalar(select(Strategy).where(Strategy.name == name))
+    if not row:
+        raise HTTPException(404, f"Strategy {name} not found")
+
+    updated: dict[str, str] = {}
+    field_map = {
+        "qualify_threshold_win_rate": body.qualify_threshold_win_rate,
+        "score_weight_win_rate": body.score_weight_win_rate,
+        "score_weight_roi": body.score_weight_roi,
+        "backtest_interval_seconds": body.backtest_interval_seconds,
+        "backtest_timeframes": json.dumps(body.backtest_timeframes) if body.backtest_timeframes is not None else None,
+        "backtest_symbols": json.dumps(body.backtest_symbols) if body.backtest_symbols is not None else None,
+        "param_step_size": body.param_step_size,
+        "range_expansion_months": body.range_expansion_months,
+        "max_history_months": body.max_history_months,
+    }
+    for suffix, value in field_map.items():
+        if value is not None:
+            key = f"{name}_{suffix}"
+            crud.set_setting(db, key, str(value))
+            updated[key] = str(value)
+
+    return {"status": "updated", "settings": updated}
+
+
+@router.post("/{name}/pause-search")
+def pause_search(name: str, db: Session = Depends(get_db), _a=Depends(require_admin)):
+    """Pause the continuous backtest loop for a strategy (admin only)."""
+    _ensure_strategies_exist(db)
+    row = db.scalar(select(Strategy).where(Strategy.name == name))
+    if not row:
+        raise HTTPException(404, f"Strategy {name} not found")
+    from ..services.continuous_backtest import pause_search as _pause
+    _pause(name)
+    return {"status": "paused", "strategy": name}
+
+
+@router.post("/{name}/resume-search")
+def resume_search(name: str, db: Session = Depends(get_db), _a=Depends(require_admin)):
+    """Resume the continuous backtest loop for a strategy (admin only)."""
+    _ensure_strategies_exist(db)
+    row = db.scalar(select(Strategy).where(Strategy.name == name))
+    if not row:
+        raise HTTPException(404, f"Strategy {name} not found")
+    from ..services.continuous_backtest import resume_search as _resume
+    _resume(name)
+    return {"status": "resumed", "strategy": name}
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────
 
 def _get_strategy_stats(db: Session, strategy_name: str) -> dict:
     from sqlalchemy import desc

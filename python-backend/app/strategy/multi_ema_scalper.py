@@ -29,6 +29,20 @@ class MultiEMAScalperStrategy(BaseStrategy):
     display_name = "Multi EMA Scalper"
     description = "Faster DTC variant with tighter multipliers and shorter EMA periods for scalping."
 
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "ema_1": (3, 15),
+        "ema_2": (5, 20),
+        "ema_3": (8, 30),
+        "ema_4": (13, 40),
+        "ema_5": (21, 55),
+        "ema_6": (30, 80),
+        "stop_loss_pct": (0.05, 0.5),
+        "tp1_multiplier": (0.3, 4.0),
+        "tp2_multiplier": (0.3, 4.0),
+        "tp3_multiplier": (0.3, 4.0),
+        "tp4_multiplier": (0.3, 4.0),
+    }
+
     @classmethod
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()

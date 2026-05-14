@@ -23,6 +23,18 @@ class MACDMomentumStrategy(BaseStrategy):
     display_name = "MACD Momentum"
     description = "MACD line crossover signal with histogram confirmation for momentum trades."
 
+    PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+        "fast_period": (5, 20),
+        "slow_period": (15, 50),
+        "signal_period": (3, 20),
+        "histogram_threshold": (0.0, 0.01),
+        "stop_loss_pct": (0.1, 2.0),
+        "tp1_multiplier": (0.5, 8.0),
+        "tp2_multiplier": (0.5, 8.0),
+        "tp3_multiplier": (0.5, 8.0),
+        "tp4_multiplier": (0.5, 8.0),
+    }
+
     @classmethod
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()

@@ -2,7 +2,10 @@ import asyncio
 import json
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+
+from ..db import SessionLocal
+from ..auth_deps import get_current_user_from_token
 
 router = APIRouter(tags=["websocket"])
 
@@ -22,12 +25,32 @@ async def broadcast(event_type: str, data: Any):
 
 
 @router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str = Query(...),
+):
+    """
+    WebSocket endpoint with JWT authentication.
+
+    Clients must pass a valid JWT as ?token=<jwt> in the upgrade URL.
+    Connection is rejected with code 4001 if the token is missing, invalid,
+    expired, or belongs to an inactive user.
+    """
+    db = SessionLocal()
+    try:
+        user = get_current_user_from_token(token, db)
+    finally:
+        db.close()
+
+    if not user:
+        await websocket.close(code=4001)
+        return
+
     await websocket.accept()
     _connections.append(websocket)
     try:
         while True:
-            # Keep connection alive, ping every 30s
+            # Keep connection alive — ping every 30 s
             await asyncio.sleep(30)
             await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
