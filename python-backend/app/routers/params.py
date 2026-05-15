@@ -5,7 +5,7 @@ import json
 
 from fastapi import APIRouter, Depends, Query
 from ..auth_deps import require_write_access
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from ..db import get_db
 from .. import crud
@@ -15,17 +15,17 @@ router = APIRouter(prefix="/params", tags=["params"])
 
 
 @router.get("/learning")
-def get_learning(db: Session = Depends(get_db)):
+def get_learning(db: Database = Depends(get_db)):
     return get_learning_settings(db)
 
 
 @router.post("/learning")
-def update_learning(body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
+def update_learning(body: dict, db: Database = Depends(get_db), _w=Depends(require_write_access)):
     return update_learning_settings(db, body)
 
 
 @router.get("/history")
-def params_history(limit: int = Query(30, ge=1, le=200), db: Session = Depends(get_db)):
+def params_history(limit: int = Query(30, ge=1, le=200), db: Database = Depends(get_db)):
     history = crud.get_params_history(db, limit)
     return [
         {

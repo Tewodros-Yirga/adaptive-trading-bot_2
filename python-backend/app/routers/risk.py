@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Query
 from ..auth_deps import require_write_access
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 from typing import Optional
 
 from ..db import get_db
@@ -10,28 +10,28 @@ router = APIRouter(prefix="/risk", tags=["risk"])
 
 
 @router.get("/settings")
-def get_settings(db: Session = Depends(get_db)):
+def get_settings(db: Database = Depends(get_db)):
     return get_risk_settings(db)
 
 
 @router.post("/settings")
-def update_settings(body: dict, db: Session = Depends(get_db), _w=Depends(require_write_access)):
+def update_settings(body: dict, db: Database = Depends(get_db), _w=Depends(require_write_access)):
     return update_risk_settings(db, body)
 
 
 @router.get("/status")
-def get_status(db: Session = Depends(get_db)):
+def get_status(db: Database = Depends(get_db)):
     return get_risk_status(db)
 
 
 @router.post("/halt")
-def halt_trading(db: Session = Depends(get_db), _w=Depends(require_write_access)):
+def halt_trading(db: Database = Depends(get_db), _w=Depends(require_write_access)):
     update_risk_settings(db, {"trading_halt": True})
     return {"status": "halted", "trading_halt": True}
 
 
 @router.post("/resume")
-def resume_trading(db: Session = Depends(get_db), _w=Depends(require_write_access)):
+def resume_trading(db: Database = Depends(get_db), _w=Depends(require_write_access)):
     update_risk_settings(db, {"trading_halt": False})
     return {"status": "resumed", "trading_halt": False}
 
@@ -43,25 +43,21 @@ def lot_size_preview(
     symbol: str = Query(...),
     entry: float = Query(..., gt=0),
     stop_loss: float = Query(..., gt=0),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
     """
     Returns what lot sizes would be computed for a given entry+SL without placing any order.
-    Uses existing risk_manager logic for dynamic sizing and halt/block checks.
     """
     settings = get_risk_settings(db)
     status = get_risk_status(db)
 
-    sl_pips = abs(round((entry - stop_loss) * 10000, 1))  # works for most FX/gold pairs
+    sl_pips = abs(round((entry - stop_loss) * 10000, 1))
 
-    # Fixed lot from settings
     fixed_lot = settings.get("fixed_lot_size", 0.01)
 
-    # Dynamic lot: risk_per_trade_pct of balance / (sl_pips * pip_value)
-    # Fallback gracefully if bridge balance not available
     balance = status.get("account_balance") or 10000.0
     risk_pct = settings.get("risk_per_trade_pct", 1.0)
-    pip_value = settings.get("pip_value_per_lot", 10.0)  # USD per pip per standard lot
+    pip_value = settings.get("pip_value_per_lot", 10.0)
 
     risk_amount_usd = balance * (risk_pct / 100.0)
     dynamic_lot = round(risk_amount_usd / (sl_pips * pip_value), 2) if sl_pips > 0 else fixed_lot
@@ -70,7 +66,6 @@ def lot_size_preview(
     lot_size_mode = settings.get("lot_size_mode", "FIXED")
     chosen_lot = dynamic_lot if lot_size_mode == "DYNAMIC" else fixed_lot
 
-    # Block checks
     would_be_blocked = False
     block_reason = None
 

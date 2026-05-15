@@ -1,10 +1,11 @@
 """
 Auth router — login, current user, user management (admin only).
 """
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from ..auth_deps import (
     create_access_token,
@@ -13,7 +14,7 @@ from ..auth_deps import (
     require_admin,
     verify_password,
 )
-from ..db import get_db
+from ..db import get_db, COLL_USERS, next_id
 from ..models import User
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -43,8 +44,9 @@ class UpdateUserRequest(BaseModel):
 # ── Public ─────────────────────────────────────────────────────────────────────
 
 @router.post("/login")
-def login(body: LoginRequest, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.username == body.username))
+def login(body: LoginRequest, db: Database = Depends(get_db)):
+    doc = db[COLL_USERS].find_one({"username": body.username})
+    user = User.from_doc(doc) if doc else None
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.is_active:
@@ -79,18 +81,18 @@ def get_me(user: User = Depends(get_current_user)):
 # ── Admin only ────────────────────────────────────────────────────────────────
 
 @router.get("/users")
-def list_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    users = list(db.scalars(select(User).order_by(User.created_at)).all())
+def list_users(admin: User = Depends(require_admin), db: Database = Depends(get_db)):
+    docs = db[COLL_USERS].find().sort("created_at", 1)
     return [
         {
-            "id": u.id,
-            "username": u.username,
-            "role": u.role,
-            "full_access": u.full_access,
-            "is_active": u.is_active,
-            "created_at": u.created_at,
+            "id": str(d["_id"]),
+            "username": d["username"],
+            "role": d.get("role", "viewer"),
+            "full_access": d.get("full_access", False),
+            "is_active": d.get("is_active", True),
+            "created_at": d.get("created_at"),
         }
-        for u in users
+        for d in docs
     ]
 
 
@@ -98,29 +100,28 @@ def list_users(admin: User = Depends(require_admin), db: Session = Depends(get_d
 def create_user(
     body: CreateUserRequest,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
-    existing = db.scalar(select(User).where(User.username == body.username))
-    if existing:
+    if db[COLL_USERS].find_one({"username": body.username}):
         raise HTTPException(status_code=400, detail="Username already exists")
     if body.role not in ("admin", "viewer"):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'viewer'")
-    user = User(
-        username=body.username,
-        password_hash=hash_password(body.password),
-        role=body.role,
-        full_access=body.full_access,
-        is_active=True,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    doc = {
+        "_id": next_id(db, COLL_USERS),
+        "username": body.username,
+        "password_hash": hash_password(body.password),
+        "role": body.role,
+        "full_access": body.full_access,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    db[COLL_USERS].insert_one(doc)
     return {
-        "id": user.id,
-        "username": user.username,
-        "role": user.role,
-        "full_access": user.full_access,
-        "is_active": user.is_active,
+        "id": str(doc["_id"]),
+        "username": doc["username"],
+        "role": doc["role"],
+        "full_access": doc["full_access"],
+        "is_active": doc["is_active"],
     }
 
 
@@ -129,28 +130,32 @@ def update_user(
     user_id: int,
     body: UpdateUserRequest,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if not user:
+    doc = db[COLL_USERS].find_one({"_id": user_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="User not found")
+    update: dict = {}
     if body.role is not None:
         if body.role not in ("admin", "viewer"):
             raise HTTPException(status_code=400, detail="Role must be 'admin' or 'viewer'")
-        user.role = body.role
+        update["role"] = body.role
     if body.full_access is not None:
-        user.full_access = body.full_access
+        update["full_access"] = body.full_access
     if body.is_active is not None:
-        user.is_active = body.is_active
+        update["is_active"] = body.is_active
     if body.password:
-        user.password_hash = hash_password(body.password)
-    db.commit()
+        update["password_hash"] = hash_password(body.password)
+    if update:
+        doc = db[COLL_USERS].find_one_and_update(
+            {"_id": user_id}, {"$set": update}, return_document=True
+        )
     return {
-        "id": user.id,
-        "username": user.username,
-        "role": user.role,
-        "full_access": user.full_access,
-        "is_active": user.is_active,
+        "id": str(doc["_id"]),
+        "username": doc["username"],
+        "role": doc.get("role", "viewer"),
+        "full_access": doc.get("full_access", False),
+        "is_active": doc.get("is_active", True),
     }
 
 
@@ -158,13 +163,12 @@ def update_user(
 def delete_user(
     user_id: int,
     admin: User = Depends(require_admin),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
-    user = db.get(User, user_id)
-    if not user:
+    doc = db[COLL_USERS].find_one({"_id": user_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.id == admin.id:
+    if str(doc["_id"]) == str(admin.id):
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    db.delete(user)
-    db.commit()
+    db[COLL_USERS].delete_one({"_id": user_id})
     return {"deleted": True, "id": user_id}

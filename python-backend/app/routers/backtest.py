@@ -10,11 +10,10 @@ from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from ..auth_deps import get_current_user, require_write_access
-from ..db import get_db
+from ..db import get_db, COLL_BACKTEST_RESULTS
 from ..models import BacktestResult
 from ..schemas import (
     BatchBacktestRequest,
@@ -44,7 +43,7 @@ def _get_executor():
 async def run(
     body: dict,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
     _w=Depends(require_write_access),
 ):
     """
@@ -116,12 +115,12 @@ async def _run_batch_background(
     executor,
 ) -> None:
     """Background coroutine wrapper — creates its own DB session."""
-    from ..db import SessionLocal
-    db = SessionLocal()
+    from ..db import get_database
+    db = get_database()
     try:
         await run_batch_backtest(db, batch_id, runs, shared_settings, executor)
     finally:
-        db.close()
+        pass  # pymongo client is managed at app level; no per-request close needed
 
 
 # ---------------------------------------------------------------------------
@@ -129,31 +128,31 @@ async def _run_batch_background(
 # ---------------------------------------------------------------------------
 
 @router.get("/results")
-def list_results(limit: int = 20, db: Session = Depends(get_db)):
-    rows = list(
-        db.scalars(
-            select(BacktestResult)
-            .order_by(BacktestResult.created_at.desc())
-            .limit(limit)
-        ).all()
+def list_results(limit: int = 20, db: Database = Depends(get_db)):
+    docs = list(
+        db[COLL_BACKTEST_RESULTS]
+        .find()
+        .sort("created_at", -1)
+        .limit(limit)
     )
     return [
         {
-            "id": r.id,
-            "strategy_name": r.strategy_name,
-            "symbol": r.symbol,
-            "from_date": r.from_date,
-            "to_date": r.to_date,
-            "initial_balance": r.initial_balance,
-            "leverage": r.leverage,
-            "risk_per_trade_pct": r.risk_per_trade_pct,
-            "status": r.status,
-            "metrics": json.loads(r.metrics_json or "{}"),
-            "batch_id": r.batch_id,
-            "created_at": r.created_at,
-            "completed_at": r.completed_at,
+            "id": d["_id"],
+            "strategy_name": d.get("strategy_name"),
+            "symbol": d.get("symbol"),
+            "from_date": d.get("from_date"),
+            "to_date": d.get("to_date"),
+            "initial_balance": d.get("initial_balance"),
+            "leverage": d.get("leverage"),
+            "risk_per_trade_pct": d.get("risk_per_trade_pct"),
+            "status": d.get("status"),
+            "metrics": d.get("metrics_json") if isinstance(d.get("metrics_json"), dict)
+                       else json.loads(d.get("metrics_json") or "{}"),
+            "batch_id": d.get("batch_id"),
+            "created_at": d.get("created_at"),
+            "completed_at": d.get("completed_at"),
         }
-        for r in rows
+        for d in docs
     ]
 
 
@@ -162,8 +161,8 @@ def list_results(limit: int = 20, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/results/{bt_id}")
-def get_result(bt_id: int, db: Session = Depends(get_db)):
-    row = db.get(BacktestResult, bt_id)
+def get_result(bt_id: int, db: Database = Depends(get_db)):
+    row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
     return {
@@ -194,9 +193,9 @@ def get_trade_log(
     bt_id: int,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
-    row = db.get(BacktestResult, bt_id)
+    row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
     trade_log = row.trade_log_json or []
@@ -216,8 +215,8 @@ def get_trade_log(
 # ---------------------------------------------------------------------------
 
 @router.get("/results/{bt_id}/parameter-evolution")
-def get_parameter_evolution(bt_id: int, db: Session = Depends(get_db)):
-    row = db.get(BacktestResult, bt_id)
+def get_parameter_evolution(bt_id: int, db: Database = Depends(get_db)):
+    row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
     return row.parameter_evolution_log_json or {"adaptation_events": []}
@@ -228,8 +227,8 @@ def get_parameter_evolution(bt_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/results/{bt_id}/monthly-breakdown")
-def get_monthly_breakdown(bt_id: int, db: Session = Depends(get_db)):
-    row = db.get(BacktestResult, bt_id)
+def get_monthly_breakdown(bt_id: int, db: Database = Depends(get_db)):
+    row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
     return row.monthly_breakdown_json or {}
@@ -240,8 +239,8 @@ def get_monthly_breakdown(bt_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/results/{bt_id}/strategy-breakdown")
-def get_strategy_breakdown(bt_id: int, db: Session = Depends(get_db)):
-    row = db.get(BacktestResult, bt_id)
+def get_strategy_breakdown(bt_id: int, db: Database = Depends(get_db)):
+    row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
     return {
@@ -260,7 +259,7 @@ def get_strategy_breakdown(bt_id: int, db: Session = Depends(get_db)):
 async def get_backtest_pdf_report(
     bt_id: int,
     current_user=Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
     """
     Generate and stream a professional PDF backtest report.
@@ -701,7 +700,7 @@ def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -
 # ---------------------------------------------------------------------------
 
 @router.get("/batch/{batch_id}")
-def get_batch(batch_id: str, db: Session = Depends(get_db)):
+def get_batch(batch_id: str, db: Database = Depends(get_db)):
     batch = crud.get_backtest_batch(db, batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
@@ -737,7 +736,7 @@ def get_batch(batch_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/batch/{batch_id}/pair-analysis")
-def get_pair_analysis(batch_id: str, db: Session = Depends(get_db)):
+def get_pair_analysis(batch_id: str, db: Database = Depends(get_db)):
     batch = crud.get_backtest_batch(db, batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
@@ -770,7 +769,7 @@ def get_pair_analysis(batch_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/batch/{batch_id}/ensemble-simulation")
-def get_ensemble_simulation(batch_id: str, db: Session = Depends(get_db)):
+def get_ensemble_simulation(batch_id: str, db: Database = Depends(get_db)):
     batch = crud.get_backtest_batch(db, batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
@@ -783,7 +782,7 @@ def get_ensemble_simulation(batch_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/batch/{batch_id}/report")
-def get_batch_report(batch_id: str, db: Session = Depends(get_db)):
+def get_batch_report(batch_id: str, db: Database = Depends(get_db)):
     batch = crud.get_backtest_batch(db, batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
@@ -857,11 +856,11 @@ def get_batch_report(batch_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.post("/compare")
-def compare(body: dict, db: Session = Depends(get_db)):
+def compare(body: dict, db: Database = Depends(get_db)):
     ids = body.get("ids", [])
     results = []
     for bt_id in ids:
-        row = db.get(BacktestResult, bt_id)
+        row = crud.get_backtest_result(db, bt_id)
         if row:
             results.append({
                 "id": row.id,

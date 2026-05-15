@@ -1,16 +1,14 @@
 """
 Trades router — exposes trade queries to the frontend.
 """
-import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, and_, desc, case
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
-from ..db import get_db
+from ..db import get_db, COLL_TRADES
 from .. import crud
 from ..models import Trade
 
@@ -18,7 +16,7 @@ router = APIRouter(prefix="/trades", tags=["trades"])
 
 
 @router.get("")
-def list_trades(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
+def list_trades(limit: int = Query(50, ge=1, le=500), db: Database = Depends(get_db)):
     trades = crud.get_recent_trades(db, limit)
     return [
         {
@@ -44,12 +42,12 @@ def list_trades(limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_
 
 
 @router.get("/stats")
-def trade_stats(db: Session = Depends(get_db)):
+def trade_stats(db: Database = Depends(get_db)):
     return crud.get_stats(db)
 
 
 @router.get("/closed")
-def closed_trades(limit: int = Query(100, ge=1, le=1000), db: Session = Depends(get_db)):
+def closed_trades(limit: int = Query(100, ge=1, le=1000), db: Database = Depends(get_db)):
     trades = crud.get_closed_trades(db, limit)
     return [
         {
@@ -72,30 +70,22 @@ def closed_trades(limit: int = Query(100, ge=1, le=1000), db: Session = Depends(
     ]
 
 
-# ── Feature 1: Trade Journal & Analytics ─────────────────────────────────
-
 @router.get("/analytics")
 def trade_analytics(
     days: int = Query(30, ge=1, le=365),
     strategy_name: Optional[str] = None,
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ):
-    """
-    Returns rich analytics for closed trades over the specified period.
-    Computes: per-strategy stats, hourly/daily breakdowns, direction stats,
-    drawdown curve, and streak analysis — all server-side.
-    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
-    base_q = (
-        select(Trade)
-        .where(Trade.result.in_(["WIN", "LOSS"]))
-        .where(Trade.closed_at >= cutoff)
-    )
+    query: dict = {
+        "result": {"$in": ["WIN", "LOSS"]},
+        "closed_at": {"$gte": cutoff},
+    }
     if strategy_name:
-        base_q = base_q.where(Trade.strategy_name == strategy_name)
+        query["strategy_name"] = strategy_name
 
-    trades = list(db.scalars(base_q.order_by(Trade.closed_at)).all())
+    docs = db[COLL_TRADES].find(query).sort("closed_at", 1)
+    trades = [Trade.from_doc(d) for d in docs]
 
     # ── by_strategy ────────────────────────────────────────────────────────
     strat_buckets: dict[str, list] = defaultdict(list)
@@ -121,8 +111,7 @@ def trade_analytics(
     hour_buckets: dict[int, list] = defaultdict(list)
     for t in trades:
         if t.closed_at:
-            hr = t.closed_at.hour
-            hour_buckets[hr].append(t)
+            hour_buckets[t.closed_at.hour].append(t)
 
     by_hour_of_day = {}
     for hr in range(24):
@@ -188,13 +177,6 @@ def trade_analytics(
         else:
             max_loss = max(max_loss, cur)
 
-    streak_analysis = {
-        "current_streak": cur,
-        "current_streak_type": cur_type or "NONE",
-        "max_win_streak": max_win,
-        "max_loss_streak": max_loss,
-    }
-
     return {
         "period_days": days,
         "by_strategy": by_strategy,
@@ -202,5 +184,10 @@ def trade_analytics(
         "by_day_of_week": by_day_of_week,
         "by_direction": by_direction,
         "drawdown_curve": drawdown_curve,
-        "streak_analysis": streak_analysis,
+        "streak_analysis": {
+            "current_streak": cur,
+            "current_streak_type": cur_type or "NONE",
+            "max_win_streak": max_win,
+            "max_loss_streak": max_loss,
+        },
     }

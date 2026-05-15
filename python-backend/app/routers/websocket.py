@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from ..db import SessionLocal
+from ..db import get_database
 from ..auth_deps import get_current_user_from_token
 
 router = APIRouter(tags=["websocket"])
@@ -47,15 +47,11 @@ async def websocket_endpoint(
     with code 4001 if the token is missing, invalid, or belongs to an
     inactive user. This prevents Starlette from emitting an HTTP 403.
     """
-    # Accept the WS upgrade unconditionally — auth rejection is a WS close,
-    # NOT an HTTP 403, so the browser can read the close code.
     await websocket.accept()
 
-    db = SessionLocal()
-    try:
-        user = get_current_user_from_token(token, db)
-    finally:
-        db.close()
+    # pymongo Database — no close() needed (pool managed by driver)
+    db = get_database()
+    user = get_current_user_from_token(token, db)
 
     if not user:
         await websocket.close(code=4001)

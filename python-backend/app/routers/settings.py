@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .. import crud
 from ..auth_deps import require_admin
@@ -10,12 +10,12 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 # ── Bulk endpoints — MUST be before /{key} to avoid path conflict ──────────
 @router.get("/bulk")
-def get_bulk(keys: list[str] = Query(default=[]), db: Session = Depends(get_db), _a=Depends(require_admin)):
+def get_bulk(keys: list[str] = Query(default=[]), db: Database = Depends(get_db), _a=Depends(require_admin)):
     return crud.get_settings(db, keys)
 
 
 @router.post("/bulk")
-def set_bulk(body: dict, db: Session = Depends(get_db), _a=Depends(require_admin)):
+def set_bulk(body: dict, db: Database = Depends(get_db), _a=Depends(require_admin)):
     for key, value in body.items():
         if value is not None and str(value).strip():
             crud.set_setting(db, key, str(value))
@@ -24,13 +24,13 @@ def set_bulk(body: dict, db: Session = Depends(get_db), _a=Depends(require_admin
 
 # ── Single key endpoints ──────────────────────────────────────────────────
 @router.post("/{key}")
-def set_one(key: str, body: dict, db: Session = Depends(get_db), _a=Depends(require_admin)):
+def set_one(key: str, body: dict, db: Database = Depends(get_db), _a=Depends(require_admin)):
     value = body.get("value", "")
     crud.set_setting(db, key, str(value))
     return {"key": key, "value": value}
 
 
 @router.get("/{key}")
-def get_one(key: str, db: Session = Depends(get_db), _a=Depends(require_admin)):
+def get_one(key: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
     value = crud.get_setting(db, key)
     return {"key": key, "value": value}
