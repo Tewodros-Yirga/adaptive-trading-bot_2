@@ -11,6 +11,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,6 +97,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not start live trading loop: {e}")
 
+    # ── 9. Start backtester keepalive loop ─────────────────────────────────
+    # Pings the HuggingFace-hosted backtester every 4 minutes to prevent
+    # the Space from sleeping due to inactivity.
+    bg_tasks.append(asyncio.create_task(_backtester_keepalive_loop()))
+    logger.info("Started backtester keepalive loop.")
+
     logger.info("Application startup complete.")
     yield
 
@@ -109,6 +116,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("Application shutdown complete.")
 
+
+# ---------------------------------------------------------------------------
+# Background loops
+# ---------------------------------------------------------------------------
 
 async def _news_fetch_loop():
     """Fetch news every 30 minutes."""
@@ -150,6 +161,62 @@ async def _global_context_loop():
         except Exception as e:
             logger.warning(f"Global context loop error: {e}")
         await asyncio.sleep(1800)
+
+
+async def _backtester_keepalive_loop():
+    """
+    Ping the HuggingFace-hosted backtester service every 4 minutes so the
+    Space does not go to sleep from inactivity (HF sleeps after ~5 min idle).
+
+    Reads BACKTESTER_URL from env (e.g. https://your-user-backtester.hf.space).
+    The backtester exposes GET /ping which is a zero-cost no-DB endpoint.
+
+    HF private Spaces require an HF_TOKEN passed as a Bearer token.
+    Set BACKTESTER_HF_TOKEN in your backend env/secrets if the Space is private.
+    """
+    # Wait a bit at startup so the backtester has time to boot
+    await asyncio.sleep(30)
+
+    from .config import settings as _settings
+
+    backtester_url: str = getattr(_settings, "backtester_url", "") or os.environ.get("BACKTESTER_URL", "")
+    hf_token: str = getattr(_settings, "backtester_hf_token", "") or os.environ.get("BACKTESTER_HF_TOKEN", "")
+
+    if not backtester_url:
+        logger.warning(
+            "Backtester keepalive: BACKTESTER_URL not set — keepalive disabled. "
+            "Set it to the HuggingFace Space URL (e.g. https://user-spacename.hf.space)."
+        )
+        return
+
+    ping_url = backtester_url.rstrip("/") + "/ping"
+    headers: dict = {}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
+    interval = 240  # 4 minutes — safely under HF's ~5-min idle threshold
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(ping_url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.debug(
+                    "Backtester keepalive OK — uptime=%ss",
+                    data.get("uptime_seconds", "?"),
+                )
+            else:
+                logger.warning(
+                    "Backtester keepalive: unexpected status %d from %s",
+                    resp.status_code, ping_url,
+                )
+        except httpx.TimeoutException:
+            logger.warning("Backtester keepalive: request timed out (Space may be cold-starting)")
+        except Exception as exc:
+            logger.warning("Backtester keepalive error: %s", exc)
+
+        await asyncio.sleep(interval)
 
 
 async def _live_trading_loop():
