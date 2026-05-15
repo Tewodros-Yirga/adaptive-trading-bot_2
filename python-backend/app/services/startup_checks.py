@@ -7,6 +7,8 @@ Does NOT raise exceptions — the app must start even if checks fail.
 import logging
 from datetime import datetime
 
+import httpx  # needed for backtester connectivity check (check 8)
+
 logger = logging.getLogger(__name__)
 
 
@@ -228,6 +230,32 @@ async def run_startup_checks(db) -> list[dict]:
             "name": "strategy_params",
             "status": "WARN",
             "message": f"Could not validate strategy params: {e}",
+        })
+
+    # ── 8. Backtester service connectivity ────────────────────────────────
+    try:
+        from app.config import settings  # absolute import — works from services/ package
+
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{settings.backtester_service_url}/health")
+            if r.status_code == 200:
+                data = r.json()
+                checks.append({
+                    "name": "backtester_service",
+                    "status": "OK",
+                    "message": f"Backtester running, strategies: {data.get('strategies_running', [])}",
+                })
+            else:
+                checks.append({
+                    "name": "backtester_service",
+                    "status": "WARN",
+                    "message": f"Backtester returned {r.status_code}",
+                })
+    except Exception as e:
+        checks.append({
+            "name": "backtester_service",
+            "status": "WARN",
+            "message": f"Backtester unreachable: {e} — continuous backtesting may be offline",
         })
 
     # ── Stamp all checks with a timestamp and log ─────────────────────────

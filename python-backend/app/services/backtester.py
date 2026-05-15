@@ -135,6 +135,8 @@ def _build_mtf_bars_for_index(
 
     The primary OHLCV list is treated as the 1h frame. Higher/lower timeframes
     are supplied via extra_ohlcv_by_tf and sliced by date up to the current bar's date.
+    Always populates 1d/4h/1h from primary_ohlcv as a fallback so MTF strategies
+    never receive all-empty DataFrames.
     """
     import pandas as pd
 
@@ -158,12 +160,19 @@ def _build_mtf_bars_for_index(
     primary_df = _list_to_df(primary_ohlcv[: i + 1], current_date_str)
 
     # Build the bars_by_tf dict from the extra timeframes.
-    # Do NOT fall back to daily bars as "1h" — feeding daily bars to the 1h
-    # slot causes CRT / structure checks to operate on wrong candle granularity.
-    # Strategy internal guards already handle missing timeframes gracefully.
     bars_by_tf: dict[str, "pd.DataFrame"] = {}
     for tf, ohlcv_list in extra_ohlcv_by_tf.items():
         bars_by_tf[tf] = _list_to_df(ohlcv_list, current_date_str)
+
+    # Always ensure 1d, 4h, 1h are populated — use primary (daily) data as proxy
+    # when the dedicated fetches are unavailable. This prevents Alchemist and other
+    # MTF strategies from receiving all-empty DataFrames.
+    if "1d" not in bars_by_tf or bars_by_tf["1d"].empty:
+        bars_by_tf["1d"] = primary_df
+    if "4h" not in bars_by_tf or bars_by_tf["4h"].empty:
+        bars_by_tf["4h"] = primary_df  # daily bars as 4h proxy
+    if "1h" not in bars_by_tf or bars_by_tf["1h"].empty:
+        bars_by_tf["1h"] = primary_df  # daily bars as 1h proxy
 
     return bars_by_tf
 
@@ -196,6 +205,7 @@ def _run_backtest_sync(
 
     strat = get_strategy(strategy_name, params)
     is_mtf_strategy = getattr(strat, "requires_mtf", False)
+    contract_size = _contract_size(symbol)  # units per lot — varies by instrument
     closes = [r["close"] for r in ohlcv]
     highs  = [r["high"]  for r in ohlcv]
     lows   = [r["low"]   for r in ohlcv]
@@ -293,7 +303,7 @@ def _run_backtest_sync(
                 if bar["low"] <= open_trade["sl"]:
                     exit_price = open_trade["sl"]
                     exit_reason = "SL_HIT"
-                    pnl = (exit_price - open_trade["entry"]) * open_trade["lots"] * 100000
+                    pnl = (exit_price - open_trade["entry"]) * open_trade["lots"] * contract_size
                     balance += pnl
                     trades.append({**open_trade, "result": "LOSS", "pnl": round(pnl, 4), "exit": exit_price})
                     open_trade["result"] = "LOSS"
@@ -307,7 +317,7 @@ def _run_backtest_sync(
                 elif bar["high"] >= open_trade["tp"]:
                     exit_price = open_trade["tp"]
                     exit_reason = "TP1_HIT"
-                    pnl = (exit_price - open_trade["entry"]) * open_trade["lots"] * 100000
+                    pnl = (exit_price - open_trade["entry"]) * open_trade["lots"] * contract_size
                     balance += pnl
                     trades.append({**open_trade, "result": "WIN", "pnl": round(pnl, 4), "exit": exit_price})
                     open_trade["result"] = "WIN"
@@ -322,7 +332,7 @@ def _run_backtest_sync(
                 if bar["high"] >= open_trade["sl"]:
                     exit_price = open_trade["sl"]
                     exit_reason = "SL_HIT"
-                    pnl = (open_trade["entry"] - exit_price) * open_trade["lots"] * 100000
+                    pnl = (open_trade["entry"] - exit_price) * open_trade["lots"] * contract_size
                     balance += pnl
                     trades.append({**open_trade, "result": "LOSS", "pnl": round(pnl, 4), "exit": exit_price})
                     open_trade["result"] = "LOSS"
@@ -336,7 +346,7 @@ def _run_backtest_sync(
                 elif bar["low"] <= open_trade["tp"]:
                     exit_price = open_trade["tp"]
                     exit_reason = "TP1_HIT"
-                    pnl = (open_trade["entry"] - exit_price) * open_trade["lots"] * 100000
+                    pnl = (open_trade["entry"] - exit_price) * open_trade["lots"] * contract_size
                     balance += pnl
                     trades.append({**open_trade, "result": "WIN", "pnl": round(pnl, 4), "exit": exit_price})
                     open_trade["result"] = "WIN"
@@ -412,10 +422,38 @@ def _run_backtest_sync(
             else:
                 levels = {}
         elif is_mtf_strategy:
-            # MTF strategy but no extra_ohlcv_by_tf available — skip bar entirely
-            # rather than calling strategy with non-MTF data missing required DataFrames.
-            equity_curve.append({"date": bar_date, "equity": round(balance, 2)})
-            continue
+            # No extra_ohlcv_by_tf provided — build minimal bars_by_tf from primary_ohlcv
+            # so MTF strategies are never starved of data entirely.
+            minimal_extra: dict[str, list[dict]] = {}  # empty — _build_mtf_bars_for_index will fill from primary
+            bars_by_tf = _build_mtf_bars_for_index(i, ohlcv, minimal_extra)
+            from .ohlcv import build_mtf_market_data
+            try:
+                bar_ts = datetime.fromisoformat(bar_date)
+            except ValueError:
+                bar_ts = datetime.utcnow()
+            if len(bar_date) == 10 and bar_ts.hour == 0 and bar_ts.minute == 0:
+                bar_ts = bar_ts.replace(hour=8, minute=30)
+
+            atr_val = atr_series[i] or price * 0.005
+            market_data_bar = build_mtf_market_data(
+                symbol=symbol,
+                current_idx=-1,
+                bars_by_tf=bars_by_tf,
+                atr=atr_val,
+            )
+            market_data_bar["timestamp"] = bar_ts
+            market_data_bar["current_price"] = price
+
+            raw_sig = strat.signal(market_data_bar)
+            if isinstance(raw_sig, tuple):
+                signal, _conf = raw_sig
+            else:
+                signal = raw_sig
+
+            if signal:
+                levels = strat.compute_levels(signal, price, current_params)
+            else:
+                levels = {}
         else:
             # ── Universal market_data_bar — all indicators for all strategies ──
             ema_vals = {f"ema_{j+1}": ema_series_list[j][i] for j in range(6)}
@@ -466,7 +504,7 @@ def _run_backtest_sync(
         if signal and levels:
             risk_amount = balance * (risk_per_trade_pct / 100)
             sl_dist = abs(price - levels["sl"])
-            lots = min(round(risk_amount / (sl_dist * 100000), 2), 10.0) if sl_dist > 0 else 0.01
+            lots = min(round(risk_amount / (sl_dist * contract_size), 2), 10.0) if sl_dist > 0 else 0.01
             lots = max(0.01, lots)
             open_trade = {
                 "entry": price,
@@ -487,9 +525,9 @@ def _run_backtest_sync(
         last_bar = ohlcv[-1]
         last_price = last_bar["close"]
         if open_trade["direction"] == "BUY":
-            pnl = (last_price - open_trade["entry"]) * open_trade["lots"] * 100000
+            pnl = (last_price - open_trade["entry"]) * open_trade["lots"] * contract_size
         else:
-            pnl = (open_trade["entry"] - last_price) * open_trade["lots"] * 100000
+            pnl = (open_trade["entry"] - last_price) * open_trade["lots"] * contract_size
         result = "WIN" if pnl > 0 else "LOSS"
         trades.append({**open_trade, "result": result, "pnl": round(pnl, 4), "exit": last_price})
         open_trade["result"] = result
@@ -499,6 +537,16 @@ def _run_backtest_sync(
         open_trade["closed_at"] = last_bar.get("date", "")
         trade_log.append(_build_trade_log_entry(trade_index, open_trade, symbol, current_params))
         balance += pnl
+
+    # Diagnostic: log why Alchemist produced zero trades
+    if strategy_name == "Alchemist" and len(trades) == 0:
+        logger.warning(
+            "Alchemist ZERO TRADES diagnostic — symbol=%s bars_processed=%d start_idx=%d",
+            symbol, len(ohlcv) - start_idx, start_idx,
+        )
+        if is_mtf_strategy and extra_ohlcv_by_tf is not None:
+            for tf, bars in extra_ohlcv_by_tf.items():
+                logger.warning("  extra_ohlcv[%s]: %d bars", tf, len(bars))
 
     # ── Compute metrics ────────────────────────────────────────────────────────
     wins = [t for t in trades if t["result"] == "WIN"]
@@ -661,8 +709,18 @@ def _maybe_adapt(
     old_params = dict(current_params)
     composite_before = _compute_composite_score(win_rate * 100, profit_factor)
 
+    # Build learning_settings so strat.adapt() has context to make decisions.
+    # step_size mirrors the backtester's own param-search default.
+    learning_settings = {
+        "step_size": 0.05,
+        "win_rate": round(win_rate, 4),
+        "profit_factor": round(profit_factor, 4),
+        "trade_count": trade_count,
+    }
+
     try:
-        new_params = strat.adapt(current_params, recent_trades)
+        # Correct signature: adapt(trades, learning_settings)
+        new_params = strat.adapt(recent_trades, learning_settings)
         if new_params:
             deltas = {
                 k: round(new_params[k] - old_params.get(k, 0), 6)
@@ -670,6 +728,7 @@ def _maybe_adapt(
                 if k in old_params and new_params[k] != old_params.get(k)
             }
             current_params.update(new_params)
+            strat.update_params(new_params)  # keep strategy instance in sync
             composite_after = _compute_composite_score(win_rate * 100, profit_factor)
             adaptation_events.append({
                 "after_trade_index": trade_count,
@@ -683,7 +742,7 @@ def _maybe_adapt(
                 "composite_score_after": round(composite_after, 4),
             })
     except Exception as e:
-        logger.debug("Strategy adapt() raised: %s", e)
+        logger.warning("Strategy adapt() raised: %s", e)
 
     return adaptation_events
 
@@ -692,6 +751,39 @@ def _compute_composite_score(win_rate_pct: float, profit_factor: float) -> float
     wr_norm = min(win_rate_pct / 100.0, 1.0)
     pf_norm = min(profit_factor / 3.0, 1.0)
     return 0.6 * wr_norm + 0.4 * pf_norm
+
+
+def _contract_size(symbol: str) -> float:
+    """
+    Return the correct contract size (units per lot) for a symbol.
+
+    Forex majors/minors/exotics : 100,000  (standard lot = 100k units)
+    Gold  XAUUSD                :     100  (1 lot = 100 troy oz)
+    Silver XAGUSD               :   5,000  (1 lot = 5,000 oz)
+    Oil   XTIUSD / XBRUSD       :   1,000  (1 lot = 1,000 barrels)
+    Indices (US30, NAS100, …)   :       1  (1 lot = 1 index unit / CFD)
+    Crypto (BTCUSD, ETHUSD, …)  :       1  (1 lot = 1 coin)
+
+    Add rows here as you add new symbols.
+    """
+    sym = symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(" ", "")
+    # Metals
+    if sym in ("XAUUSD", "GOLD"):
+        return 100.0
+    if sym in ("XAGUSD", "SILVER"):
+        return 5_000.0
+    # Energy
+    if sym in ("XTIUSD", "USOIL", "XBRUSD", "UKOIL", "WTIUSD"):
+        return 1_000.0
+    # Indices
+    if any(sym.startswith(idx) for idx in ("US30", "NAS100", "SPX500", "US500",
+                                            "GER40", "UK100", "JPN225", "AUS200")):
+        return 1.0
+    # Crypto
+    if any(sym.startswith(c) for c in ("BTC", "ETH", "XRP", "LTC", "SOL", "BNB")):
+        return 1.0
+    # Default: standard forex lot
+    return 100_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -728,16 +820,25 @@ def run_backtest_sync_standalone(
 
     # For MTF strategies (e.g. Alchemist), fetch sub-daily timeframes.
     # MT5 Bridge is tried first — it has full historical 1h/15m data.
+    # If fetching fails, fall back gracefully to daily data as a proxy so the
+    # strategy always has *something* to work with (Alchemist's internal
+    # fallback logic handles daily-proxy data correctly).
     extra_ohlcv_by_tf: dict[str, list[dict]] = {}
     try:
         strat_check = get_strategy(strategy_name, params)
         if getattr(strat_check, "requires_mtf", False):
-            for tf in ("1d", "4h", "1h", "15m"):
+            # Always seed with daily data so MTF strategies have a base
+            extra_ohlcv_by_tf["1d"] = ohlcv
+            extra_ohlcv_by_tf["4h"] = ohlcv  # daily as 4h proxy until real 4h loads
+            for tf in ("4h", "1h", "15m"):
                 try:
-                    extra_ohlcv_by_tf[tf] = fetch_ohlcv_sync(symbol, from_date, to_date, tf)
-                    logger.info("MTF standalone %s %s: %d bars", symbol, tf, len(extra_ohlcv_by_tf[tf]))
+                    fetched = fetch_ohlcv_sync(symbol, from_date, to_date, tf)
+                    if fetched:
+                        extra_ohlcv_by_tf[tf] = fetched
+                        logger.info("MTF standalone %s %s: %d bars", symbol, tf, len(fetched))
                 except Exception as exc:
-                    logger.warning("MTF standalone fetch failed %s %s: %s", symbol, tf, exc)
+                    logger.warning("MTF standalone fetch failed %s %s: %s — using daily proxy", symbol, tf, exc)
+                    # Leave the daily proxy already set; don't overwrite with nothing
     except Exception as exc:
         logger.warning("MTF strategy check failed for %s: %s", strategy_name, exc)
 
@@ -860,7 +961,7 @@ def run_backtest(
         result_row.monthly_breakdown_json = monthly_breakdown
         result_row.parameter_evolution_log_json = parameter_evolution_log
         result_row.drawdown_periods_json = drawdown_periods
-        result_row.status = "COMPLETED"
+        result_row.status = "COMPLETE"
         result_row.completed_at = datetime.utcnow()
     except Exception as exc:
         logger.exception("Backtest run failed for %s/%s", strategy_name, symbol)

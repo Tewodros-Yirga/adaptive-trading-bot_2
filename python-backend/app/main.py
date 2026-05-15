@@ -1,10 +1,14 @@
 """
 AlgoTrade Pro — FastAPI Application Entry Point
+
+NOTE: Continuous backtesting has been moved to the standalone backtester-service
+(backtester_service/). The backend no longer runs a ProcessPoolExecutor or
+start_continuous_backtest tasks. Strategy param updates are picked up from
+MongoDB (strategies collection) which the backtester writes to.
 """
 import asyncio
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Security
@@ -18,9 +22,6 @@ from .startup_migrations import run_startup_migrations
 from .auth_deps import get_current_user, require_admin, require_write_access, seed_admin_user
 
 logger = logging.getLogger(__name__)
-
-# Shared ProcessPoolExecutor for backtesting workers
-_EXECUTOR = ProcessPoolExecutor(max_workers=2)
 
 
 @asynccontextmanager
@@ -97,29 +98,9 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(_news_learning_loop()))
     bg_tasks.append(asyncio.create_task(_global_context_loop()))
 
-    # ── 8. Start continuous backtest loops for ALL registered strategies ──────
-    db = SessionLocal()
-    try:
-        from .strategy.registry import STRATEGY_REGISTRY
-        from .services.continuous_backtest import start_continuous_backtest
-        # Stagger starts by 60 s per strategy to avoid hammering the bridge
-        # and yfinance with simultaneous requests at boot.
-        for idx, strategy_name in enumerate(STRATEGY_REGISTRY):
-            startup_delay = idx * 60  # 0s, 60s, 120s, ...
-            task = asyncio.create_task(
-                start_continuous_backtest(strategy_name, _EXECUTOR, startup_delay=startup_delay)
-            )
-            bg_tasks.append(task)
-            logger.info(
-                "Registered continuous backtest loop for %s (starts in %ds)",
-                strategy_name, startup_delay,
-            )
-    except Exception as e:
-        logger.warning(f"Could not start continuous backtest loops: {e}")
-    finally:
-        db.close()
-
-    # ── 9. Start live trading loop (polls bridge price → orchestrator → trade) ──
+    # ── 8. Start live trading loop ─────────────────────────────────────────
+    # NOTE: Continuous backtesting now runs in the dedicated backtester-service.
+    #       The backend only needs the live trading loop here.
     try:
         bg_tasks.append(asyncio.create_task(_live_trading_loop()))
         logger.info("Started live trading loop.")
@@ -137,7 +118,6 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-    _EXECUTOR.shutdown(wait=False)
     logger.info("Application shutdown complete.")
 
 
@@ -199,9 +179,6 @@ async def _live_trading_loop():
       3. Pass price + minimal market_data to process_signal().
       4. The orchestrator + picker handle signal gathering, strategy selection,
          risk checks, and order placement.
-
-    Shadow signals are always logged regardless of simulation_mode, so you can
-    watch what the strategies *would* do before going live.
     """
     await asyncio.sleep(30)  # brief initial delay so the bridge has time to connect
     while True:
@@ -312,7 +289,8 @@ def create_app() -> FastAPI:
     from .routers.shadow_signals import router as shadow_router
     from .routers.ensemble import router as ensemble_router
     from .routers.picker import router as picker_router
-    from .routers.system import router as system_router       # NEW
+    from .routers.system import router as system_router
+    from .routers.health import router as health_router          # ← Feature 8
 
     # ── Auth router (public — no auth required for login) ──────────────────
     app.include_router(auth_router)
@@ -336,7 +314,9 @@ def create_app() -> FastAPI:
     app.include_router(shadow_router, dependencies=jwt_deps)
     app.include_router(ensemble_router, dependencies=jwt_deps)
     app.include_router(picker_router, dependencies=jwt_deps)
-    app.include_router(system_router, dependencies=jwt_deps)  # NEW
+    app.include_router(system_router, dependencies=jwt_deps)
+    # /health/db is public — no jwt_deps
+    app.include_router(health_router)                            # ← Feature 8
 
     # ── Serve frontend SPA ────────────────────────────────────────────────
     frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
@@ -344,7 +324,7 @@ def create_app() -> FastAPI:
         app.mount("/app", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
     @app.get("/health")
-    def health():
+    def health_check():
         return {"status": "ok", "version": "2.0.0"}
 
     return app

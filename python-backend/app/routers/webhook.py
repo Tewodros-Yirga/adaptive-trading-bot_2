@@ -2,8 +2,11 @@
 Webhook router — receives trading signals from TradingView / external sources.
 """
 import logging
+import time
+from collections import deque
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
@@ -17,6 +20,43 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
+# ── Feature 9: In-memory rate limiter ────────────────────────────────────
+# Stores (timestamp, symbol) tuples for recent signal calls.
+_signal_timestamps: deque = deque()   # all signals — global cap
+_symbol_timestamps: dict[str, deque] = {}  # per-symbol cap
+
+_GLOBAL_LIMIT = 60   # max signals per 60s across all symbols
+_SYMBOL_LIMIT = 10   # max signals per 60s per symbol
+_WINDOW_SECS  = 60
+
+
+def _check_rate_limit(symbol: str) -> tuple[bool, str]:
+    """Returns (allowed, reason). Prunes stale entries on every call."""
+    now = time.monotonic()
+    cutoff = now - _WINDOW_SECS
+
+    # Prune global deque
+    while _signal_timestamps and _signal_timestamps[0] < cutoff:
+        _signal_timestamps.popleft()
+
+    # Prune per-symbol deque
+    if symbol not in _symbol_timestamps:
+        _symbol_timestamps[symbol] = deque()
+    sym_dq = _symbol_timestamps[symbol]
+    while sym_dq and sym_dq[0] < cutoff:
+        sym_dq.popleft()
+
+    # Check limits
+    if len(_signal_timestamps) >= _GLOBAL_LIMIT:
+        return False, f"Global rate limit: max {_GLOBAL_LIMIT} signals/{_WINDOW_SECS}s"
+    if len(sym_dq) >= _SYMBOL_LIMIT:
+        return False, f"Symbol rate limit: max {_SYMBOL_LIMIT} signals/{_WINDOW_SECS}s for {symbol}"
+
+    # Record this call
+    _signal_timestamps.append(now)
+    sym_dq.append(now)
+    return True, ""
+
 
 @router.post("/signal")
 def receive_signal(payload: WebhookPayload, db: Session = Depends(get_db)):
@@ -29,6 +69,17 @@ def receive_signal(payload: WebhookPayload, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     symbol = payload.symbol or settings.symbol
+
+    # ── Rate limiting ─────────────────────────────────────────────────────
+    allowed, reason = _check_rate_limit(symbol)
+    if not allowed:
+        retry_after = _WINDOW_SECS
+        return JSONResponse(
+            status_code=429,
+            content={"detail": reason, "retry_after": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+
     logger.info(f"Webhook signal received: {payload.signal} for {symbol}")
 
     # ── Map signal to direction ───────────────────────────────────────────
@@ -118,10 +169,6 @@ def close_trade_webhook(
         raise HTTPException(status_code=404, detail=f"Trade #{trade_id} not found")
 
     # ── Trigger online picker weight learning ─────────────────────────────
-    # Find the most recent StrategyPickerDecision that led to this trade.
-    # The picker back-fills trade_id after order placement, so we query by
-    # trade_id directly first, then fall back to the most recent decision
-    # for the trade's symbol within a short window.
     try:
         from ..services.strategy_picker import update_picker_weights_from_trade
 
@@ -131,7 +178,6 @@ def close_trade_webhook(
             .limit(1)
         )
         if picker_decision is None and trade.symbol:
-            # Fallback: nearest decision by timestamp for this symbol
             picker_decision = db.scalar(
                 select(StrategyPickerDecision)
                 .where(StrategyPickerDecision.symbol == trade.symbol)
@@ -141,15 +187,10 @@ def close_trade_webhook(
 
         if picker_decision:
             update_picker_weights_from_trade(trade, picker_decision, db)
-            logger.info(
-                f"Picker weights updated from trade #{trade_id} result={result}"
-            )
+            logger.info(f"Picker weights updated from trade #{trade_id} result={result}")
         else:
-            logger.debug(
-                f"No StrategyPickerDecision found for trade #{trade_id}; skipping weight update"
-            )
+            logger.debug(f"No StrategyPickerDecision found for trade #{trade_id}; skipping weight update")
     except Exception as exc:
-        # Weight learning is non-critical — log and continue
         logger.warning(f"Picker weight update failed for trade #{trade_id}: {exc}")
 
     return {

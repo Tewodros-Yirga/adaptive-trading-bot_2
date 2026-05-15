@@ -1,11 +1,13 @@
 import json
+import logging
 from math import sqrt
 
 from sqlalchemy.orm import Session
 
 from .. import crud
-from ..strategy.dtc import DEFAULT_PARAMS
 from .runtime_settings import get_learning_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -18,9 +20,51 @@ def _tiny_step(current: float, target_delta: float, max_change_pct: float) -> tu
     return current + bounded_delta, bounded_delta
 
 
+def _load_strategy_params(db: Session, strategy_name: str) -> dict:
+    """
+    Load current params for the given strategy from the strategies collection.
+    Falls back to the strategy class's default_params via STRATEGY_REGISTRY.
+    """
+    # Try loading from the Strategy row in DB
+    try:
+        from sqlalchemy import select
+        from ..models import Strategy
+        row = db.scalar(select(Strategy).where(Strategy.name == strategy_name))
+        if row and row.params_json:
+            import json as _json
+            params = _json.loads(row.params_json)
+            if params:
+                return params
+    except Exception as e:
+        logger.warning("Could not load params from Strategy row for %s: %s", strategy_name, e)
+
+    # Fall back to STRATEGY_REGISTRY default_params
+    try:
+        from ..strategy.registry import STRATEGY_REGISTRY
+        if strategy_name in STRATEGY_REGISTRY:
+            strategy_cls = STRATEGY_REGISTRY[strategy_name]
+            instance = strategy_cls({})
+            if hasattr(instance, "default_params") and callable(instance.default_params):
+                return instance.default_params()
+    except Exception as e:
+        logger.warning("Could not load default_params from registry for %s: %s", strategy_name, e)
+
+    # Last resort: DTC defaults
+    try:
+        from ..strategy.dtc import DEFAULT_PARAMS
+        return DEFAULT_PARAMS.copy()
+    except Exception:
+        return {}
+
+
 def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") -> dict:
     learning = get_learning_settings(db)
-    params = crud.get_current_params(db) or DEFAULT_PARAMS.copy()
+
+    # Load strategy-specific params instead of always using DTC defaults
+    params = _load_strategy_params(db, strategy_name)
+    if not params:
+        return {"skipped": True, "reason": f"Could not load params for strategy {strategy_name}"}
+
     all_closed = crud.get_closed_trades(db, 100000)
     last_adapt_count_raw = crud.get_setting(db, "last_adapt_closed_count")
     last_adapt_count = int(last_adapt_count_raw) if last_adapt_count_raw else 0
@@ -52,12 +96,13 @@ def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") ->
 
     sl_signal = (0.5 - win_rate) * 0.2
     sl_target_delta = sl_signal * lr * 100
-    new_sl, sl_delta = _tiny_step(float(params["stop_loss_pct"]), sl_target_delta, learning["adaptation_max_change_pct"])
-    new_sl = _clamp(new_sl, params.get("min_stop_loss_pct", 0.1), params.get("max_stop_loss_pct", 1.5))
-    if abs(new_sl - params["stop_loss_pct"]) > 0:
-        new_params["stop_loss_pct"] = round(new_sl, 5)
-        deltas.append(sl_delta)
-        actions.append({"rule": "tiny_sl_update", "detail": f"SL {params['stop_loss_pct']} -> {new_params['stop_loss_pct']}"})
+    if "stop_loss_pct" in params:
+        new_sl, sl_delta = _tiny_step(float(params["stop_loss_pct"]), sl_target_delta, learning["adaptation_max_change_pct"])
+        new_sl = _clamp(new_sl, params.get("min_stop_loss_pct", 0.1), params.get("max_stop_loss_pct", 1.5))
+        if abs(new_sl - params["stop_loss_pct"]) > 0:
+            new_params["stop_loss_pct"] = round(new_sl, 5)
+            deltas.append(sl_delta)
+            actions.append({"rule": "tiny_sl_update", "detail": f"SL {params['stop_loss_pct']} -> {new_params['stop_loss_pct']}"})
 
     tp_signal = (profit_factor - 1.0) * 0.02
     tp_target_delta = tp_signal * lr * 100
@@ -98,6 +143,7 @@ def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") ->
         trigger="AUTO",
         confidence_score=confidence,
         delta_magnitude=delta_magnitude,
+        strategy_name=strategy_name,
     )
     crud.log_adaptation(
         db,
@@ -115,6 +161,20 @@ def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") ->
         },
     )
     crud.set_setting(db, "last_adapt_closed_count", str(len(all_closed)))
+
+    # Persist updated params back to the Strategy row
+    try:
+        from sqlalchemy import select
+        from ..models import Strategy
+        from datetime import datetime
+        row = db.scalar(select(Strategy).where(Strategy.name == strategy_name))
+        if row:
+            row.params_json = json.dumps(new_params)
+            row.updated_at = datetime.utcnow()
+            db.commit()
+    except Exception as e:
+        logger.warning("Could not persist adapted params to Strategy row for %s: %s", strategy_name, e)
+
     return {
         "trades_evaluated": len(trades),
         "win_rate": round(win_rate * 100, 2),

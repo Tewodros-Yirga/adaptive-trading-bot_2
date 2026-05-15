@@ -73,7 +73,8 @@ def compute_factor_scores(
 ) -> dict[str, float]:
     """
     Returns raw factor scores (0.0–1.0) for each of the 7 factors.
-    Falls back to backtest composite score when live trade history is thin.
+    Falls back to backtest composite score when live trade history is thin,
+    but uses strategy-specific factors (freshness, signal_confidence) even then.
     """
     lookback = int(crud.get_setting(db, "picker_lookback_trades") or 20)
     min_live_trades = int(crud.get_setting(db, "picker_min_trades_for_scoring") or 5)
@@ -82,8 +83,25 @@ def compute_factor_scores(
 
     if len(recent_trades) < min_live_trades:
         best_candidate = crud.get_best_backtest_candidate(db, strategy_name)
-        score = best_candidate.composite_score if best_candidate else 0.3
-        return {f: score for f in FACTOR_NAMES}
+        bt_score = best_candidate.composite_score if best_candidate else 0.3
+
+        # Use strategy-specific factors even without live trades
+        latest_param = crud.get_latest_param_version_for_strategy(db, strategy_name)
+        if latest_param:
+            hours_since = (datetime.datetime.utcnow() - latest_param.created_at).total_seconds() / 3600
+            freshness = math.exp(-0.01 * hours_since)
+        else:
+            freshness = 0.5
+
+        return {
+            "recent_win_rate": bt_score,
+            "profit_factor": bt_score,
+            "backtest_composite_score": bt_score,
+            "drawdown": 0.8,            # assume low drawdown when untested
+            "signal_confidence": float(signal_confidence),
+            "recency_of_last_win": 0.0, # no wins yet
+            "parameter_freshness": freshness,
+        }
 
     wins = [t for t in recent_trades if t.result == "WIN"]
     recent_win_rate = len(wins) / len(recent_trades)

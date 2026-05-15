@@ -1,5 +1,6 @@
 """
 Authentication dependencies — JWT creation/verification, role guards.
+Updated to use pymongo (MongoDB) instead of SQLAlchemy.
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -8,11 +9,10 @@ import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .config import settings
-from .db import get_db
+from .db import get_db, COLL_USERS
 from .models import User
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
-def create_access_token(user_id: int, username: str, role: str, full_access: bool) -> str:
+def create_access_token(user_id: str, username: str, role: str, full_access: bool) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user_id),
@@ -61,17 +61,33 @@ def decode_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def get_current_user_from_token(token: str, db: Session) -> User | None:
+def _get_user_by_id(db: Database, user_id: str) -> User | None:
+    """Fetch a user document by string ID (stored as username-keyed or ObjectId)."""
+    from bson import ObjectId
+    # Try ObjectId first, fall back to numeric id field
+    doc = None
+    try:
+        doc = db[COLL_USERS].find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        pass
+    if not doc:
+        # Fallback: some tokens may store integer id
+        try:
+            doc = db[COLL_USERS].find_one({"id": int(user_id)})
+        except Exception:
+            pass
+    return User.from_doc(doc) if doc else None
+
+
+def get_current_user_from_token(token: str, db: Database) -> User | None:
     """
     Decode a raw JWT string and return the matching active User, or None.
-
-    Used by the WebSocket endpoint which receives the token as a query parameter
-    rather than an Authorization header.
+    Used by the WebSocket endpoint (token passed as query parameter).
     """
     try:
         payload = decode_token(token)
-        user_id = int(payload["sub"])
-        user = db.get(User, user_id)
+        user_id = payload["sub"]
+        user = _get_user_by_id(db, user_id)
         if not user or not user.is_active:
             return None
         return user
@@ -81,13 +97,13 @@ def get_current_user_from_token(token: str, db: Session) -> User | None:
 
 async def get_current_user(
     creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> User:
     if creds is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     payload = decode_token(creds.credentials)
-    user_id = int(payload["sub"])
-    user = db.get(User, user_id)
+    user_id = payload["sub"]
+    user = _get_user_by_id(db, user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     return user
@@ -108,31 +124,37 @@ async def require_write_access(user: User = Depends(get_current_user)) -> User:
     raise HTTPException(status_code=403, detail="Write access required")
 
 
-def seed_admin_user(db: Session) -> None:
+def seed_admin_user(db: Database) -> None:
     """Create admin user from env vars if it doesn't exist."""
     if not settings.admin_password:
         logger.warning("ADMIN_PASSWORD not set — skipping admin seed")
         return
-    existing = db.scalar(
-        select(User).where(User.username == settings.admin_username)
-    )
-    if existing:
-        # Update password hash in case it changed
-        new_hash = hash_password(settings.admin_password)
+
+    existing_doc = db[COLL_USERS].find_one({"username": settings.admin_username})
+
+    if existing_doc:
+        existing = User.from_doc(existing_doc)
+        # Update password hash if it changed
         if not verify_password(settings.admin_password, existing.password_hash):
-            existing.password_hash = new_hash
-            existing.role = "admin"
-            existing.is_active = True
-            db.commit()
+            new_hash = hash_password(settings.admin_password)
+            db[COLL_USERS].update_one(
+                {"username": settings.admin_username},
+                {"$set": {
+                    "password_hash": new_hash,
+                    "role": "admin",
+                    "is_active": True,
+                }},
+            )
             logger.info(f"Admin user '{settings.admin_username}' password updated.")
         return
-    user = User(
-        username=settings.admin_username,
-        password_hash=hash_password(settings.admin_password),
-        role="admin",
-        full_access=True,
-        is_active=True,
-    )
-    db.add(user)
-    db.commit()
-    logger.info(f"Admin user '{settings.admin_username}' created.")
+
+    doc = {
+        "username": settings.admin_username,
+        "password_hash": hash_password(settings.admin_password),
+        "role": "admin",
+        "full_access": True,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    result = db[COLL_USERS].insert_one(doc)
+    logger.info(f"Admin user '{settings.admin_username}' created (id={result.inserted_id}).")

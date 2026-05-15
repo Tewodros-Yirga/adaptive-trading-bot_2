@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
-sqlalchemy
-psycopg2-binary
+pymongo[srv]==3.11
 python-dotenv
 pydantic-settings
 httpx
@@ -13,5 +12,4 @@ pyjwt
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 yfinance
-alembic
 weasyprint

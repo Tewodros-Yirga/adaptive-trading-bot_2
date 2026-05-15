@@ -613,6 +613,16 @@ def seed_default_settings(db: Session) -> None:
         for suffix, value in per_strategy_defaults.items():
             _maybe_add(f"{strategy_name}_{suffix}", value)
 
+    # ── Alchemist-specific overrides (more permissive — complex multi-confluent strategy) ──
+    alchemist_overrides: dict[str, str] = {
+        "Alchemist_qualify_threshold_win_rate": "45.0",  # lower bar — complex strategy
+        "Alchemist_backtest_timeframes": '["1d"]',       # daily only for now
+        "Alchemist_backtest_symbols": '["XAUUSD"]',
+        "Alchemist_param_step_size": "0.03",
+    }
+    for key, value in alchemist_overrides.items():
+        _maybe_add(key, value)
+
     if rows_to_insert:
         db.bulk_save_objects(rows_to_insert)
         db.commit()

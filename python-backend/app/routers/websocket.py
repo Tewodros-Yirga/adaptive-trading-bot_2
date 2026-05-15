@@ -24,6 +24,16 @@ async def broadcast(event_type: str, data: Any):
         _connections.remove(ws)
 
 
+async def broadcast_ws_event(event: dict) -> None:
+    """
+    Broadcast a pre-formed event dict to all connected WebSocket clients.
+    Reads 'event' or 'type' key for the event_type; falls back to 'event'.
+    Called by continuous_backtest and other services.
+    """
+    event_type = event.get("event") or event.get("type") or "event"
+    await broadcast(event_type, event)
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
