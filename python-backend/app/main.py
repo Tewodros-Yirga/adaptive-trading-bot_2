@@ -168,51 +168,37 @@ async def _backtester_keepalive_loop():
     Ping the HuggingFace-hosted backtester service every 4 minutes so the
     Space does not go to sleep from inactivity (HF sleeps after ~5 min idle).
 
-    Reads BACKTESTER_URL from env (e.g. https://your-user-backtester.hf.space).
-    The backtester exposes GET /ping which is a zero-cost no-DB endpoint.
-
-    HF private Spaces require an HF_TOKEN passed as a Bearer token.
-    Set BACKTESTER_HF_TOKEN in your backend env/secrets if the Space is private.
+    Uses BacktesterClient so the HF Bearer token is always included — required
+    for private Spaces.  Configure via env/secrets:
+        BACKTESTER_URL       e.g. https://youruser-spacename.hf.space
+        BACKTESTER_HF_TOKEN  your HuggingFace read token
     """
-    # Wait a bit at startup so the backtester has time to boot
-    await asyncio.sleep(30)
+    await asyncio.sleep(30)  # let the backtester finish cold-starting
 
-    from .config import settings as _settings
+    from .services.backtester_client import BacktesterClient, BacktesterUnavailable
 
-    backtester_url: str = getattr(_settings, "backtester_url", "") or os.environ.get("BACKTESTER_URL", "")
-    hf_token: str = getattr(_settings, "backtester_hf_token", "") or os.environ.get("BACKTESTER_HF_TOKEN", "")
+    client = BacktesterClient()
 
-    if not backtester_url:
+    if not client.is_configured:
         logger.warning(
             "Backtester keepalive: BACKTESTER_URL not set — keepalive disabled. "
-            "Set it to the HuggingFace Space URL (e.g. https://user-spacename.hf.space)."
+            "Add it to your backend env/secrets."
         )
         return
-
-    ping_url = backtester_url.rstrip("/") + "/ping"
-    headers: dict = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
 
     interval = 240  # 4 minutes — safely under HF's ~5-min idle threshold
 
     while True:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(ping_url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                logger.debug(
-                    "Backtester keepalive OK — uptime=%ss",
-                    data.get("uptime_seconds", "?"),
-                )
-            else:
-                logger.warning(
-                    "Backtester keepalive: unexpected status %d from %s",
-                    resp.status_code, ping_url,
-                )
+            data = await client.ping()
+            logger.debug("Backtester keepalive OK — uptime=%ss", data.get("uptime_seconds", "?"))
+        except BacktesterUnavailable as exc:
+            logger.warning("Backtester keepalive: %s", exc)
+            return  # misconfigured — stop looping
         except httpx.TimeoutException:
             logger.warning("Backtester keepalive: request timed out (Space may be cold-starting)")
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Backtester keepalive: HTTP %d from %s", exc.response.status_code, exc.request.url)
         except Exception as exc:
             logger.warning("Backtester keepalive error: %s", exc)
 

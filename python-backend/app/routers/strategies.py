@@ -13,7 +13,9 @@ from ..models import Strategy, Trade
 from ..schemas import BacktestCandidateOut, SearchStatusOut, SearchSettingsIn
 from ..services.orchestrator import get_ensemble_config, set_ensemble_config, set_strategy_live
 from ..strategy.registry import STRATEGY_REGISTRY, list_strategies
-
+from fastapi import APIRouter, HTTPException
+from ..services.backtester_client import BacktesterClient, BacktesterUnavailable
+ 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
 
@@ -368,25 +370,25 @@ def get_best_candidate(name: str, db: Database = Depends(get_db)):
     return crud.get_best_backtest_candidate(db, name)
 
 
-@router.get("/{name}/search-status", response_model=SearchStatusOut)
-async def search_status(name: str, db: Database = Depends(get_db)):
-    _ensure_strategies_exist(db)
-    doc = db[COLL_STRATEGIES].find_one({"name": name})
-    if not doc:
-        raise HTTPException(404, f"Strategy {name} not found")
+# @router.get("/{name}/search-status", response_model=SearchStatusOut)
+# async def search_status(name: str, db: Database = Depends(get_db)):
+#     _ensure_strategies_exist(db)
+#     doc = db[COLL_STRATEGIES].find_one({"name": name})
+#     if not doc:
+#         raise HTTPException(404, f"Strategy {name} not found")
 
-    from ..config import settings
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=settings.backtester_service_timeout) as client:
-            r = await client.get(f"{settings.backtester_service_url}/status/{name}")
-            if r.status_code == 200:
-                return r.json()
-    except Exception:
-        pass
+#     from ..config import settings
+#     import httpx
+#     try:
+#         async with httpx.AsyncClient(timeout=settings.backtester_service_timeout) as client:
+#             r = await client.get(f"{settings.backtester_service_url}/status/{name}")
+#             if r.status_code == 200:
+#                 return r.json()
+#     except Exception:
+#         pass
 
-    from ..services.continuous_backtest import get_search_status
-    return get_search_status(name)
+#     from ..services.continuous_backtest import get_search_status
+#     return get_search_status(name)
 
 
 @router.post("/{name}/search-settings")
@@ -422,26 +424,26 @@ def update_search_settings(
     return {"status": "updated", "settings": updated}
 
 
-@router.post("/{name}/pause-search")
-def pause_search(name: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
-    _ensure_strategies_exist(db)
-    doc = db[COLL_STRATEGIES].find_one({"name": name})
-    if not doc:
-        raise HTTPException(404, f"Strategy {name} not found")
-    from ..services.continuous_backtest import pause_search as _pause
-    _pause(name)
-    return {"status": "paused", "strategy": name}
+# @router.post("/{name}/pause-search")
+# def pause_search(name: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
+#     _ensure_strategies_exist(db)
+#     doc = db[COLL_STRATEGIES].find_one({"name": name})
+#     if not doc:
+#         raise HTTPException(404, f"Strategy {name} not found")
+#     from ..services.continuous_backtest import pause_search as _pause
+#     _pause(name)
+#     return {"status": "paused", "strategy": name}
 
 
-@router.post("/{name}/resume-search")
-def resume_search(name: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
-    _ensure_strategies_exist(db)
-    doc = db[COLL_STRATEGIES].find_one({"name": name})
-    if not doc:
-        raise HTTPException(404, f"Strategy {name} not found")
-    from ..services.continuous_backtest import resume_search as _resume
-    _resume(name)
-    return {"status": "resumed", "strategy": name}
+# @router.post("/{name}/resume-search")
+# def resume_search(name: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
+#     _ensure_strategies_exist(db)
+#     doc = db[COLL_STRATEGIES].find_one({"name": name})
+#     if not doc:
+#         raise HTTPException(404, f"Strategy {name} not found")
+#     from ..services.continuous_backtest import resume_search as _resume
+#     _resume(name)
+#     return {"status": "resumed", "strategy": name}
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────
@@ -466,3 +468,57 @@ def _get_strategy_stats(db: Database, strategy_name: str) -> dict:
         "total_trades": len(trades),
         "last_adapted": None,
     }
+
+
+    
+@router.get("/{strategy_name}/search-status")
+async def search_status(strategy_name: str):
+    """
+    Proxy GET /status/{strategy_name} → backtester service.
+    Returns current phase, iterations, best score, pause state, etc.
+    """
+    client = BacktesterClient()
+    try:
+        return await client.get_status(strategy_name)
+    except BacktesterUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        # Surface the error so the frontend can show a meaningful message
+        # instead of a generic network failure.
+        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
+ 
+ 
+@router.post("/{strategy_name}/pause-search")
+async def pause_search_route(strategy_name: str):
+    """Proxy POST /pause/{strategy_name} → backtester service."""
+    client = BacktesterClient()
+    try:
+        return await client.pause(strategy_name)
+    except BacktesterUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
+ 
+ 
+@router.post("/{strategy_name}/resume-search")
+async def resume_search_route(strategy_name: str):
+    """Proxy POST /resume/{strategy_name} → backtester service."""
+    client = BacktesterClient()
+    try:
+        return await client.resume(strategy_name)
+    except BacktesterUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
+ 
+ 
+@router.post("/{strategy_name}/trigger-search")
+async def trigger_search_route(strategy_name: str):
+    """Proxy POST /trigger/{strategy_name} → backtester service (skip current sleep)."""
+    client = BacktesterClient()
+    try:
+        return await client.trigger(strategy_name)
+    except BacktesterUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
