@@ -2,7 +2,7 @@ import json
 import logging
 from math import sqrt
 
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .. import crud
 from .runtime_settings import get_learning_settings
@@ -20,16 +20,14 @@ def _tiny_step(current: float, target_delta: float, max_change_pct: float) -> tu
     return current + bounded_delta, bounded_delta
 
 
-def _load_strategy_params(db: Session, strategy_name: str) -> dict:
+def _load_strategy_params(db: Database, strategy_name: str) -> dict:
     """
     Load current params for the given strategy from the strategies collection.
     Falls back to the strategy class's default_params via STRATEGY_REGISTRY.
     """
     # Try loading from the Strategy row in DB
     try:
-        from sqlalchemy import select
-        from ..models import Strategy
-        row = db.scalar(select(Strategy).where(Strategy.name == strategy_name))
+        row = crud.get_strategy_by_name(db, strategy_name)
         if row and row.params_json:
             import json as _json
             params = _json.loads(row.params_json)
@@ -57,7 +55,7 @@ def _load_strategy_params(db: Session, strategy_name: str) -> dict:
         return {}
 
 
-def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") -> dict:
+def run_adaptation(db: Database, window: int = 20, strategy_name: str = "DTC") -> dict:
     learning = get_learning_settings(db)
 
     # Load strategy-specific params instead of always using DTC defaults
@@ -164,14 +162,7 @@ def run_adaptation(db: Session, window: int = 20, strategy_name: str = "DTC") ->
 
     # Persist updated params back to the Strategy row
     try:
-        from sqlalchemy import select
-        from ..models import Strategy
-        from datetime import datetime
-        row = db.scalar(select(Strategy).where(Strategy.name == strategy_name))
-        if row:
-            row.params_json = json.dumps(new_params)
-            row.updated_at = datetime.utcnow()
-            db.commit()
+        crud.update_strategy_params(db, strategy_name, new_params)
     except Exception as e:
         logger.warning("Could not persist adapted params to Strategy row for %s: %s", strategy_name, e)
 

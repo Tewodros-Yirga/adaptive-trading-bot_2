@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .. import crud
 
@@ -30,7 +30,7 @@ RISK_DEFAULTS: dict[str, Any] = {
 }
 
 
-def get_risk_settings(db: Session) -> dict:
+def get_risk_settings(db: Database) -> dict:
     stored = crud.get_settings(db, RISK_KEYS)
     result: dict[str, Any] = {}
     for key, default in RISK_DEFAULTS.items():
@@ -48,7 +48,7 @@ def get_risk_settings(db: Session) -> dict:
     return result
 
 
-def update_risk_settings(db: Session, payload: dict) -> dict:
+def update_risk_settings(db: Database, payload: dict) -> dict:
     current = get_risk_settings(db)
     merged = {**current, **payload}
     validated = {
@@ -115,7 +115,7 @@ def compute_dynamic_lot_size(
 
 
 def check_and_compute_lot_size(
-    db: Session,
+    db: Database,
     symbol: str,
     entry_price: float,
     stop_loss: float,
@@ -174,7 +174,7 @@ def check_and_compute_lot_size(
     return lot_size, None
 
 
-def get_risk_status(db: Session) -> dict:
+def get_risk_status(db: Database) -> dict:
     settings = get_risk_settings(db)
     open_trades = crud.get_recent_trades(db, 1000)
     open_count = sum(1 for t in open_trades if t.result == "OPEN")

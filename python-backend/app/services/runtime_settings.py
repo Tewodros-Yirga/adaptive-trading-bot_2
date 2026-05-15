@@ -1,4 +1,4 @@
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .. import crud
 from ..config import settings
@@ -13,7 +13,7 @@ LEARNING_KEYS = [
 ]
 
 
-def get_learning_settings(db: Session) -> dict:
+def get_learning_settings(db: Database) -> dict:
     stored = crud.get_settings(db, LEARNING_KEYS)
     defaults = {
         "adaptation_interval": settings.adaptation_interval,
@@ -33,7 +33,7 @@ def get_learning_settings(db: Session) -> dict:
     return typed
 
 
-def update_learning_settings(db: Session, payload: dict) -> dict:
+def update_learning_settings(db: Database, payload: dict) -> dict:
     current = get_learning_settings(db)
     merged = current | payload
     validated = {

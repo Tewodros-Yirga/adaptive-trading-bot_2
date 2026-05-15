@@ -20,7 +20,7 @@ import json
 import logging
 from datetime import date, timedelta
 
-from ..db import SessionLocal
+from ..db import get_database
 from ..models import BacktestCandidate
 from ..strategy.registry import STRATEGY_REGISTRY
 from .param_search import ParamSearchEngine, ParamCandidate
@@ -105,7 +105,7 @@ async def start_continuous_backtest(strategy_name: str, executor, startup_delay:
         "is_paused": False,
     }
 
-    db = SessionLocal()
+    db = get_database()
     try:
         from .. import crud as _crud
 
@@ -203,9 +203,7 @@ async def start_continuous_backtest(strategy_name: str, executor, startup_delay:
                     score_delta=score_delta,
                     backtest_result_id=result.get("backtest_result_id"),
                 )
-                db.add(candidate_row)
-                db.commit()
-                db.refresh(candidate_row)
+                candidate_row = _crud.create_backtest_candidate(db, candidate_row)
 
                 if promoted:
                     engine.promote(candidate, composite_score)
@@ -258,7 +256,6 @@ async def start_continuous_backtest(strategy_name: str, executor, startup_delay:
         logger.error("Continuous backtest loop crashed for %s: %s", strategy_name, exc, exc_info=True)
     finally:
         _status[strategy_name]["is_running"] = False
-        db.close()
 
 
 # ---------------------------------------------------------------------------

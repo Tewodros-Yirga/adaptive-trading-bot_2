@@ -19,11 +19,10 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import desc, select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .. import crud
-from ..models import EnsembleDecision, ParameterVersion, ShadowSignal, Strategy, StrategyPickerDecision
+from ..models import EnsembleDecision, Strategy
 from ..services.bridge_client import bridge_client
 from ..services.news_intelligence import get_news_bias
 from ..services.risk_manager import check_and_compute_lot_size
@@ -36,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Ensemble configuration helpers
 # ---------------------------------------------------------------------------
 
-def get_ensemble_config(db: Session) -> dict:
+def get_ensemble_config(db: Database) -> dict:
     raw = crud.get_setting(db, "ensemble_config")
     if raw:
         try:
@@ -51,7 +50,7 @@ def get_ensemble_config(db: Session) -> dict:
     }
 
 
-def set_ensemble_config(db: Session, config: dict) -> dict:
+def set_ensemble_config(db: Database, config: dict) -> dict:
     migrated = _migrate_dominant_to_weighted_vote(config)
     crud.set_setting(db, "ensemble_config", json.dumps(migrated))
     return migrated
@@ -166,31 +165,37 @@ def resolve_ensemble_levels(
 # Strategy DB helpers
 # ---------------------------------------------------------------------------
 
-def get_live_strategy(db: Session) -> Strategy | None:
-    return db.scalar(select(Strategy).where(Strategy.is_live.is_(True)).limit(1))
-
-
-def get_active_strategies(db: Session) -> list[Strategy]:
-    return list(db.scalars(select(Strategy).where(Strategy.is_active.is_(True))).all())
-
-
-def set_strategy_live(db: Session, name: str) -> Strategy:
-    strategies = list(db.scalars(select(Strategy)).all())
+def get_live_strategy(db: Database) -> Strategy | None:
+    strategies = crud.get_all_strategies(db)
     for s in strategies:
-        s.is_live = s.name == name
-        s.updated_at = datetime.utcnow()
-    db.commit()
-    live = db.scalar(select(Strategy).where(Strategy.name == name))
-    if not live:
+        if getattr(s, "is_live", False):
+            return s
+    return None
+
+
+def get_active_strategies(db: Database) -> list[Strategy]:
+    return crud.get_active_strategies(db)
+
+
+def set_strategy_live(db: Database, name: str) -> Strategy:
+    from ..db import COLL_STRATEGIES
+    _db = db
+    _db[COLL_STRATEGIES].update_many({}, {"$set": {"is_live": False, "updated_at": datetime.utcnow()}})
+    doc = _db[COLL_STRATEGIES].find_one_and_update(
+        {"name": name},
+        {"$set": {"is_live": True, "updated_at": datetime.utcnow()}},
+        return_document=True,
+    )
+    if not doc:
         raise ValueError(f"Strategy {name} not found")
-    return live
+    return Strategy.from_doc(doc)
 
 
 # ---------------------------------------------------------------------------
 # MTF data fetching helpers
 # ---------------------------------------------------------------------------
 
-async def _fetch_mtf_bars(symbol: str, db: Session) -> dict:
+async def _fetch_mtf_bars(symbol: str, db: Database) -> dict:
     """
     Fetch the last ~100 bars for each required timeframe for MTF strategies.
     Returns dict: {"1d": DataFrame, "4h": DataFrame, "1h": DataFrame, "15m": DataFrame}.
@@ -225,7 +230,7 @@ async def _fetch_mtf_bars(symbol: str, db: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 async def process_signal(
-    db: Session,
+    db: Database,
     market_data: dict,
     symbol: str,
     price: float,
@@ -325,19 +330,28 @@ async def process_signal(
             })
 
     # ── Log shadow signals ─────────────────────────────────────────────────
-    for sd in signal_dicts:
-        if sd["direction"]:
-            shadow = ShadowSignal(
-                strategy_name=sd["strategy_name"],
-                symbol=symbol,
-                direction=sd["direction"],
-                entry_price=price,
-                sl=sd.get("proposed_sl"),
-                tp1=sd.get("proposed_tp1"),
-                signal_time=datetime.utcnow(),
-            )
-            db.add(shadow)
-    db.commit()
+    try:
+        from ..db import next_id
+        coll_name = "shadow_signals"
+        try:
+            from ..db import COLL_SHADOW_SIGNALS
+            coll_name = COLL_SHADOW_SIGNALS
+        except ImportError:
+            pass
+        for sd in signal_dicts:
+            if sd["direction"]:
+                db[coll_name].insert_one({
+                    "_id": next_id(db, coll_name),
+                    "strategy_name": sd["strategy_name"],
+                    "symbol": symbol,
+                    "direction": sd["direction"],
+                    "entry_price": price,
+                    "sl": sd.get("proposed_sl"),
+                    "tp1": sd.get("proposed_tp1"),
+                    "signal_time": datetime.utcnow(),
+                })
+    except Exception as exc:
+        logger.warning("Shadow signal logging failed: %s", exc)
 
     # ── Strategy Picker: select + resolve ──────────────────────────────────
     picker_result = await pick_and_route(symbol, signal_dicts, db)
@@ -440,9 +454,12 @@ async def process_signal(
         }
     )
 
-    latest_param = db.scalar(
-        select(ParameterVersion).order_by(desc(ParameterVersion.version)).limit(1)
-    )
+    strategy_for_params = selected_strategies[0] if selected_strategies else None
+    if strategy_for_params:
+        latest_param = crud.get_latest_param_version(db, strategy_for_params)
+    else:
+        latest_param = crud.get_current_params(db)  # returns dict, not ParameterVersion
+        latest_param = None  # version will default to 1
     version = latest_param.version if latest_param else 1
 
     trade = crud.log_trade(
@@ -468,10 +485,7 @@ async def process_signal(
     )
 
     if picker_decision_id:
-        picker_dec = db.get(StrategyPickerDecision, picker_decision_id)
-        if picker_dec:
-            picker_dec.trade_id = trade.id
-            db.commit()
+        crud.update_picker_decision_trade_id(db, picker_decision_id, trade.id)
 
     signals_summary = {sd["strategy_name"]: sd["direction"] for sd in signal_dicts}
 
@@ -497,7 +511,7 @@ async def process_signal(
 # ---------------------------------------------------------------------------
 
 def _log_ensemble_decision(
-    db: Session,
+    db: Database,
     symbol: str,
     signal_dicts: list[dict],
     weights: dict[str, float],
@@ -535,25 +549,22 @@ def _log_ensemble_decision(
             }
         )
 
-    row = EnsembleDecision(
-        symbol=symbol,
-        timestamp=datetime.utcnow(),
-        resolved_direction=resolved_direction,
-        resolved_confidence=resolved_confidence,
-        trade_id=trade_id,
-        strategy_votes_json=strategy_votes,
-        final_entry=levels.get("entry"),
-        final_sl=levels.get("sl"),
-        final_tp1=levels.get("tp1"),
-        final_tp2=levels.get("tp2"),
-        final_tp3=levels.get("tp3"),
-        final_tp4=levels.get("tp4"),
-        news_bias=news_bias,
-        news_blocked=news_blocked,
-        risk_blocked=risk_blocked,
-        block_reason=block_reason,
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+    fields = {
+        "symbol": symbol,
+        "timestamp": datetime.utcnow(),
+        "resolved_direction": resolved_direction,
+        "resolved_confidence": resolved_confidence,
+        "trade_id": trade_id,
+        "strategy_votes_json": strategy_votes,
+        "final_entry": levels.get("entry"),
+        "final_sl": levels.get("sl"),
+        "final_tp1": levels.get("tp1"),
+        "final_tp2": levels.get("tp2"),
+        "final_tp3": levels.get("tp3"),
+        "final_tp4": levels.get("tp4"),
+        "news_bias": news_bias,
+        "news_blocked": news_blocked,
+        "risk_blocked": risk_blocked,
+        "block_reason": block_reason,
+    }
+    return crud.create_ensemble_decision(db, fields)

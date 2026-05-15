@@ -11,12 +11,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import desc, select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .. import crud
-from ..models import NewsItem
+
+COLL_NEWS = "news_items"
 
 # ── Positive / negative word lists for fallback sentiment ─────────────────────
 POSITIVE_WORDS = {
@@ -243,7 +243,7 @@ def _parse_dt(raw: str | None) -> datetime | None:
         return None
 
 
-def fetch_and_store_news(db: Session, symbol: str | None = None) -> int:
+def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
     newsapi_key = crud.get_setting(db, "newsapi_key")
     alphavantage_key = crud.get_setting(db, "alphavantage_key")
     finnhub_key = crud.get_setting(db, "finnhub_key")
@@ -271,37 +271,40 @@ def fetch_and_store_news(db: Session, symbol: str | None = None) -> int:
         sentiment = analyze_sentiment(headline, item.get("summary", ""), groq_key)
         pub_dt = _parse_dt(item.get("published_at"))
 
-        news = NewsItem(
-            source=item.get("source", "unknown"),
-            headline=headline,
-            summary=item.get("summary", ""),
-            url=item.get("url", ""),
-            published_at=pub_dt,
-            symbols_mentioned=json.dumps([sym]),
-            raw_sentiment_score=item.get("raw_sentiment_score"),
-            ai_sentiment_score=sentiment["ai_sentiment_score"],
-            ai_sentiment_label=sentiment["ai_sentiment_label"],
-            ai_confidence=sentiment["ai_confidence"],
-            market_impact_predicted=sentiment["market_impact_predicted"],
-            impact_learning_weight=1.0,
-        )
-        db.add(news)
-        stored += 1
+        try:
+            from ..db import next_id
+            db[COLL_NEWS].insert_one({
+                "_id": next_id(db, COLL_NEWS),
+                "source": item.get("source", "unknown"),
+                "headline": headline,
+                "summary": item.get("summary", ""),
+                "url": item.get("url", ""),
+                "published_at": pub_dt,
+                "symbols_mentioned": json.dumps([sym]),
+                "raw_sentiment_score": item.get("raw_sentiment_score"),
+                "ai_sentiment_score": sentiment["ai_sentiment_score"],
+                "ai_sentiment_label": sentiment["ai_sentiment_label"],
+                "ai_confidence": sentiment["ai_confidence"],
+                "market_impact_predicted": sentiment["market_impact_predicted"],
+                "market_impact_actual": None,
+                "impact_learning_weight": 1.0,
+            })
+            stored += 1
+        except Exception:
+            pass
 
-    db.commit()
     return stored
 
 
-def get_news_bias(db: Session, symbol: str, hours: int = 12) -> dict:
+def get_news_bias(db: Database, symbol: str, hours: int = 12) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    items = list(
-        db.scalars(
-            select(NewsItem)
-            .where(NewsItem.published_at >= cutoff)
-            .order_by(desc(NewsItem.published_at))
-            .limit(50)
-        ).all()
+    docs = list(
+        db[COLL_NEWS]
+        .find({"published_at": {"$gte": cutoff}})
+        .sort("published_at", -1)
+        .limit(50)
     )
+    items = docs
     if not items:
         return {"bias": 0.0, "confidence": 0.0, "item_count": 0}
 
@@ -309,12 +312,16 @@ def get_news_bias(db: Session, symbol: str, hours: int = 12) -> dict:
     total_weight = 0.0
     weighted_score = 0.0
     for item in items:
-        if item.ai_sentiment_score is None:
+        if item.get("ai_sentiment_score") is None:
             continue
-        age_hours = (now - item.published_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+        pub = item.get("published_at")
+        if pub is None:
+            continue
+        pub_tz = pub.replace(tzinfo=timezone.utc) if pub.tzinfo is None else pub
+        age_hours = (now - pub_tz).total_seconds() / 3600
         recency_decay = math.exp(-0.15 * age_hours)
-        w = recency_decay * (item.impact_learning_weight or 1.0) * (item.ai_confidence or 0.5)
-        weighted_score += w * item.ai_sentiment_score
+        w = recency_decay * (item.get("impact_learning_weight") or 1.0) * (item.get("ai_confidence") or 0.5)
+        weighted_score += w * item["ai_sentiment_score"]
         total_weight += w
 
     if total_weight == 0:
@@ -325,23 +332,21 @@ def get_news_bias(db: Session, symbol: str, hours: int = 12) -> dict:
     return {"bias": round(bias, 4), "confidence": round(confidence, 4), "item_count": len(items)}
 
 
-def run_retrospective_learning(db: Session) -> int:
+def run_retrospective_learning(db: Database) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
-    items = list(
-        db.scalars(
-            select(NewsItem)
-            .where(NewsItem.market_impact_actual.is_(None))
-            .where(NewsItem.published_at < cutoff)
-            .limit(50)
-        ).all()
+    docs = list(
+        db[COLL_NEWS]
+        .find({"market_impact_actual": None, "published_at": {"$lt": cutoff}})
+        .limit(50)
     )
     updated = 0
-    for item in items:
-        if not item.published_at:
+    for item in docs:
+        pub = item.get("published_at")
+        if not pub:
             continue
-        window_start = item.published_at.replace(tzinfo=timezone.utc)
+        window_start = pub.replace(tzinfo=timezone.utc) if pub.tzinfo is None else pub
         window_end = window_start + timedelta(hours=4)
-        sym_list = json.loads(item.symbols_mentioned or "[]")
+        sym_list = json.loads(item.get("symbols_mentioned") or "[]")
         relevant_trades = crud.get_closed_trades(db, 10000)
         trade_pnls = [
             t.pnl or 0
@@ -354,17 +359,18 @@ def run_retrospective_learning(db: Session) -> int:
             continue
         avg_pnl = sum(trade_pnls) / len(trade_pnls)
         impact_actual = max(-1.0, min(1.0, avg_pnl * 10))
-        item.market_impact_actual = impact_actual
-        if item.market_impact_predicted is not None:
-            accuracy = 1 - abs(item.market_impact_predicted - impact_actual) / 2
-            old_w = item.impact_learning_weight or 1.0
-            item.impact_learning_weight = round(0.8 * old_w + 0.2 * accuracy, 4)
+        update_fields: dict = {"market_impact_actual": impact_actual}
+        predicted = item.get("market_impact_predicted")
+        if predicted is not None:
+            accuracy = 1 - abs(predicted - impact_actual) / 2
+            old_w = item.get("impact_learning_weight") or 1.0
+            update_fields["impact_learning_weight"] = round(0.8 * old_w + 0.2 * accuracy, 4)
+        db[COLL_NEWS].update_one({"_id": item["_id"]}, {"$set": update_fields})
         updated += 1
-    db.commit()
     return updated
 
 
-def get_global_context(db: Session) -> dict:
+def get_global_context(db: Database) -> dict:
     raw = crud.get_setting(db, "global_market_context")
     if raw:
         try:
@@ -380,21 +386,19 @@ def get_global_context(db: Session) -> dict:
     }
 
 
-def update_global_context(db: Session) -> dict:
+def update_global_context(db: Database) -> dict:
     items = list(
-        db.scalars(
-            select(NewsItem)
-            .where(NewsItem.published_at >= datetime.now(timezone.utc) - timedelta(hours=6))
-            .order_by(desc(NewsItem.published_at))
-            .limit(20)
-        ).all()
+        db[COLL_NEWS]
+        .find({"published_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)}})
+        .sort("published_at", -1)
+        .limit(20)
     )
     if not items:
         return get_global_context(db)
 
-    scores = [i.ai_sentiment_score for i in items if i.ai_sentiment_score is not None]
+    scores = [i.get("ai_sentiment_score") for i in items if i.get("ai_sentiment_score") is not None]
     avg_score = sum(scores) / len(scores) if scores else 0.0
-    labels = [i.ai_sentiment_label for i in items if i.ai_sentiment_label]
+    labels = [i.get("ai_sentiment_label") for i in items if i.get("ai_sentiment_label")]
     bullish_count = labels.count("BULLISH")
     bearish_count = labels.count("BEARISH")
     dominant = "BULLISH" if bullish_count > bearish_count else "BEARISH" if bearish_count > bullish_count else "NEUTRAL"
@@ -405,7 +409,7 @@ def update_global_context(db: Session) -> dict:
 
     if groq_key:
         try:
-            headlines = "\n".join(f"- {i.headline}" for i in items[:15])
+            headlines = "\n".join(f"- {i.get('headline', '')}" for i in items[:15])
             payload = {
                 "model": "llama3-8b-8192",
                 "messages": [

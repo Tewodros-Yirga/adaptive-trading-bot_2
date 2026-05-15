@@ -26,10 +26,10 @@ from datetime import datetime
 from itertools import combinations
 
 import httpx
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .. import crud
-from ..models import BacktestResult, OHLCVCache, StrategyPairAnalysis
+from ..models import BacktestResult, StrategyPairAnalysis
 from ..strategy.registry import get_strategy
 
 logger = logging.getLogger(__name__)
@@ -858,7 +858,7 @@ def run_backtest_sync_standalone(
 # ---------------------------------------------------------------------------
 
 def run_backtest(
-    db: Session,
+    db: Database,
     strategy_name: str,
     symbol: str,
     from_date: str,
@@ -879,17 +879,15 @@ def run_backtest(
     av_key = crud.get_setting(db, "alphavantage_key") or ""
 
     # Try cache first
-    cached = db.query(OHLCVCache).filter(
-        OHLCVCache.symbol == symbol,
-        OHLCVCache.from_date == from_date,
-        OHLCVCache.to_date == to_date,
-    ).first()
+    cached_doc = db["ohlcv_cache"].find_one({
+        "symbol": symbol, "from_date": from_date, "to_date": to_date,
+    })
 
     ohlcv: list[dict] = []
     data_source = "cache"
 
-    if cached:
-        ohlcv = json.loads(cached.data_json)
+    if cached_doc:
+        ohlcv = json.loads(cached_doc["data_json"])
     else:
         try:
             ohlcv = fetch_ohlcv_sync(symbol, from_date, to_date, "1d", av_key=av_key)
@@ -898,16 +896,20 @@ def run_backtest(
             logger.warning("Backtest fetch failed for %s: %s", symbol, exc)
 
         if ohlcv:
-            cache_row = OHLCVCache(
-                symbol=symbol,
-                interval="1d",
-                from_date=from_date,
-                to_date=to_date,
-                data_json=json.dumps(ohlcv),
-                source=data_source,
-            )
-            db.add(cache_row)
-            db.commit()
+            try:
+                from ..db import next_id
+                db["ohlcv_cache"].insert_one({
+                    "_id": next_id(db, "ohlcv_cache"),
+                    "symbol": symbol,
+                    "interval": "1d",
+                    "from_date": from_date,
+                    "to_date": to_date,
+                    "data_json": json.dumps(ohlcv),
+                    "source": data_source,
+                    "created_at": datetime.utcnow(),
+                })
+            except Exception:
+                pass  # cache write failure is non-fatal
 
     # For MTF strategies, fetch all extra timeframes via MT5 Bridge first.
     extra_ohlcv_by_tf: dict[str, list[dict]] = {}
@@ -932,15 +934,30 @@ def run_backtest(
         status="RUNNING" if ohlcv else "FAILED",
         batch_id=batch_id,
     )
-    db.add(result_row)
-    db.commit()
-    db.refresh(result_row)
+    from ..db import next_id, COLL_BACKTEST_RESULTS
+    result_id = next_id(db, COLL_BACKTEST_RESULTS)
+    result_doc = {
+        "_id": result_id,
+        "strategy_name": strategy_name,
+        "symbol": symbol,
+        "from_date": from_date,
+        "to_date": to_date,
+        "params_json": json.dumps(params),
+        "initial_balance": initial_balance,
+        "leverage": leverage,
+        "risk_per_trade_pct": risk_per_trade_pct,
+        "status": "RUNNING" if ohlcv else "FAILED",
+        "batch_id": batch_id,
+        "created_at": datetime.utcnow(),
+    }
+    db[COLL_BACKTEST_RESULTS].insert_one(result_doc)
 
     if not ohlcv:
-        result_row.metrics_json = json.dumps({"error": "No OHLCV data available"})
-        result_row.status = "FAILED"
-        db.commit()
-        return result_row.id
+        db[COLL_BACKTEST_RESULTS].update_one(
+            {"_id": result_id},
+            {"$set": {"metrics_json": json.dumps({"error": "No OHLCV data available"}), "status": "FAILED"}},
+        )
+        return result_id
 
     try:
         metrics = _run_backtest_sync(
@@ -955,21 +972,27 @@ def run_backtest(
         parameter_evolution_log = metrics.pop("parameter_evolution_log", {})
         drawdown_periods = metrics.pop("drawdown_periods", [])
 
-        result_row.metrics_json = json.dumps(metrics)
-        result_row.equity_curve_json = json.dumps(equity_curve)
-        result_row.trade_log_json = trade_log
-        result_row.monthly_breakdown_json = monthly_breakdown
-        result_row.parameter_evolution_log_json = parameter_evolution_log
-        result_row.drawdown_periods_json = drawdown_periods
-        result_row.status = "COMPLETE"
-        result_row.completed_at = datetime.utcnow()
+        db[COLL_BACKTEST_RESULTS].update_one(
+            {"_id": result_id},
+            {"$set": {
+                "metrics_json": json.dumps(metrics),
+                "equity_curve_json": json.dumps(equity_curve),
+                "trade_log_json": trade_log,
+                "monthly_breakdown_json": monthly_breakdown,
+                "parameter_evolution_log_json": parameter_evolution_log,
+                "drawdown_periods_json": drawdown_periods,
+                "status": "COMPLETE",
+                "completed_at": datetime.utcnow(),
+            }},
+        )
     except Exception as exc:
         logger.exception("Backtest run failed for %s/%s", strategy_name, symbol)
-        result_row.metrics_json = json.dumps({"error": str(exc)})
-        result_row.status = "FAILED"
+        db[COLL_BACKTEST_RESULTS].update_one(
+            {"_id": result_id},
+            {"$set": {"metrics_json": json.dumps({"error": str(exc)}), "status": "FAILED"}},
+        )
 
-    db.commit()
-    return result_row.id
+    return result_id
 
 
 # ---------------------------------------------------------------------------
@@ -977,7 +1000,7 @@ def run_backtest(
 # ---------------------------------------------------------------------------
 
 async def run_batch_backtest(
-    db: Session,
+    db: Database,
     batch_id: str,
     runs: list[dict],
     shared_settings: dict,
@@ -1011,64 +1034,62 @@ async def run_batch_backtest(
 
     raw_results = await asyncio.gather(*futures, return_exceptions=True)
 
-    from ..db import SessionLocal
+    from ..db import get_database, next_id, COLL_BACKTEST_RESULTS
     for run, result in zip(runs, raw_results):
-        per_db = SessionLocal()
+        per_db = get_database()
         try:
             if isinstance(result, Exception):
                 error_msg = str(result)
                 failures.append(f"{run['strategy_name']}: {error_msg}")
-                result_row = BacktestResult(
-                    strategy_name=run["strategy_name"],
-                    symbol=run.get("symbol", "XAUUSD"),
-                    from_date=run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
-                    to_date=run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
-                    params_json=json.dumps(run.get("params", {})),
-                    initial_balance=float(run.get("initial_balance", 10000)),
-                    leverage=int(run.get("leverage", 100)),
-                    risk_per_trade_pct=float(run.get("risk_per_trade_pct", 1.0)),
-                    metrics_json=json.dumps({"error": error_msg}),
-                    status="FAILED",
-                    batch_id=batch_id,
-                )
-                per_db.add(result_row)
-                per_db.commit()
-                per_db.refresh(result_row)
-                result_ids.append(result_row.id)
+                result_id = next_id(per_db, COLL_BACKTEST_RESULTS)
+                per_db[COLL_BACKTEST_RESULTS].insert_one({
+                    "_id": result_id,
+                    "strategy_name": run["strategy_name"],
+                    "symbol": run.get("symbol", "XAUUSD"),
+                    "from_date": run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
+                    "to_date": run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
+                    "params_json": json.dumps(run.get("params", {})),
+                    "initial_balance": float(run.get("initial_balance", 10000)),
+                    "leverage": int(run.get("leverage", 100)),
+                    "risk_per_trade_pct": float(run.get("risk_per_trade_pct", 1.0)),
+                    "metrics_json": json.dumps({"error": error_msg}),
+                    "status": "FAILED",
+                    "batch_id": batch_id,
+                    "created_at": datetime.utcnow(),
+                })
+                result_ids.append(result_id)
             else:
-                result_row = BacktestResult(
-                    strategy_name=run["strategy_name"],
-                    symbol=run.get("symbol", "XAUUSD"),
-                    from_date=run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
-                    to_date=run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
-                    params_json=json.dumps(run.get("params", {})),
-                    initial_balance=float(run.get("initial_balance", 10000)),
-                    leverage=int(run.get("leverage", 100)),
-                    risk_per_trade_pct=float(run.get("risk_per_trade_pct", 1.0)),
-                    metrics_json=json.dumps({
+                result_id = next_id(per_db, COLL_BACKTEST_RESULTS)
+                per_db[COLL_BACKTEST_RESULTS].insert_one({
+                    "_id": result_id,
+                    "strategy_name": run["strategy_name"],
+                    "symbol": run.get("symbol", "XAUUSD"),
+                    "from_date": run.get("from_date", shared_settings.get("from_date", "2024-01-01")),
+                    "to_date": run.get("to_date", shared_settings.get("to_date", "2024-12-31")),
+                    "params_json": json.dumps(run.get("params", {})),
+                    "initial_balance": float(run.get("initial_balance", 10000)),
+                    "leverage": int(run.get("leverage", 100)),
+                    "risk_per_trade_pct": float(run.get("risk_per_trade_pct", 1.0)),
+                    "metrics_json": json.dumps({
                         k: v for k, v in result.items()
                         if k not in ("equity_curve", "trade_log", "drawdown_periods")
                     }),
-                    equity_curve_json=json.dumps(result.get("equity_curve", [])),
-                    trade_log_json=result.get("trade_log"),
-                    monthly_breakdown_json=result.get("monthly_breakdown"),
-                    parameter_evolution_log_json=result.get("parameter_evolution_log"),
-                    drawdown_periods_json=result.get("drawdown_periods"),
-                    status="COMPLETED",
-                    completed_at=datetime.utcnow(),
-                    batch_id=batch_id,
-                )
-                per_db.add(result_row)
-                per_db.commit()
-                per_db.refresh(result_row)
-                result_ids.append(result_row.id)
+                    "equity_curve_json": json.dumps(result.get("equity_curve", [])),
+                    "trade_log_json": result.get("trade_log"),
+                    "monthly_breakdown_json": result.get("monthly_breakdown"),
+                    "parameter_evolution_log_json": result.get("parameter_evolution_log"),
+                    "drawdown_periods_json": result.get("drawdown_periods"),
+                    "status": "COMPLETED",
+                    "completed_at": datetime.utcnow(),
+                    "batch_id": batch_id,
+                    "created_at": datetime.utcnow(),
+                })
+                result_ids.append(result_id)
         except Exception as e:
             logger.exception("Failed to persist batch result for %s", run.get("strategy_name"))
             failures.append(f"{run['strategy_name']}: persistence error {e}")
-        finally:
-            per_db.close()
 
-    analysis_db = SessionLocal()
+    analysis_db = get_database()
     try:
         bt_results = crud.get_backtest_results_for_batch(analysis_db, batch_id)
         cross_analysis = _compute_cross_analysis(bt_results)
@@ -1079,8 +1100,6 @@ async def run_batch_backtest(
     except Exception as e:
         logger.exception("Batch post-processing failed for batch %s", batch_id)
         crud.update_backtest_batch(analysis_db, batch_id, "PARTIAL_FAILURE", {})
-    finally:
-        analysis_db.close()
 
 
 def _compute_cross_analysis(bt_results: list[BacktestResult]) -> dict:
@@ -1182,7 +1201,7 @@ def _compute_trade_correlation(trades_a: list[dict], trades_b: list[dict]) -> fl
 
 
 async def _compute_pair_analyses(
-    db: Session,
+    db: Database,
     batch_id: str,
     bt_results: list[BacktestResult],
 ) -> None:

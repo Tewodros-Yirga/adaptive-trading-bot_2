@@ -10,12 +10,11 @@ import logging
 import math
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .. import crud
-from ..models import AppSetting, PickerWeightHistory, StrategyPickerDecision
+from ..models import PickerWeightHistory, StrategyPickerDecision
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +43,11 @@ DEFAULT_WEIGHTS = {
 # Weight loading helpers
 # ---------------------------------------------------------------------------
 
-def _load_factor_weights(db: Session) -> dict[str, float]:
+def _load_factor_weights(db: Database) -> dict[str, float]:
     """Load picker factor weights from AppSettings, falling back to defaults."""
     keys = [f"picker_weight_{f}" for f in FACTOR_NAMES]
-    rows = list(db.scalars(select(AppSetting).where(AppSetting.key.in_(keys))).all())
+    setting_map = crud.get_settings(db, keys)
     weights: dict[str, float] = {}
-    setting_map = {r.key: r.value for r in rows}
     for f in FACTOR_NAMES:
         key = f"picker_weight_{f}"
         try:
@@ -69,7 +67,7 @@ def _load_factor_weights(db: Session) -> dict[str, float]:
 def compute_factor_scores(
     strategy_name: str,
     signal_confidence: float,
-    db: Session,
+    db: Database,
 ) -> dict[str, float]:
     """
     Returns raw factor scores (0.0–1.0) for each of the 7 factors.
@@ -200,7 +198,7 @@ def apply_news_adjustments(
     scores: dict[str, float],
     strategy_signals: dict[str, str | None],
     symbol: str,
-    db: Session,
+    db: Database,
 ) -> tuple[dict[str, float], dict, bool]:
     """
     Adjust scores based on news bias and potentially veto the whole signal.
@@ -301,7 +299,7 @@ async def _generate_reasoning(
     selected: list[str],
     scores: dict[str, float],
     news_influence: dict,
-    db: Session,
+    db: Database,
 ) -> str:
     api_key = crud.get_setting(db, "groq_api_key")
     if not api_key:
@@ -342,7 +340,7 @@ def _format_scores(
 async def pick_and_route(
     symbol: str,
     raw_signals: list[dict],
-    db: Session,
+    db: Database,
 ) -> dict:
     """
     Main entry point called by the orchestrator.
@@ -391,9 +389,7 @@ async def pick_and_route(
             picker_confidence=0.0,
             reasoning="NEWS_VETO",
         )
-        db.add(decision)
-        db.commit()
-        db.refresh(decision)
+        decision = crud.create_picker_decision(db, decision)
         return {
             "resolved_direction": None,
             "selected_strategies": [],
@@ -417,9 +413,7 @@ async def pick_and_route(
             picker_confidence=0.0,
             reasoning="NO_ELIGIBLE_STRATEGY",
         )
-        db.add(decision)
-        db.commit()
-        db.refresh(decision)
+        decision = crud.create_picker_decision(db, decision)
         return {
             "resolved_direction": None,
             "selected_strategies": [],
@@ -452,9 +446,7 @@ async def pick_and_route(
         picker_confidence=confidence,
         reasoning=reasoning,
     )
-    db.add(decision)
-    db.commit()
-    db.refresh(decision)
+    decision = crud.create_picker_decision(db, decision)
 
     return {
         "resolved_direction": resolved_direction,
@@ -472,7 +464,7 @@ async def pick_and_route(
 # Online weight learning
 # ---------------------------------------------------------------------------
 
-def update_picker_weights_from_trade(trade, decision: StrategyPickerDecision, db: Session) -> None:
+def update_picker_weights_from_trade(trade, decision: StrategyPickerDecision, db: Database) -> None:
     """
     Gradient-based update of picker factor weights after a trade closes.
     Uses SELECT FOR UPDATE to prevent concurrent write races.
@@ -488,16 +480,14 @@ def update_picker_weights_from_trade(trade, decision: StrategyPickerDecision, db
     keys = [f"picker_weight_{f}" for f in FACTOR_NAMES]
 
     try:
-        settings_rows = list(
-            db.scalars(
-                select(AppSetting)
-                .where(AppSetting.key.in_(keys))
-                .with_for_update()
-            ).all()
-        )
+        setting_map = crud.get_settings(db, keys)
         weights_before = {
-            s.key.replace("picker_weight_", ""): float(s.value) for s in settings_rows
+            k.replace("picker_weight_", ""): float(v) for k, v in setting_map.items()
         }
+        # Fill in any missing keys with defaults
+        for f in FACTOR_NAMES:
+            if f not in weights_before:
+                weights_before[f] = DEFAULT_WEIGHTS[f]
 
         lr = float(crud.get_setting(db, "picker_learning_rate") or 0.05)
         selected_list: list[str] = decision.selected_strategies_json or []
@@ -522,29 +512,22 @@ def update_picker_weights_from_trade(trade, decision: StrategyPickerDecision, db
         total = sum(weights_after.values()) or 1.0
         weights_after = {k: v / total for k, v in weights_after.items()}
 
-        # Persist updated weights
-        setting_map = {s.key: s for s in settings_rows}
+        # Persist updated weights via crud
         for f in FACTOR_NAMES:
-            key = f"picker_weight_{f}"
-            if key in setting_map:
-                setting_map[key].value = str(round(weights_after[f], 8))
+            crud.set_setting(db, f"picker_weight_{f}", str(round(weights_after[f], 8)))
 
         deltas = {f: round(weights_after[f] - weights_before.get(f, 0.0), 8) for f in weights_before}
-        db.add(
-            PickerWeightHistory(
-                trade_id=trade.id,
-                weights_before_json=weights_before,
-                weights_after_json=weights_after,
-                weight_deltas_json=deltas,
-                trade_result=trade.result,
-                updated_at=datetime.datetime.utcnow(),
-            )
-        )
-        db.commit()
+        crud.create_picker_weight_history(db, PickerWeightHistory(
+            trade_id=trade.id,
+            weights_before_json=weights_before,
+            weights_after_json=weights_after,
+            weight_deltas_json=deltas,
+            trade_result=trade.result,
+            updated_at=datetime.datetime.utcnow(),
+        ))
         logger.info(
             f"Picker weights updated from trade #{trade.id} ({trade.result}). "
             f"Δmax={max(abs(v) for v in deltas.values()):.4f}"
         )
     except Exception as e:
         logger.warning(f"update_picker_weights_from_trade failed: {e}")
-        db.rollback()

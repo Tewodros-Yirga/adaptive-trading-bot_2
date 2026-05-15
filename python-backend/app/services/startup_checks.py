@@ -23,12 +23,11 @@ async def run_startup_checks(db) -> list[dict]:
 
     # ── 1. DB connectivity ─────────────────────────────────────────────────
     try:
-        from sqlalchemy import text
-        db.execute(text("SELECT 1"))
+        db.command("ping")
         checks.append({
             "name": "db_connectivity",
             "status": "OK",
-            "message": "Database reachable",
+            "message": "MongoDB reachable",
         })
     except Exception as e:
         checks.append({
@@ -37,48 +36,12 @@ async def run_startup_checks(db) -> list[dict]:
             "message": str(e),
         })
 
-    # ── 2. Alembic migration state ─────────────────────────────────────────
-    # NOTE: Use a separate raw engine connection (NOT the ORM session) so that
-    # MigrationContext doesn't invalidate the shared session for later checks.
-    try:
-        import os
-        from sqlalchemy import create_engine as _ce
-        from alembic.runtime.migration import MigrationContext
-        from alembic.script import ScriptDirectory
-        from alembic.config import Config
-
-        alembic_cfg = Config("alembic.ini")
-        script = ScriptDirectory.from_config(alembic_cfg)
-
-        _check_engine = _ce(
-            os.environ["DATABASE_URL"], future=True, pool_pre_ping=True
-        )
-        with _check_engine.connect() as raw_conn:
-            context = MigrationContext.configure(raw_conn)
-            current = set(context.get_current_heads())
-        _check_engine.dispose()
-
-        heads = set(script.get_heads())
-
-        if current == heads:
-            checks.append({
-                "name": "migrations",
-                "status": "OK",
-                "message": f"All migrations applied: {sorted(current)}",
-            })
-        else:
-            missing = heads - current
-            checks.append({
-                "name": "migrations",
-                "status": "WARN",
-                "message": f"Unapplied migrations: {sorted(missing)} — run `alembic upgrade head`",
-            })
-    except Exception as e:
-        checks.append({
-            "name": "migrations",
-            "status": "WARN",
-            "message": f"Could not check migration state: {e}",
-        })
+    # ── 2. Migration state (N/A for MongoDB) ───────────────────────────────
+    checks.append({
+        "name": "migrations",
+        "status": "OK",
+        "message": "MongoDB in use — Alembic migrations not applicable",
+    })
 
     # ── 3. Strategy registry consistency ──────────────────────────────────
     try:
