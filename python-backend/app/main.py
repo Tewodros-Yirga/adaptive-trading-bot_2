@@ -16,9 +16,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .db import SessionLocal, engine
-from .models import Base
-from .startup_migrations import run_startup_migrations
+from .db import get_database          # ← MongoDB: no SessionLocal/engine
 from .auth_deps import get_current_user, require_admin, require_write_access, seed_admin_user
 
 logger = logging.getLogger(__name__)
@@ -26,27 +24,26 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── 1. Run DDL migrations FIRST, before any ORM queries ───────────────
+    # ── 1. Ensure MongoDB indexes exist ───────────────────────────────────
     try:
-        logger.info("Running startup migrations...")
-        run_startup_migrations()
-        logger.info("Startup migrations complete.")
+        from .db import create_indexes
+        db = get_database()
+        create_indexes(db)
+        logger.info("MongoDB indexes verified.")
     except Exception as e:
-        logger.error(f"Startup migration failed: {e}")
+        logger.error(f"MongoDB index creation failed: {e}")
         raise
 
     # ── 2. Seed admin user from env vars ──────────────────────────────────
-    db = SessionLocal()
     try:
+        db = get_database()
         seed_admin_user(db)
     except Exception as e:
         logger.warning(f"Could not seed admin user: {e}")
-    finally:
-        db.close()
 
     # ── 3. Ensure default params exist ────────────────────────────────────
-    db = SessionLocal()
     try:
+        db = get_database()
         from .crud import get_current_params, save_params
         from .strategy.dtc import DEFAULT_PARAMS
         if not get_current_params(db):
@@ -54,34 +51,28 @@ async def lifespan(app: FastAPI):
             logger.info("Seeded default DTC parameters.")
     except Exception as e:
         logger.warning(f"Could not seed default params: {e}")
-    finally:
-        db.close()
 
     # ── 4. Seed strategy registry into DB ─────────────────────────────────
-    db = SessionLocal()
     try:
+        db = get_database()
         from .routers.strategies import _ensure_strategies_exist
         _ensure_strategies_exist(db)
         logger.info("Strategy registry seeded.")
     except Exception as e:
         logger.warning(f"Could not seed strategies: {e}")
-    finally:
-        db.close()
 
     # ── 5. Seed default AppSettings for continuous backtest + picker ───────
-    db = SessionLocal()
     try:
+        db = get_database()
         from .crud import seed_default_settings
         seed_default_settings(db)
         logger.info("Default AppSettings seeded.")
     except Exception as e:
         logger.warning(f"Could not seed default settings: {e}")
-    finally:
-        db.close()
 
     # ── 6. Run startup health checks ───────────────────────────────────────
-    db = SessionLocal()
     try:
+        db = get_database()
         from .services.startup_checks import run_startup_checks
         checks = await run_startup_checks(db)
         app.state.startup_checks = checks
@@ -89,8 +80,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Startup checks failed: {e}")
         app.state.startup_checks = []
-    finally:
-        db.close()
 
     # ── 7. Start background tasks ─────────────────────────────────────────
     bg_tasks = []
@@ -126,14 +115,12 @@ async def _news_fetch_loop():
     await asyncio.sleep(60)  # initial delay
     while True:
         try:
-            db = SessionLocal()
+            db = get_database()
             from .services.news_intelligence import fetch_and_store_news
             from .config import settings
             fetch_and_store_news(db, getattr(settings, "symbol", "XAUUSD"))
         except Exception as e:
             logger.warning(f"News fetch loop error: {e}")
-        finally:
-            db.close()
         await asyncio.sleep(1800)  # 30 min
 
 
@@ -142,15 +129,13 @@ async def _news_learning_loop():
     await asyncio.sleep(120)
     while True:
         try:
-            db = SessionLocal()
+            db = get_database()
             from .services.news_intelligence import run_retrospective_learning
             updated = run_retrospective_learning(db)
             if updated:
                 logger.info(f"Retrospective learning updated {updated} news items.")
         except Exception as e:
             logger.warning(f"News learning loop error: {e}")
-        finally:
-            db.close()
         await asyncio.sleep(7200)  # 2 hours
 
 
@@ -159,13 +144,11 @@ async def _global_context_loop():
     await asyncio.sleep(90)
     while True:
         try:
-            db = SessionLocal()
+            db = get_database()
             from .services.news_intelligence import update_global_context
             update_global_context(db)
         except Exception as e:
             logger.warning(f"Global context loop error: {e}")
-        finally:
-            db.close()
         await asyncio.sleep(1800)
 
 
@@ -184,61 +167,57 @@ async def _live_trading_loop():
     while True:
         interval = 60  # default; overridden by AppSetting each iteration
         try:
-            db = SessionLocal()
-            try:
-                from .config import settings as _settings
-                from .services.orchestrator import process_signal
-                from . import crud as _crud
+            db = get_database()
+            from .config import settings as _settings
+            from .services.orchestrator import process_signal
+            from . import crud as _crud
 
-                interval = float(
-                    _crud.get_setting(db, "live_trading_interval_seconds") or 60
-                )
+            interval = float(
+                _crud.get_setting(db, "live_trading_interval_seconds") or 60
+            )
 
-                if _settings.simulation_mode:
-                    logger.debug("Live trading loop: simulation_mode=True, skipping order placement.")
-                else:
-                    active_symbols_raw = _crud.get_setting(db, "live_trading_symbols") or "XAUUSD"
-                    symbols = [s.strip() for s in active_symbols_raw.split(",") if s.strip()]
+            if _settings.simulation_mode:
+                logger.debug("Live trading loop: simulation_mode=True, skipping order placement.")
+            else:
+                active_symbols_raw = _crud.get_setting(db, "live_trading_symbols") or "XAUUSD"
+                symbols = [s.strip() for s in active_symbols_raw.split(",") if s.strip()]
 
-                    for symbol in symbols:
-                        try:
-                            from datetime import date, timedelta
-                            from .services.ohlcv import fetch_ohlcv_with_fallback
-                            from_dt = (date.today() - timedelta(days=2)).isoformat()
-                            to_dt = date.today().isoformat()
-                            df, _src = await fetch_ohlcv_with_fallback(
-                                symbol, from_dt, to_dt, "1h", db
+                for symbol in symbols:
+                    try:
+                        from datetime import date, timedelta
+                        from .services.ohlcv import fetch_ohlcv_with_fallback
+                        from_dt = (date.today() - timedelta(days=2)).isoformat()
+                        to_dt = date.today().isoformat()
+                        df, _src = await fetch_ohlcv_with_fallback(
+                            symbol, from_dt, to_dt, "1h", db
+                        )
+                        if df.empty:
+                            logger.warning("Live loop: no price data for %s", symbol)
+                            continue
+
+                        price = float(df["close"].iloc[-1])
+                        atr = float((df["high"] - df["low"]).tail(14).mean()) if len(df) >= 14 else price * 0.005
+
+                        market_data = {
+                            "symbol": symbol,
+                            "price": price,
+                            "current_price": price,
+                            "atr": atr,
+                        }
+
+                        result = await process_signal(db, market_data, symbol, price)
+                        status = result.get("status", "?")
+
+                        if status == "OK":
+                            logger.info(
+                                "Live trade placed: %s %s @ %.5f (trade_id=%s)",
+                                result.get("signal"), symbol, price, result.get("trade_id")
                             )
-                            if df.empty:
-                                logger.warning("Live loop: no price data for %s", symbol)
-                                continue
+                        elif status not in ("NO_SIGNAL", "NO_ACTIVE_STRATEGIES"):
+                            logger.info("Live loop %s: %s", symbol, status)
 
-                            price = float(df["close"].iloc[-1])
-                            atr = float((df["high"] - df["low"]).tail(14).mean()) if len(df) >= 14 else price * 0.005
-
-                            market_data = {
-                                "symbol": symbol,
-                                "price": price,
-                                "current_price": price,
-                                "atr": atr,
-                            }
-
-                            result = await process_signal(db, market_data, symbol, price)
-                            status = result.get("status", "?")
-
-                            if status == "OK":
-                                logger.info(
-                                    "Live trade placed: %s %s @ %.5f (trade_id=%s)",
-                                    result.get("signal"), symbol, price, result.get("trade_id")
-                                )
-                            elif status not in ("NO_SIGNAL", "NO_ACTIVE_STRATEGIES"):
-                                logger.info("Live loop %s: %s", symbol, status)
-
-                        except Exception as sym_exc:
-                            logger.warning("Live loop error for %s: %s", symbol, sym_exc)
-
-            finally:
-                db.close()
+                    except Exception as sym_exc:
+                        logger.warning("Live loop error for %s: %s", symbol, sym_exc)
 
         except Exception as exc:
             logger.error("Live trading loop crashed: %s", exc, exc_info=True)
@@ -290,7 +269,7 @@ def create_app() -> FastAPI:
     from .routers.ensemble import router as ensemble_router
     from .routers.picker import router as picker_router
     from .routers.system import router as system_router
-    from .routers.health import router as health_router          # ← Feature 8
+    from .routers.health import router as health_router
 
     # ── Auth router (public — no auth required for login) ──────────────────
     app.include_router(auth_router)
@@ -316,7 +295,7 @@ def create_app() -> FastAPI:
     app.include_router(picker_router, dependencies=jwt_deps)
     app.include_router(system_router, dependencies=jwt_deps)
     # /health/db is public — no jwt_deps
-    app.include_router(health_router)                            # ← Feature 8
+    app.include_router(health_router)
 
     # ── Serve frontend SPA ────────────────────────────────────────────────
     frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")

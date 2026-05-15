@@ -1,9 +1,22 @@
+"""
+CRUD helpers — rewritten for MongoDB (pymongo).
+
+The `db` parameter throughout is a pymongo `Database` object (from get_database()),
+NOT a SQLAlchemy Session. All collection names come from db.py constants.
+"""
 import json
 from datetime import datetime
 
-from sqlalchemy import desc, select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
+from .db import (
+    COLL_TRADES, COLL_PARAMETER_VERSIONS, COLL_ADAPTATION_LOGS,
+    COLL_APP_SETTINGS, COLL_STRATEGIES, COLL_BACKTEST_RESULTS,
+    COLL_BACKTEST_CANDIDATES, COLL_BACKTEST_BATCHES,
+    COLL_STRATEGY_PAIR_ANALYSES, COLL_ENSEMBLE_DECISIONS,
+    COLL_STRATEGY_PICKER_DECISIONS, COLL_PICKER_WEIGHT_HISTORY,
+    next_id,
+)
 from .models import (
     AdaptationLog, AppSetting, BacktestBatch, BacktestCandidate,
     BacktestResult, EnsembleDecision, ParameterVersion, PickerWeightHistory,
@@ -15,58 +28,65 @@ from .models import (
 # Trade CRUD
 # ---------------------------------------------------------------------------
 
-def log_trade(db: Session, fields: dict) -> Trade:
-    trade = Trade(**fields)
-    db.add(trade)
-    db.commit()
-    db.refresh(trade)
-    return trade
+def log_trade(db: Database, fields: dict) -> Trade:
+    fields = dict(fields)
+    fields.setdefault("opened_at", datetime.utcnow())
+    fields["_id"] = next_id(db, COLL_TRADES)
+    db[COLL_TRADES].insert_one(fields)
+    return Trade.from_doc(fields)
 
 
-def close_trade(db: Session, trade_id: int, exit_price: float, pnl: float, result: str) -> Trade | None:
-    trade = db.get(Trade, trade_id)
-    if not trade:
+def close_trade(db: Database, trade_id: int, exit_price: float, pnl: float, result: str) -> Trade | None:
+    doc = db[COLL_TRADES].find_one({"_id": trade_id})
+    if not doc:
         return None
     now = datetime.utcnow()
-    duration_mins = ((now - trade.opened_at).total_seconds() / 60.0) if trade.opened_at else None
-    trade.exit_price = exit_price
-    trade.pnl = pnl
-    trade.result = result
-    trade.closed_at = now
-    trade.duration_mins = round(duration_mins, 1) if duration_mins is not None else None
-    db.commit()
-    db.refresh(trade)
-    return trade
+    opened_at = doc.get("opened_at")
+    duration_mins = ((now - opened_at).total_seconds() / 60.0) if opened_at else None
+    update = {
+        "exit_price": exit_price,
+        "pnl": pnl,
+        "result": result,
+        "closed_at": now,
+        "duration_mins": round(duration_mins, 1) if duration_mins is not None else None,
+    }
+    db[COLL_TRADES].update_one({"_id": trade_id}, {"$set": update})
+    doc.update(update)
+    return Trade.from_doc(doc)
 
 
-def get_recent_trades(db: Session, limit: int = 50) -> list[Trade]:
-    return list(db.scalars(select(Trade).order_by(desc(Trade.opened_at)).limit(limit)).all())
+def get_recent_trades(db: Database, limit: int = 50) -> list[Trade]:
+    docs = db[COLL_TRADES].find().sort("opened_at", -1).limit(limit)
+    return [Trade.from_doc(d) for d in docs]
 
 
-def get_closed_trades(db: Session, limit: int = 100) -> list[Trade]:
-    q = select(Trade).where(Trade.result.in_(["WIN", "LOSS"])).order_by(desc(Trade.closed_at)).limit(limit)
-    return list(db.scalars(q).all())
+def get_closed_trades(db: Database, limit: int = 100) -> list[Trade]:
+    docs = (
+        db[COLL_TRADES]
+        .find({"result": {"$in": ["WIN", "LOSS"]}})
+        .sort("closed_at", -1)
+        .limit(limit)
+    )
+    return [Trade.from_doc(d) for d in docs]
 
 
 def get_recent_closed_trades_for_strategy(
-    db: Session, strategy_name: str, limit: int = 20
+    db: Database, strategy_name: str, limit: int = 20
 ) -> list[Trade]:
-    """Return the most recent closed trades for a specific strategy."""
-    q = (
-        select(Trade)
-        .where(Trade.result.in_(["WIN", "LOSS"]))
-        .where(Trade.strategy_name == strategy_name)
-        .order_by(desc(Trade.closed_at))
+    docs = (
+        db[COLL_TRADES]
+        .find({"result": {"$in": ["WIN", "LOSS"]}, "strategy_name": strategy_name})
+        .sort("closed_at", -1)
         .limit(limit)
     )
-    return list(db.scalars(q).all())
+    return [Trade.from_doc(d) for d in docs]
 
 
 # Alias used by startup_checks and other services
 get_recent_closed_trades = get_recent_closed_trades_for_strategy
 
 
-def get_stats(db: Session) -> dict:
+def get_stats(db: Database) -> dict:
     trades = get_closed_trades(db, 1000)
     if not trades:
         return {
@@ -114,7 +134,7 @@ def get_stats(db: Session) -> dict:
 # ---------------------------------------------------------------------------
 
 def save_params(
-    db: Session,
+    db: Database,
     params: dict,
     reason: str = "",
     trigger: str = "AUTO",
@@ -123,44 +143,42 @@ def save_params(
     rollback_from_version: int | None = None,
     strategy_name: str | None = None,
 ) -> ParameterVersion:
-    last = db.scalar(select(ParameterVersion).order_by(desc(ParameterVersion.version)).limit(1))
-    version = (last.version + 1) if last else 1
-    row = ParameterVersion(
-        version=version,
-        params_json=json.dumps(params),
-        reason=reason,
-        trigger=trigger,
-        confidence_score=confidence_score,
-        delta_magnitude=delta_magnitude,
-        rollback_from_version=rollback_from_version,
-        strategy_name=strategy_name,
-        created_at=datetime.utcnow(),
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+    last = db[COLL_PARAMETER_VERSIONS].find_one(sort=[("version", -1)])
+    version = (last["version"] + 1) if last else 1
+    doc = {
+        "_id": next_id(db, COLL_PARAMETER_VERSIONS),
+        "version": version,
+        "params_json": json.dumps(params),
+        "reason": reason,
+        "trigger": trigger,
+        "confidence_score": confidence_score,
+        "delta_magnitude": delta_magnitude,
+        "rollback_from_version": rollback_from_version,
+        "strategy_name": strategy_name,
+        "created_at": datetime.utcnow(),
+    }
+    db[COLL_PARAMETER_VERSIONS].insert_one(doc)
+    return ParameterVersion.from_doc(doc)
 
 
-def get_current_params(db: Session) -> dict | None:
-    last = db.scalar(select(ParameterVersion).order_by(desc(ParameterVersion.version)).limit(1))
-    return json.loads(last.params_json) if last else None
+def get_current_params(db: Database) -> dict | None:
+    last = db[COLL_PARAMETER_VERSIONS].find_one(sort=[("version", -1)])
+    return json.loads(last["params_json"]) if last else None
 
 
-def get_params_history(db: Session, limit: int = 30) -> list[ParameterVersion]:
-    return list(db.scalars(select(ParameterVersion).order_by(desc(ParameterVersion.version)).limit(limit)).all())
+def get_params_history(db: Database, limit: int = 30) -> list[ParameterVersion]:
+    docs = db[COLL_PARAMETER_VERSIONS].find().sort("version", -1).limit(limit)
+    return [ParameterVersion.from_doc(d) for d in docs]
 
 
 def get_latest_param_version_for_strategy(
-    db: Session, strategy_name: str
+    db: Database, strategy_name: str
 ) -> ParameterVersion | None:
-    """Return the most recently created ParameterVersion for a specific strategy."""
-    return db.scalar(
-        select(ParameterVersion)
-        .where(ParameterVersion.strategy_name == strategy_name)
-        .order_by(desc(ParameterVersion.version))
-        .limit(1)
+    doc = db[COLL_PARAMETER_VERSIONS].find_one(
+        {"strategy_name": strategy_name},
+        sort=[("version", -1)],
     )
+    return ParameterVersion.from_doc(doc) if doc else None
 
 
 # Alias used by startup_checks and other services
@@ -171,129 +189,124 @@ get_latest_param_version = get_latest_param_version_for_strategy
 # Adaptation Log CRUD
 # ---------------------------------------------------------------------------
 
-def log_adaptation(db: Session, fields: dict) -> AdaptationLog:
-    row = AdaptationLog(**fields, evaluated_at=datetime.utcnow())
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+def log_adaptation(db: Database, fields: dict) -> AdaptationLog:
+    fields = dict(fields)
+    fields.setdefault("evaluated_at", datetime.utcnow())
+    fields["_id"] = next_id(db, COLL_ADAPTATION_LOGS)
+    db[COLL_ADAPTATION_LOGS].insert_one(fields)
+    return AdaptationLog.from_doc(fields)
 
 
 # ---------------------------------------------------------------------------
 # AppSetting CRUD
 # ---------------------------------------------------------------------------
 
-def get_setting(db: Session, key: str) -> str | None:
-    row = db.scalar(select(AppSetting).where(AppSetting.key == key).limit(1))
-    return row.value if row else None
+def get_setting(db: Database, key: str) -> str | None:
+    doc = db[COLL_APP_SETTINGS].find_one({"key": key})
+    return doc["value"] if doc else None
 
 
-# Synchronous alias (used inside background tasks that already have a db session)
+# Synchronous alias (used inside background tasks that already have a db)
 get_setting_sync = get_setting
 
 
-def set_setting(db: Session, key: str, value: str) -> AppSetting:
-    row = db.scalar(select(AppSetting).where(AppSetting.key == key).limit(1))
-    if row:
-        row.value = value
-        row.updated_at = datetime.utcnow()
-    else:
-        row = AppSetting(key=key, value=value, updated_at=datetime.utcnow())
-        db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+def set_setting(db: Database, key: str, value: str) -> AppSetting:
+    now = datetime.utcnow()
+    doc = db[COLL_APP_SETTINGS].find_one_and_update(
+        {"key": key},
+        {"$set": {"value": value, "updated_at": now}},
+        upsert=True,
+        return_document=True,
+    )
+    return AppSetting.from_doc(doc)
 
 
-def get_settings(db: Session, keys: list[str]) -> dict[str, str]:
-    rows = list(db.scalars(select(AppSetting).where(AppSetting.key.in_(keys))).all())
-    return {r.key: r.value for r in rows}
+def get_settings(db: Database, keys: list[str]) -> dict[str, str]:
+    docs = db[COLL_APP_SETTINGS].find({"key": {"$in": keys}})
+    return {d["key"]: d["value"] for d in docs}
 
 
 # ---------------------------------------------------------------------------
 # Strategy CRUD helpers
 # ---------------------------------------------------------------------------
 
-def get_strategy_by_name(db: Session, name: str) -> Strategy | None:
-    return db.scalar(select(Strategy).where(Strategy.name == name))
+def get_strategy_by_name(db: Database, name: str) -> Strategy | None:
+    doc = db[COLL_STRATEGIES].find_one({"name": name})
+    return Strategy.from_doc(doc) if doc else None
 
 
-def get_active_strategies(db: Session) -> list[Strategy]:
-    return list(db.scalars(select(Strategy).where(Strategy.is_active == True)).all())  # noqa: E712
+def get_active_strategies(db: Database) -> list[Strategy]:
+    docs = db[COLL_STRATEGIES].find({"is_active": True})
+    return [Strategy.from_doc(d) for d in docs]
 
 
-def get_all_strategies(db: Session) -> list[Strategy]:
-    """Return all strategy rows regardless of active state."""
-    return list(db.scalars(select(Strategy)).all())
+def get_all_strategies(db: Database) -> list[Strategy]:
+    docs = db[COLL_STRATEGIES].find()
+    return [Strategy.from_doc(d) for d in docs]
 
 
-def update_strategy_params(db: Session, strategy_name: str, params: dict) -> Strategy | None:
-    row = get_strategy_by_name(db, strategy_name)
-    if not row:
-        return None
-    row.params_json = json.dumps(params)
-    row.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(row)
-    return row
+def update_strategy_params(db: Database, strategy_name: str, params: dict) -> Strategy | None:
+    now = datetime.utcnow()
+    doc = db[COLL_STRATEGIES].find_one_and_update(
+        {"name": strategy_name},
+        {"$set": {"params_json": json.dumps(params), "updated_at": now}},
+        return_document=True,
+    )
+    return Strategy.from_doc(doc) if doc else None
 
 
 # ---------------------------------------------------------------------------
 # BacktestResult CRUD (extended)
 # ---------------------------------------------------------------------------
 
-def get_backtest_result(db: Session, bt_id: int) -> BacktestResult | None:
-    """Fetch a single BacktestResult by primary key."""
-    return db.get(BacktestResult, bt_id)
+def get_backtest_result(db: Database, bt_id: int) -> BacktestResult | None:
+    doc = db[COLL_BACKTEST_RESULTS].find_one({"_id": bt_id})
+    return BacktestResult.from_doc(doc) if doc else None
 
 
-def get_backtest_results_by_batch(db: Session, batch_id: str) -> list[BacktestResult]:
-    """Return all BacktestResult rows for a given batch_id."""
-    return list(
-        db.scalars(
-            select(BacktestResult)
-            .where(BacktestResult.batch_id == batch_id)
-            .order_by(BacktestResult.created_at)
-        ).all()
-    )
+def get_backtest_results_by_batch(db: Database, batch_id: str) -> list[BacktestResult]:
+    docs = db[COLL_BACKTEST_RESULTS].find({"batch_id": batch_id}).sort("created_at", 1)
+    return [BacktestResult.from_doc(d) for d in docs]
 
 
 # ---------------------------------------------------------------------------
 # BacktestCandidate CRUD
 # ---------------------------------------------------------------------------
 
-def create_backtest_candidate(db: Session, candidate: BacktestCandidate) -> BacktestCandidate:
-    db.add(candidate)
-    db.commit()
-    db.refresh(candidate)
+def create_backtest_candidate(db: Database, candidate: BacktestCandidate) -> BacktestCandidate:
+    doc = candidate.to_dict()
+    doc["_id"] = next_id(db, COLL_BACKTEST_CANDIDATES)
+    db[COLL_BACKTEST_CANDIDATES].insert_one(doc)
+    candidate.id = str(doc["_id"])
     return candidate
 
 
 def get_backtest_candidates(
-    db: Session,
+    db: Database,
     strategy_name: str,
     page: int = 1,
     limit: int = 50,
     qualified_only: bool = False,
 ) -> list[BacktestCandidate]:
-    q = (
-        select(BacktestCandidate)
-        .where(BacktestCandidate.strategy_name == strategy_name)
-    )
+    query: dict = {"strategy_name": strategy_name}
     if qualified_only:
-        q = q.where(BacktestCandidate.qualified == True)  # noqa: E712
-    q = q.order_by(desc(BacktestCandidate.evaluated_at)).offset((page - 1) * limit).limit(limit)
-    return list(db.scalars(q).all())
-
-
-def get_best_backtest_candidate(db: Session, strategy_name: str) -> BacktestCandidate | None:
-    return db.scalar(
-        select(BacktestCandidate)
-        .where(BacktestCandidate.strategy_name == strategy_name)
-        .where(BacktestCandidate.qualified == True)  # noqa: E712
-        .order_by(desc(BacktestCandidate.composite_score))
-        .limit(1)
+        query["qualified"] = True
+    docs = (
+        db[COLL_BACKTEST_CANDIDATES]
+        .find(query)
+        .sort("evaluated_at", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
     )
+    return [BacktestCandidate.from_doc(d) for d in docs]
+
+
+def get_best_backtest_candidate(db: Database, strategy_name: str) -> BacktestCandidate | None:
+    doc = db[COLL_BACKTEST_CANDIDATES].find_one(
+        {"strategy_name": strategy_name, "qualified": True},
+        sort=[("composite_score", -1)],
+    )
+    return BacktestCandidate.from_doc(doc) if doc else None
 
 
 # ---------------------------------------------------------------------------
@@ -301,83 +314,80 @@ def get_best_backtest_candidate(db: Session, strategy_name: str) -> BacktestCand
 # ---------------------------------------------------------------------------
 
 def create_backtest_batch(
-    db: Session,
+    db: Database,
     batch_id: str,
     strategy_names: list[str],
     shared_settings: dict | None = None,
 ) -> BacktestBatch:
-    row = BacktestBatch(
-        batch_id=batch_id,
-        strategy_names=strategy_names,
-        shared_settings_json=shared_settings or {},
-        status="RUNNING",
-        created_at=datetime.utcnow(),
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+    doc = {
+        "_id": next_id(db, COLL_BACKTEST_BATCHES),
+        "batch_id": batch_id,
+        "strategy_names": strategy_names,
+        "shared_settings_json": shared_settings or {},
+        "status": "RUNNING",
+        "cross_analysis_json": None,
+        "created_at": datetime.utcnow(),
+        "completed_at": None,
+    }
+    db[COLL_BACKTEST_BATCHES].insert_one(doc)
+    return BacktestBatch.from_doc(doc)
 
 
-def get_backtest_batch(db: Session, batch_id: str) -> BacktestBatch | None:
-    return db.scalar(select(BacktestBatch).where(BacktestBatch.batch_id == batch_id))
+def get_backtest_batch(db: Database, batch_id: str) -> BacktestBatch | None:
+    doc = db[COLL_BACKTEST_BATCHES].find_one({"batch_id": batch_id})
+    return BacktestBatch.from_doc(doc) if doc else None
 
 
 def update_backtest_batch(
-    db: Session,
+    db: Database,
     batch_id: str,
     status: str,
     cross_analysis_json: dict | None = None,
 ) -> BacktestBatch | None:
-    row = get_backtest_batch(db, batch_id)
-    if not row:
-        return None
-    row.status = status
+    update: dict = {"status": status}
     if cross_analysis_json is not None:
-        row.cross_analysis_json = cross_analysis_json
+        update["cross_analysis_json"] = cross_analysis_json
     if status in ("COMPLETE", "PARTIAL_FAILURE"):
-        row.completed_at = datetime.utcnow()
-    db.commit()
-    db.refresh(row)
-    return row
+        update["completed_at"] = datetime.utcnow()
+    doc = db[COLL_BACKTEST_BATCHES].find_one_and_update(
+        {"batch_id": batch_id},
+        {"$set": update},
+        return_document=True,
+    )
+    return BacktestBatch.from_doc(doc) if doc else None
 
 
 # Alias used in some services
 update_backtest_batch_status = update_backtest_batch
 
 
-def get_backtest_results_for_batch(db: Session, batch_id: str) -> list[BacktestResult]:
-    return list(
-        db.scalars(
-            select(BacktestResult)
-            .where(BacktestResult.batch_id == batch_id)
-            .order_by(BacktestResult.created_at)
-        ).all()
-    )
+def get_backtest_results_for_batch(db: Database, batch_id: str) -> list[BacktestResult]:
+    docs = db[COLL_BACKTEST_RESULTS].find({"batch_id": batch_id}).sort("created_at", 1)
+    return [BacktestResult.from_doc(d) for d in docs]
 
 
 # ---------------------------------------------------------------------------
 # StrategyPairAnalysis CRUD
 # ---------------------------------------------------------------------------
 
-def create_pair_analysis(db: Session, row: StrategyPairAnalysis) -> StrategyPairAnalysis:
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+def create_pair_analysis(db: Database, row: StrategyPairAnalysis) -> StrategyPairAnalysis:
+    doc = row.to_dict()
+    doc["_id"] = next_id(db, COLL_STRATEGY_PAIR_ANALYSES)
+    db[COLL_STRATEGY_PAIR_ANALYSES].insert_one(doc)
+    row.id = str(doc["_id"])
     return row
 
 
 def get_pair_analyses_for_batch(
-    db: Session,
+    db: Database,
     batch_id: str,
 ) -> list[StrategyPairAnalysis]:
-    return list(
-        db.scalars(
-            select(StrategyPairAnalysis)
-            .where(StrategyPairAnalysis.batch_id == batch_id)
-            .order_by(desc(StrategyPairAnalysis.synergy_score))
-        ).all()
+    docs = (
+        db[COLL_STRATEGY_PAIR_ANALYSES]
+        .find({"batch_id": batch_id})
+        .sort("synergy_score", -1)
     )
+    return [StrategyPairAnalysis.from_doc(d) for d in docs]
 
 
 # Alias
@@ -388,122 +398,131 @@ get_pair_analyses = get_pair_analyses_for_batch
 # EnsembleDecision CRUD
 # ---------------------------------------------------------------------------
 
-def create_ensemble_decision(db: Session, fields: dict) -> EnsembleDecision:
-    row = EnsembleDecision(**fields)
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+def create_ensemble_decision(db: Database, fields: dict) -> EnsembleDecision:
+    fields = dict(fields)
+    fields["_id"] = next_id(db, COLL_ENSEMBLE_DECISIONS)
+    db[COLL_ENSEMBLE_DECISIONS].insert_one(fields)
+    return EnsembleDecision.from_doc(fields)
 
 
 def update_ensemble_decision_trade_id(
-    db: Session, decision_id: int, trade_id: int
+    db: Database, decision_id: int, trade_id: int
 ) -> EnsembleDecision | None:
-    row = db.get(EnsembleDecision, decision_id)
-    if not row:
-        return None
-    row.trade_id = trade_id
-    db.commit()
-    db.refresh(row)
-    return row
+    doc = db[COLL_ENSEMBLE_DECISIONS].find_one_and_update(
+        {"_id": decision_id},
+        {"$set": {"trade_id": trade_id}},
+        return_document=True,
+    )
+    return EnsembleDecision.from_doc(doc) if doc else None
 
 
 def get_ensemble_decisions(
-    db: Session,
+    db: Database,
     page: int = 1,
     limit: int = 50,
     symbol: str | None = None,
 ) -> list[EnsembleDecision]:
-    q = select(EnsembleDecision).order_by(desc(EnsembleDecision.timestamp))
+    query: dict = {}
     if symbol:
-        q = q.where(EnsembleDecision.symbol == symbol)
-    q = q.offset((page - 1) * limit).limit(limit)
-    return list(db.scalars(q).all())
+        query["symbol"] = symbol
+    docs = (
+        db[COLL_ENSEMBLE_DECISIONS]
+        .find(query)
+        .sort("timestamp", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    return [EnsembleDecision.from_doc(d) for d in docs]
 
 
-def get_ensemble_decision(db: Session, decision_id: int) -> EnsembleDecision | None:
-    return db.get(EnsembleDecision, decision_id)
+def get_ensemble_decision(db: Database, decision_id: int) -> EnsembleDecision | None:
+    doc = db[COLL_ENSEMBLE_DECISIONS].find_one({"_id": decision_id})
+    return EnsembleDecision.from_doc(doc) if doc else None
 
 
 # ---------------------------------------------------------------------------
 # StrategyPickerDecision CRUD
 # ---------------------------------------------------------------------------
 
-def create_picker_decision(db: Session, row: StrategyPickerDecision) -> StrategyPickerDecision:
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+def create_picker_decision(db: Database, row: StrategyPickerDecision) -> StrategyPickerDecision:
+    doc = row.to_dict()
+    doc["_id"] = next_id(db, COLL_STRATEGY_PICKER_DECISIONS)
+    db[COLL_STRATEGY_PICKER_DECISIONS].insert_one(doc)
+    row.id = str(doc["_id"])
     return row
 
 
 def update_picker_decision_trade_id(
-    db: Session, decision_id: int, trade_id: int
+    db: Database, decision_id: int, trade_id: int
 ) -> StrategyPickerDecision | None:
-    row = db.get(StrategyPickerDecision, decision_id)
-    if not row:
-        return None
-    row.trade_id = trade_id
-    db.commit()
-    db.refresh(row)
-    return row
+    doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one_and_update(
+        {"_id": decision_id},
+        {"$set": {"trade_id": trade_id}},
+        return_document=True,
+    )
+    return StrategyPickerDecision.from_doc(doc) if doc else None
 
 
 def get_picker_decisions(
-    db: Session,
+    db: Database,
     page: int = 1,
     limit: int = 50,
     symbol: str | None = None,
 ) -> list[StrategyPickerDecision]:
-    q = select(StrategyPickerDecision).order_by(desc(StrategyPickerDecision.timestamp))
+    query: dict = {}
     if symbol:
-        q = q.where(StrategyPickerDecision.symbol == symbol)
-    q = q.offset((page - 1) * limit).limit(limit)
-    return list(db.scalars(q).all())
+        query["symbol"] = symbol
+    docs = (
+        db[COLL_STRATEGY_PICKER_DECISIONS]
+        .find(query)
+        .sort("timestamp", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    return [StrategyPickerDecision.from_doc(d) for d in docs]
 
 
-def get_picker_decision(db: Session, decision_id: int) -> StrategyPickerDecision | None:
-    return db.get(StrategyPickerDecision, decision_id)
+def get_picker_decision(db: Database, decision_id: int) -> StrategyPickerDecision | None:
+    doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one({"_id": decision_id})
+    return StrategyPickerDecision.from_doc(doc) if doc else None
 
 
 def get_picker_decisions_for_trade(
-    db: Session, trade_id: int
+    db: Database, trade_id: int
 ) -> list[StrategyPickerDecision]:
-    return list(
-        db.scalars(
-            select(StrategyPickerDecision)
-            .where(StrategyPickerDecision.trade_id == trade_id)
-        ).all()
-    )
+    docs = db[COLL_STRATEGY_PICKER_DECISIONS].find({"trade_id": trade_id})
+    return [StrategyPickerDecision.from_doc(d) for d in docs]
 
 
 # ---------------------------------------------------------------------------
 # PickerWeightHistory CRUD
 # ---------------------------------------------------------------------------
 
-def create_picker_weight_history(db: Session, row: PickerWeightHistory) -> PickerWeightHistory:
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+def create_picker_weight_history(db: Database, row: PickerWeightHistory) -> PickerWeightHistory:
+    doc = row.to_dict()
+    doc["_id"] = next_id(db, COLL_PICKER_WEIGHT_HISTORY)
+    db[COLL_PICKER_WEIGHT_HISTORY].insert_one(doc)
+    row.id = str(doc["_id"])
     return row
 
 
 def get_picker_weight_history(
-    db: Session, limit: int = 50
+    db: Database, limit: int = 50
 ) -> list[PickerWeightHistory]:
-    return list(
-        db.scalars(
-            select(PickerWeightHistory)
-            .order_by(desc(PickerWeightHistory.updated_at))
-            .limit(limit)
-        ).all()
+    docs = (
+        db[COLL_PICKER_WEIGHT_HISTORY]
+        .find()
+        .sort("updated_at", -1)
+        .limit(limit)
     )
+    return [PickerWeightHistory.from_doc(d) for d in docs]
 
 
 # ---------------------------------------------------------------------------
 # Seed default AppSettings
 # ---------------------------------------------------------------------------
 
-def seed_default_settings(db: Session) -> None:
+def seed_default_settings(db: Database) -> None:
     """
     Insert default AppSetting rows for all subsystems.
     Skips keys that already exist (never overwrites).
@@ -569,8 +588,8 @@ def seed_default_settings(db: Session) -> None:
 
     # ── Live trading loop ──────────────────────────────────────────────────
     live_trading_defaults: dict[str, str] = {
-        "live_trading_interval_seconds": "60",   # poll every 60 s
-        "live_trading_symbols": "XAUUSD",        # comma-separated symbols
+        "live_trading_interval_seconds": "60",
+        "live_trading_symbols": "XAUUSD",
     }
 
     per_strategy_defaults: dict[str, str] = {
@@ -585,44 +604,39 @@ def seed_default_settings(db: Session) -> None:
         "max_history_months": "36",
     }
 
-    rows_to_insert: list[AppSetting] = []
-
-    def _maybe_add(key: str, value: str) -> None:
-        existing = db.scalar(select(AppSetting).where(AppSetting.key == key))
-        if not existing:
-            rows_to_insert.append(
-                AppSetting(key=key, value=value, updated_at=datetime.utcnow())
-            )
+    def _maybe_insert(key: str, value: str) -> None:
+        """Insert only if the key doesn't already exist (upsert with $setOnInsert)."""
+        db[COLL_APP_SETTINGS].update_one(
+            {"key": key},
+            {"$setOnInsert": {"key": key, "value": value, "updated_at": datetime.utcnow()}},
+            upsert=True,
+        )
 
     for key, value in risk_defaults.items():
-        _maybe_add(key, value)
+        _maybe_insert(key, value)
 
     for key, value in news_defaults.items():
-        _maybe_add(key, value)
+        _maybe_insert(key, value)
 
     for key, value in backtest_globals.items():
-        _maybe_add(key, value)
+        _maybe_insert(key, value)
 
     for key, value in picker_defaults.items():
-        _maybe_add(key, value)
+        _maybe_insert(key, value)
 
     for key, value in live_trading_defaults.items():
-        _maybe_add(key, value)
+        _maybe_insert(key, value)
 
     for strategy_name in STRATEGY_REGISTRY.keys():
         for suffix, value in per_strategy_defaults.items():
-            _maybe_add(f"{strategy_name}_{suffix}", value)
+            _maybe_insert(f"{strategy_name}_{suffix}", value)
 
-    # ── Alchemist-specific overrides (more permissive — complex multi-confluent strategy) ──
+    # ── Alchemist-specific overrides ──────────────────────────────────────
     alchemist_overrides: dict[str, str] = {
-        "Alchemist_qualify_threshold_win_rate": "45.0",  # lower bar — complex strategy
-        "Alchemist_backtest_timeframes": '["1d"]',       # daily only for now
+        "Alchemist_qualify_threshold_win_rate": "45.0",
+        "Alchemist_backtest_timeframes": '["1d"]',
         "Alchemist_backtest_symbols": '["XAUUSD"]',
         "Alchemist_param_step_size": "0.03",
     }
     for key, value in alchemist_overrides.items():
-        _maybe_add(key, value)
-
-    if rows_to_insert:
-        db.bulk_save_objects(rows_to_insert)
-        db.commit()
+        _maybe_insert(key, value)
