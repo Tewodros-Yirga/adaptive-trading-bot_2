@@ -6,6 +6,7 @@ import logging
 import os
 
 from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.collection import ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import ConnectionFailure
 
@@ -62,11 +63,36 @@ def get_client() -> MongoClient:
     return _client
 
 
+def _parse_db_name(uri: str) -> str:
+    """
+    Extract the database name from a MongoDB URI.
+    Falls back to 'trading_bot' if the URI contains no DB path segment.
+
+    Examples:
+      mongodb+srv://user:pass@cluster.mongodb.net/mydb  -> 'mydb'
+      mongodb://localhost:27017/trading_bot             -> 'trading_bot'
+      mongodb+srv://user:pass@cluster.mongodb.net/      -> 'trading_bot'
+    """
+    try:
+        # Strip query string, then get the path component after the host
+        path = uri.split("?")[0]
+        # Split on "/" — for SRV URIs: ["mongodb+srv:", "", "host", "dbname"]
+        parts = path.split("/")
+        if len(parts) >= 4 and parts[3].strip():
+            return parts[3].strip()
+    except Exception:
+        pass
+    return "trading_bot"
+
+
 def get_database() -> Database:
     global _db
     if _db is None:
         client = get_client()
-        _db = client["trading_bot"]
+        uri = _get_uri()
+        db_name = _parse_db_name(uri)
+        _db = client[db_name]
+        logger.info("Using MongoDB database: %s", db_name)
     return _db
 
 
@@ -152,6 +178,6 @@ def next_id(db: Database, name: str) -> int:
         {"_id": name},
         {"$inc": {"seq": 1}},
         upsert=True,
-        return_document=True,  # pymongo ReturnDocument.AFTER equivalent
+        return_document=ReturnDocument.AFTER,
     )
     return result["seq"]
