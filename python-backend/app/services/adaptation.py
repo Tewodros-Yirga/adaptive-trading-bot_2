@@ -63,13 +63,14 @@ def run_adaptation(db: Database, window: int = 20, strategy_name: str = "DTC") -
     if not params:
         return {"skipped": True, "reason": f"Could not load params for strategy {strategy_name}"}
 
-    all_closed = crud.get_closed_trades(db, 100000)
+    from ..db import COLL_TRADES
+    total_closed_count = db[COLL_TRADES].count_documents({"result": {"$in": ["WIN", "LOSS"]}})
     last_adapt_count_raw = crud.get_setting(db, "last_adapt_closed_count")
     last_adapt_count = int(last_adapt_count_raw) if last_adapt_count_raw else 0
-    if len(all_closed) - last_adapt_count < learning["adaptation_cooldown_trades"]:
+    if total_closed_count - last_adapt_count < learning["adaptation_cooldown_trades"]:
         return {"skipped": True, "reason": "Adaptation cooldown active"}
 
-    trades = all_closed[:window]
+    trades = crud.get_closed_trades(db, window)
     if len(trades) < learning["adaptation_min_closed_trades"]:
         return {"skipped": True, "reason": f"Only {len(trades)} closed trades"}
 
@@ -158,7 +159,7 @@ def run_adaptation(db: Database, window: int = 20, strategy_name: str = "DTC") -
             "strategy_name": strategy_name,
         },
     )
-    crud.set_setting(db, "last_adapt_closed_count", str(len(all_closed)))
+    crud.set_setting(db, "last_adapt_closed_count", str(total_closed_count))
 
     # Persist updated params back to the Strategy row
     try:

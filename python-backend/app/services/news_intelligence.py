@@ -230,15 +230,26 @@ RSS_FEEDS = [
 def _parse_dt(raw: str | None) -> datetime | None:
     if not raw:
         return None
-    for fmt in ("%Y%m%dT%H%M%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
+    # Try %z-aware format first (handles ISO 8601 with offset)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y%m%dT%H%M%S%z"):
         try:
-            dt = datetime.strptime(raw[:19].replace("Z", ""), fmt.rstrip("Z%z").rstrip("Z"))
+            dt = datetime.strptime(raw, fmt)
+            return dt.astimezone(timezone.utc).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    # Try naive formats — assume UTC
+    for fmt in ("%Y%m%dT%H%M%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(raw[:19].rstrip("Z"), fmt)
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             pass
     try:
         from dateutil import parser as dp
-        return dp.parse(raw)
+        dt = dp.parse(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -280,6 +291,7 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
                 "summary": item.get("summary", ""),
                 "url": item.get("url", ""),
                 "published_at": pub_dt,
+                "fetched_at": datetime.now(timezone.utc),
                 "symbols_mentioned": json.dumps([sym]),
                 "raw_sentiment_score": item.get("raw_sentiment_score"),
                 "ai_sentiment_score": sentiment["ai_sentiment_score"],
@@ -290,8 +302,9 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
                 "impact_learning_weight": 1.0,
             })
             stored += 1
-        except Exception:
-            pass
+        except Exception as e:
+            import logging as _log
+            _log.getLogger(__name__).warning("Failed to insert news item '%s': %s", headline[:60], e)
 
     return stored
 

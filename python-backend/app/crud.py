@@ -214,7 +214,10 @@ def set_setting(db: Database, key: str, value: str) -> AppSetting:
     now = datetime.utcnow()
     doc = db[COLL_APP_SETTINGS].find_one_and_update(
         {"key": key},
-        {"$set": {"value": value, "updated_at": now}},
+        {
+            "$set": {"value": value, "updated_at": now},
+            "$setOnInsert": {"key": key},  # ensures key field exists on upsert-insert
+        },
         upsert=True,
         return_document=True,
     )

@@ -146,7 +146,7 @@ def check_and_compute_lot_size(
     closed_trades = crud.get_closed_trades(db, 10000)
     today_pnl = sum(
         (t.pnl or 0) for t in closed_trades
-        if t.closed_at and t.closed_at.replace(tzinfo=timezone.utc) >= today_start
+        if t.closed_at and (t.closed_at if t.closed_at.tzinfo else t.closed_at.replace(tzinfo=timezone.utc)) >= today_start
     )
     balance = settings["account_balance"]
     if balance > 0:
@@ -183,7 +183,7 @@ def get_risk_status(db: Database) -> dict:
     closed_trades = crud.get_closed_trades(db, 10000)
     today_pnl = sum(
         (t.pnl or 0) for t in closed_trades
-        if t.closed_at and t.closed_at.replace(tzinfo=timezone.utc) >= today_start
+        if t.closed_at and (t.closed_at if t.closed_at.tzinfo else t.closed_at.replace(tzinfo=timezone.utc)) >= today_start
     )
     stats = crud.get_stats(db)
     balance = settings["account_balance"]

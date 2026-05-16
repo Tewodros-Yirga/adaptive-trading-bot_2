@@ -86,7 +86,9 @@ def compute_factor_scores(
         # Use strategy-specific factors even without live trades
         latest_param = crud.get_latest_param_version_for_strategy(db, strategy_name)
         if latest_param:
-            hours_since = (datetime.datetime.utcnow() - latest_param.created_at).total_seconds() / 3600
+            _now = datetime.datetime.now(datetime.timezone.utc)
+            _ca = latest_param.created_at if latest_param.created_at.tzinfo else latest_param.created_at.replace(tzinfo=datetime.timezone.utc)
+            hours_since = (_now - _ca).total_seconds() / 3600
             freshness = math.exp(-0.01 * hours_since)
         else:
             freshness = 0.5
@@ -125,14 +127,18 @@ def compute_factor_scores(
     recency_lambda = float(crud.get_setting(db, "picker_recency_lambda") or 0.1)
     if wins:
         last_win = max(wins, key=lambda t: t.closed_at)
-        bars_since = (datetime.datetime.utcnow() - last_win.closed_at).total_seconds() / 3600
+        _now = datetime.datetime.now(datetime.timezone.utc)
+        _lw = last_win.closed_at if last_win.closed_at.tzinfo else last_win.closed_at.replace(tzinfo=datetime.timezone.utc)
+        bars_since = (_now - _lw).total_seconds() / 3600
         recency_score = math.exp(-recency_lambda * bars_since)
     else:
         recency_score = 0.0
 
     latest_param = crud.get_latest_param_version_for_strategy(db, strategy_name)
     if latest_param:
-        hours_since = (datetime.datetime.utcnow() - latest_param.created_at).total_seconds() / 3600
+        _now = datetime.datetime.now(datetime.timezone.utc)
+        _ca = latest_param.created_at if latest_param.created_at.tzinfo else latest_param.created_at.replace(tzinfo=datetime.timezone.utc)
+        hours_since = (_now - _ca).total_seconds() / 3600
         freshness_score = math.exp(-0.01 * hours_since)
     else:
         freshness_score = 0.5

@@ -17,7 +17,7 @@ def get_bulk(keys: list[str] = Query(default=[]), db: Database = Depends(get_db)
 @router.post("/bulk")
 def set_bulk(body: dict, db: Database = Depends(get_db), _a=Depends(require_admin)):
     for key, value in body.items():
-        if value is not None and str(value).strip():
+        if value is not None:  # allow empty strings — callers may intentionally clear a key
             crud.set_setting(db, key, str(value))
     return {"saved": list(body.keys())}
 
