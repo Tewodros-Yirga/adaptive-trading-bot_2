@@ -12,7 +12,7 @@ from passlib.context import CryptContext
 from pymongo.database import Database
 
 from .config import settings
-from .db import get_db, COLL_USERS
+from .db import get_db, COLL_USERS, next_id
 from .models import User
 
 logger = logging.getLogger(__name__)
@@ -62,20 +62,13 @@ def decode_token(token: str) -> dict:
 
 
 def _get_user_by_id(db: Database, user_id: str) -> User | None:
-    """Fetch a user document by string ID (stored as username-keyed or ObjectId)."""
-    from bson import ObjectId
-    # Try ObjectId first, fall back to numeric id field
+    """Fetch a user document by string ID (stored as integer _id via next_id)."""
     doc = None
+    # Primary lookup: integer _id (all users created via next_id)
     try:
-        doc = db[COLL_USERS].find_one({"_id": ObjectId(user_id)})
-    except Exception:
+        doc = db[COLL_USERS].find_one({"_id": int(user_id)})
+    except (ValueError, TypeError):
         pass
-    if not doc:
-        # Fallback: some tokens may store integer id
-        try:
-            doc = db[COLL_USERS].find_one({"id": int(user_id)})
-        except Exception:
-            pass
     return User.from_doc(doc) if doc else None
 
 
@@ -149,6 +142,7 @@ def seed_admin_user(db: Database) -> None:
         return
 
     doc = {
+        "_id": next_id(db, COLL_USERS),  # use integer _id for consistency
         "username": settings.admin_username,
         "password_hash": hash_password(settings.admin_password),
         "role": "admin",
@@ -157,4 +151,4 @@ def seed_admin_user(db: Database) -> None:
         "created_at": datetime.utcnow(),
     }
     result = db[COLL_USERS].insert_one(doc)
-    logger.info(f"Admin user '{settings.admin_username}' created (id={result.inserted_id}).")
+    logger.info(f"Admin user '{settings.admin_username}' created (id={doc['_id']}).")

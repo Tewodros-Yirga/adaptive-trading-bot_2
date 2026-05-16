@@ -212,11 +212,14 @@ get_setting_sync = get_setting
 
 def set_setting(db: Database, key: str, value: str) -> AppSetting:
     now = datetime.utcnow()
+    # Check if key already exists to reuse its _id; otherwise generate a new one
+    existing = db[COLL_APP_SETTINGS].find_one({"key": key}, {"_id": 1})
+    new_id = existing["_id"] if existing else next_id(db, COLL_APP_SETTINGS)
     doc = db[COLL_APP_SETTINGS].find_one_and_update(
         {"key": key},
         {
             "$set": {"value": value, "updated_at": now},
-            "$setOnInsert": {"key": key},  # ensures key field exists on upsert-insert
+            "$setOnInsert": {"key": key, "_id": new_id},
         },
         upsert=True,
         return_document=True,
@@ -609,9 +612,14 @@ def seed_default_settings(db: Database) -> None:
 
     def _maybe_insert(key: str, value: str) -> None:
         """Insert only if the key doesn't already exist (upsert with $setOnInsert)."""
+        # Generate _id only for genuinely new documents
+        existing = db[COLL_APP_SETTINGS].find_one({"key": key}, {"_id": 1})
+        if existing:
+            return  # already exists, skip
+        new_id = next_id(db, COLL_APP_SETTINGS)
         db[COLL_APP_SETTINGS].update_one(
             {"key": key},
-            {"$setOnInsert": {"key": key, "value": value, "updated_at": datetime.utcnow()}},
+            {"$setOnInsert": {"_id": new_id, "key": key, "value": value, "updated_at": datetime.utcnow()}},
             upsert=True,
         )
 

@@ -14,6 +14,14 @@ from typing import Any
 from bson import ObjectId
 
 
+def _ensure_str(v) -> str:
+    """Return v as a JSON string if it's already a dict/list, else return as-is."""
+    if isinstance(v, (dict, list)):
+        import json as _json
+        return _json.dumps(v)
+    return v or ""
+
+
 def _oid_to_str(v: Any) -> Any:
     """Recursively convert ObjectId values to strings for serialization."""
     if isinstance(v, ObjectId):
@@ -55,7 +63,7 @@ class Trade:
     strategy_name: str | None = "DTC"
     opened_at: datetime = field(default_factory=datetime.utcnow)
     closed_at: datetime | None = None
-    id: str = ""           # string of MongoDB _id
+    id: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -115,7 +123,7 @@ class ParameterVersion:
         doc = dict(doc)
         obj = cls(
             version=doc.get("version", 0),
-            params_json=doc.get("params_json", "{}"),
+            params_json=_ensure_str(doc.get("params_json", "{}")),
             reason=doc.get("reason"),
             trigger=doc.get("trigger"),
             confidence_score=doc.get("confidence_score"),
@@ -230,7 +238,7 @@ class Strategy:
             description=doc.get("description"),
             is_active=doc.get("is_active", False),
             is_live=doc.get("is_live", False),
-            params_json=doc.get("params_json", "{}"),
+            params_json=_ensure_str(doc.get("params_json", "{}")),
             created_at=doc.get("created_at", datetime.utcnow()),
             updated_at=doc.get("updated_at", datetime.utcnow()),
         )
@@ -323,12 +331,12 @@ class BacktestResult:
             symbol=doc.get("symbol", ""),
             from_date=doc.get("from_date", ""),
             to_date=doc.get("to_date", ""),
-            params_json=doc.get("params_json", "{}"),
+            params_json=_ensure_str(doc.get("params_json", "{}")),
             initial_balance=doc.get("initial_balance", 10000.0),
             leverage=doc.get("leverage", 100),
             risk_per_trade_pct=doc.get("risk_per_trade_pct", 1.0),
-            metrics_json=doc.get("metrics_json", "{}"),
-            equity_curve_json=doc.get("equity_curve_json", "[]"),
+            metrics_json=_ensure_str(doc.get("metrics_json", "{}")),
+            equity_curve_json=_ensure_str(doc.get("equity_curve_json", "[]")),
             status=doc.get("status", "PENDING"),
             created_at=doc.get("created_at", datetime.utcnow()),
             completed_at=doc.get("completed_at"),
@@ -372,7 +380,7 @@ class OHLCVCache:
             interval=doc.get("interval", ""),
             from_date=doc.get("from_date", ""),
             to_date=doc.get("to_date", ""),
-            data_json=doc.get("data_json", "[]"),
+            data_json=_ensure_str(doc.get("data_json", "[]")),
             source=doc.get("source"),
             fetched_at=doc.get("fetched_at", datetime.utcnow()),
         )

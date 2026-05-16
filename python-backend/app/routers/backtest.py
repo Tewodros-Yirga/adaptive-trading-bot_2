@@ -26,13 +26,11 @@ router = APIRouter(prefix="/backtest", tags=["backtest"])
 
 
 # ---------------------------------------------------------------------------
-# Helper: share the module-level executor from main
+# Helper: executor removed — backtester runs as a standalone service
 # ---------------------------------------------------------------------------
 
 def _get_executor():
-    """Return the shared ProcessPoolExecutor from main.py."""
-    from ..main import _EXECUTOR
-    return _EXECUTOR
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -71,14 +69,12 @@ async def run(
         )
 
         runs_as_dicts = [r.model_dump() for r in batch_req.runs]
-        executor = _get_executor()
 
         background_tasks.add_task(
             _run_batch_background,
             batch_id,
             runs_as_dicts,
             batch_req.shared_settings,
-            executor,
         )
 
         return BatchBacktestResponse(batch_id=batch_id, run_count=len(batch_req.runs))
@@ -112,13 +108,12 @@ async def _run_batch_background(
     batch_id: str,
     runs: list[dict],
     shared_settings: dict,
-    executor,
 ) -> None:
     """Background coroutine wrapper — creates its own DB session."""
     from ..db import get_database
     db = get_database()
     try:
-        await run_batch_backtest(db, batch_id, runs, shared_settings, executor)
+        await run_batch_backtest(db, batch_id, runs, shared_settings, None)
     finally:
         pass  # pymongo client is managed at app level; no per-request close needed
 
@@ -135,8 +130,15 @@ def list_results(limit: int = 20, db: Database = Depends(get_db)):
         .sort("created_at", -1)
         .limit(limit)
     )
-    return [
-        {
+    results = []
+    for d in docs:
+        metrics = d.get("metrics_json", {})
+        if isinstance(metrics, str):
+            try:
+                metrics = json.loads(metrics)
+            except Exception:
+                metrics = {}
+        results.append({
             "id": d["_id"],
             "strategy_name": d.get("strategy_name"),
             "symbol": d.get("symbol"),
@@ -146,14 +148,12 @@ def list_results(limit: int = 20, db: Database = Depends(get_db)):
             "leverage": d.get("leverage"),
             "risk_per_trade_pct": d.get("risk_per_trade_pct"),
             "status": d.get("status"),
-            "metrics": d.get("metrics_json") if isinstance(d.get("metrics_json"), dict)
-                       else json.loads(d.get("metrics_json") or "{}"),
+            "metrics": metrics,
             "batch_id": d.get("batch_id"),
             "created_at": d.get("created_at"),
             "completed_at": d.get("completed_at"),
-        }
-        for d in docs
-    ]
+        })
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -165,19 +165,28 @@ def get_result(bt_id: int, db: Database = Depends(get_db)):
     row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
+
+    def _safe_loads(v, default):
+        if isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v or json.dumps(default))
+        except Exception:
+            return default
+
     return {
         "id": row.id,
         "strategy_name": row.strategy_name,
         "symbol": row.symbol,
         "from_date": row.from_date,
         "to_date": row.to_date,
-        "params": json.loads(row.params_json or "{}"),
+        "params": _safe_loads(row.params_json, {}),
         "initial_balance": row.initial_balance,
         "leverage": row.leverage,
         "risk_per_trade_pct": row.risk_per_trade_pct,
         "status": row.status,
-        "metrics": json.loads(row.metrics_json or "{}"),
-        "equity_curve": json.loads(row.equity_curve_json or "[]"),
+        "metrics": _safe_loads(row.metrics_json, {}),
+        "equity_curve": _safe_loads(row.equity_curve_json, []),
         "batch_id": row.batch_id,
         "created_at": row.created_at,
         "completed_at": row.completed_at,
@@ -243,9 +252,18 @@ def get_strategy_breakdown(bt_id: int, db: Database = Depends(get_db)):
     row = crud.get_backtest_result(db, bt_id)
     if not row:
         raise HTTPException(404, "Backtest not found")
+
+    def _safe_loads(v, default):
+        if isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v or json.dumps(default))
+        except Exception:
+            return default
+
     return {
         "strategy_name": row.strategy_name,
-        "metrics": json.loads(row.metrics_json or "{}"),
+        "metrics": _safe_loads(row.metrics_json, {}),
         "drawdown_periods": row.drawdown_periods_json or [],
         "strategy_performance_timeline": row.strategy_performance_timeline_json or {},
     }
@@ -309,8 +327,16 @@ def _html_to_pdf(html: str) -> bytes:
 
 def _render_backtest_report_html(result: BacktestResult) -> str:  # noqa: C901
     """Build a complete, self-contained HTML document for the backtest report."""
-    metrics: dict = json.loads(result.metrics_json or "{}")
-    equity_curve: list = json.loads(result.equity_curve_json or "[]")
+    def _safe_loads(v, default):
+        if isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v or json.dumps(default))
+        except Exception:
+            return default
+
+    metrics: dict = _safe_loads(result.metrics_json, {})
+    equity_curve: list = _safe_loads(result.equity_curve_json, [])
     monthly: dict = result.monthly_breakdown_json or {}
     evolution: dict = result.parameter_evolution_log_json or {}
     trade_log: list = result.trade_log_json or []
@@ -426,86 +452,26 @@ def _render_backtest_report_html(result: BacktestResult) -> str:  # noqa: C901
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-  body {{
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    font-size: 11pt;
-    color: #1a1a2e;
-    background: #fff;
-    line-height: 1.5;
-  }}
-
+  body {{ font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; font-size: 11pt; color: #1a1a2e; background: #fff; line-height: 1.5; }}
   .page {{ padding: 28px 36px; page-break-after: always; }}
   .page:last-child {{ page-break-after: auto; }}
-
-  /* ── Header ── */
-  .report-header {{
-    background: #1e2d3d;
-    color: #fff;
-    padding: 20px 24px;
-    border-radius: 6px;
-    margin-bottom: 24px;
-  }}
+  .report-header {{ background: #1e2d3d; color: #fff; padding: 20px 24px; border-radius: 6px; margin-bottom: 24px; }}
   .report-header h1 {{ font-size: 18pt; font-weight: 700; margin-bottom: 4px; }}
   .report-header .subtitle {{ font-size: 10pt; opacity: 0.75; }}
   .report-header .meta {{ margin-top: 12px; font-size: 9.5pt; opacity: 0.85; display: flex; gap: 24px; }}
-
-  /* ── Section heading ── */
-  h2 {{
-    font-size: 13pt;
-    font-weight: 600;
-    color: #1e2d3d;
-    border-left: 4px solid #3a7bd5;
-    padding-left: 10px;
-    margin: 20px 0 12px;
-  }}
-
-  /* ── Tables ── */
-  table {{
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 9.5pt;
-    margin-bottom: 16px;
-  }}
+  h2 {{ font-size: 13pt; font-weight: 600; color: #1e2d3d; border-left: 4px solid #3a7bd5; padding-left: 10px; margin: 20px 0 12px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 9.5pt; margin-bottom: 16px; }}
   thead tr {{ background: #1e2d3d; color: #fff; }}
-  thead th {{
-    padding: 8px 10px;
-    text-align: left;
-    font-weight: 600;
-    font-size: 9pt;
-    letter-spacing: 0.03em;
-  }}
+  thead th {{ padding: 8px 10px; text-align: left; font-weight: 600; font-size: 9pt; letter-spacing: 0.03em; }}
   tbody tr {{ background: #fff; }}
   tbody tr.alt {{ background: #f8f9fa; }}
   tbody td {{ padding: 6px 10px; border-bottom: 1px solid #e8ecef; }}
   .empty {{ color: #999; font-style: italic; text-align: center; padding: 16px; }}
-
-  /* ── Two-column metrics ── */
-  .metrics-grid {{ display: flex; gap: 16px; }}
-  .metrics-grid table {{ flex: 1; }}
-
-  /* ── Equity SVG ── */
-  .equity-wrap {{
-    border: 1px solid #e8ecef;
-    border-radius: 6px;
-    overflow: hidden;
-    margin: 12px 0;
-  }}
-
-  /* ── Footer ── */
-  .footer {{
-    font-size: 8.5pt;
-    color: #aaa;
-    text-align: center;
-    margin-top: 24px;
-    padding-top: 8px;
-    border-top: 1px solid #e8ecef;
-  }}
+  .equity-wrap {{ border: 1px solid #e8ecef; border-radius: 6px; overflow: hidden; margin: 12px 0; }}
+  .footer {{ font-size: 8.5pt; color: #aaa; text-align: center; margin-top: 24px; padding-top: 8px; border-top: 1px solid #e8ecef; }}
 </style>
 </head>
 <body>
-
-<!-- ═══════════════════ PAGE 1 — SUMMARY ═══════════════════ -->
 <div class="page">
   <div class="report-header">
     <h1>Backtest Report — {result.strategy_name} on {result.symbol}</h1>
@@ -518,110 +484,53 @@ def _render_backtest_report_html(result: BacktestResult) -> str:  # noqa: C901
       <span>🕐 Generated: {generated_at}</span>
     </div>
   </div>
-
   <h2>Performance Summary</h2>
-  <table>
-    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
-    <tbody>{metrics_rows}</tbody>
-  </table>
-
+  <table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>{metrics_rows}</tbody></table>
   <h2>Equity Curve</h2>
   <div class="equity-wrap">{equity_svg}</div>
-
   <div class="footer">AlgoTrade Pro — Backtest ID #{result.id} — {result.strategy_name}</div>
 </div>
-
-<!-- ═══════════════════ PAGE 2 — MONTHLY BREAKDOWN ═══════════════════ -->
 <div class="page">
   <div class="report-header">
     <h1>Monthly Performance Breakdown</h1>
     <div class="subtitle">{result.strategy_name} · {result.symbol} · {result.from_date} → {result.to_date}</div>
   </div>
-
   <h2>Month-by-Month Results</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Period</th><th>Wins</th><th>Losses</th><th>Net PnL</th><th>Win Rate</th>
-      </tr>
-    </thead>
-    <tbody>{monthly_rows}</tbody>
-  </table>
-
+  <table><thead><tr><th>Period</th><th>Wins</th><th>Losses</th><th>Net PnL</th><th>Win Rate</th></tr></thead><tbody>{monthly_rows}</tbody></table>
   <div class="footer">AlgoTrade Pro — Backtest ID #{result.id}</div>
 </div>
-
-<!-- ═══════════════════ PAGE 3 — PARAMETER EVOLUTION ═══════════════════ -->
 <div class="page">
   <div class="report-header">
     <h1>Parameter Adaptation Log</h1>
     <div class="subtitle">{result.strategy_name} · Continuous optimisation events during backtest</div>
   </div>
-
   <h2>Adaptation Events</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>After Trade #</th><th>Win Rate at Event</th><th>Parameter Deltas (top 5)</th>
-      </tr>
-    </thead>
-    <tbody>{evolution_rows}</tbody>
-  </table>
-
+  <table><thead><tr><th>After Trade #</th><th>Win Rate at Event</th><th>Parameter Deltas (top 5)</th></tr></thead><tbody>{evolution_rows}</tbody></table>
   <div class="footer">AlgoTrade Pro — Backtest ID #{result.id}</div>
 </div>
-
-<!-- ═══════════════════ PAGE 4 — TOP 10 WINNING TRADES ═══════════════════ -->
 <div class="page">
   <div class="report-header">
     <h1>Top 10 Winning Trades</h1>
     <div class="subtitle">{result.strategy_name} · {result.symbol} · sorted by PnL descending</div>
   </div>
-
   <h2>Best Trades</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th>
-        <th>PnL</th><th>Duration (min)</th><th>Exit Reason</th>
-      </tr>
-    </thead>
-    <tbody>{winning_rows}</tbody>
-  </table>
-
+  <table><thead><tr><th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Duration (min)</th><th>Exit Reason</th></tr></thead><tbody>{winning_rows}</tbody></table>
   <div class="footer">AlgoTrade Pro — Backtest ID #{result.id}</div>
 </div>
-
-<!-- ═══════════════════ PAGE 5 — TOP 10 LOSING TRADES ═══════════════════ -->
 <div class="page">
   <div class="report-header">
     <h1>Top 10 Losing Trades</h1>
     <div class="subtitle">{result.strategy_name} · {result.symbol} · sorted by PnL ascending</div>
   </div>
-
   <h2>Worst Trades</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th>
-        <th>PnL</th><th>Duration (min)</th><th>Exit Reason</th>
-      </tr>
-    </thead>
-    <tbody>{losing_rows}</tbody>
-  </table>
-
+  <table><thead><tr><th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Duration (min)</th><th>Exit Reason</th></tr></thead><tbody>{losing_rows}</tbody></table>
   <div class="footer">AlgoTrade Pro — Backtest ID #{result.id}</div>
 </div>
-
 </body>
 </html>"""
 
 
 def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -> str:
-    """
-    Build a simple inline SVG equity curve from cumulative PnL data.
-    equity_curve can be a list of floats (cumulative pnl) or list of dicts with a 'cumulative_pnl' key.
-    """
     if not equity_curve:
         return (
             f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">'
@@ -631,7 +540,6 @@ def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -
             f"</svg>"
         )
 
-    # Normalise to list of floats
     values: list[float] = []
     for item in equity_curve:
         if isinstance(item, (int, float)):
@@ -646,7 +554,6 @@ def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -
     pad = 20
     chart_w = width - pad * 2
     chart_h = height - pad * 2
-
     min_v = min(values)
     max_v = max(values)
     v_range = max_v - min_v or 1.0
@@ -657,18 +564,10 @@ def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -
     def _y(v: float) -> float:
         return pad + (1 - (v - min_v) / v_range) * chart_h
 
-    # Build polyline points
     points = " ".join(f"{_x(i):.1f},{_y(v):.1f}" for i, v in enumerate(values))
-
-    # Fill polygon (close path back to baseline)
     baseline_y = _y(0) if min_v < 0 < max_v else (pad + chart_h)
-    fill_points = (
-        f"{pad:.1f},{baseline_y:.1f} "
-        + points
-        + f" {pad + chart_w:.1f},{baseline_y:.1f}"
-    )
+    fill_points = f"{pad:.1f},{baseline_y:.1f} " + points + f" {pad + chart_w:.1f},{baseline_y:.1f}"
 
-    # Zero line if applicable
     zero_line = ""
     if min_v < 0 < max_v:
         zy = _y(0)
@@ -677,9 +576,6 @@ def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -
             f'stroke="#ccc" stroke-width="1" stroke-dasharray="4,3"/>'
         )
 
-    # Axis labels
-    label_min = f"{min_v:+.2f}"
-    label_max = f"{max_v:+.2f}"
     final_val = values[-1]
     final_color = "#2ecc71" if final_val >= 0 else "#e74c3c"
 
@@ -688,8 +584,8 @@ def _build_equity_svg(equity_curve: list, width: int = 700, height: int = 200) -
   {zero_line}
   <polygon points="{fill_points}" fill="rgba(58,123,213,0.12)"/>
   <polyline points="{points}" fill="none" stroke="#3a7bd5" stroke-width="2" stroke-linejoin="round"/>
-  <text x="{pad}" y="{height - 4}" font-family="Inter,sans-serif" font-size="9" fill="#999">{label_min}</text>
-  <text x="{pad}" y="{pad - 4}" font-family="Inter,sans-serif" font-size="9" fill="#999">{label_max}</text>
+  <text x="{pad}" y="{height - 4}" font-family="Inter,sans-serif" font-size="9" fill="#999">{min_v:+.2f}</text>
+  <text x="{pad}" y="{pad - 4}" font-family="Inter,sans-serif" font-size="9" fill="#999">{max_v:+.2f}</text>
   <text x="{width - pad}" y="{_y(final_val):.1f}" font-family="Inter,sans-serif" font-size="9"
     fill="{final_color}" text-anchor="end" dy="-4">{final_val:+.2f}</text>
 </svg>"""
@@ -705,6 +601,15 @@ def get_batch(batch_id: str, db: Database = Depends(get_db)):
     if not batch:
         raise HTTPException(404, "Batch not found")
     results = crud.get_backtest_results_for_batch(db, batch_id)
+
+    def _safe_loads(v, default):
+        if isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v or json.dumps(default))
+        except Exception:
+            return default
+
     return {
         "id": batch.id,
         "batch_id": batch.batch_id,
@@ -722,7 +627,7 @@ def get_batch(batch_id: str, db: Database = Depends(get_db)):
                 "from_date": r.from_date,
                 "to_date": r.to_date,
                 "status": r.status,
-                "metrics": json.loads(r.metrics_json or "{}"),
+                "metrics": _safe_loads(r.metrics_json, {}),
                 "created_at": r.created_at,
                 "completed_at": r.completed_at,
             }
@@ -789,6 +694,14 @@ def get_batch_report(batch_id: str, db: Database = Depends(get_db)):
     results = crud.get_backtest_results_for_batch(db, batch_id)
     analyses = crud.get_pair_analyses_for_batch(db, batch_id)
 
+    def _safe_loads(v, default):
+        if isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v or json.dumps(default))
+        except Exception:
+            return default
+
     results_out = [
         {
             "id": r.id,
@@ -797,12 +710,12 @@ def get_batch_report(batch_id: str, db: Database = Depends(get_db)):
             "from_date": r.from_date,
             "to_date": r.to_date,
             "status": r.status,
-            "params": json.loads(r.params_json or "{}"),
+            "params": _safe_loads(r.params_json, {}),
             "initial_balance": r.initial_balance,
             "leverage": r.leverage,
             "risk_per_trade_pct": r.risk_per_trade_pct,
-            "metrics": json.loads(r.metrics_json or "{}"),
-            "equity_curve": json.loads(r.equity_curve_json or "[]"),
+            "metrics": _safe_loads(r.metrics_json, {}),
+            "equity_curve": _safe_loads(r.equity_curve_json, []),
             "monthly_breakdown": r.monthly_breakdown_json or {},
             "drawdown_periods": r.drawdown_periods_json or [],
             "parameter_evolution": r.parameter_evolution_log_json or {},
@@ -857,6 +770,14 @@ def get_batch_report(batch_id: str, db: Database = Depends(get_db)):
 
 @router.post("/compare")
 def compare(body: dict, db: Database = Depends(get_db)):
+    def _safe_loads(v, default):
+        if isinstance(v, (dict, list)):
+            return v
+        try:
+            return json.loads(v or json.dumps(default))
+        except Exception:
+            return default
+
     ids = body.get("ids", [])
     results = []
     for bt_id in ids:
@@ -868,8 +789,8 @@ def compare(body: dict, db: Database = Depends(get_db)):
                 "symbol": row.symbol,
                 "from_date": row.from_date,
                 "to_date": row.to_date,
-                "metrics": json.loads(row.metrics_json or "{}"),
-                "equity_curve": json.loads(row.equity_curve_json or "[]"),
+                "metrics": _safe_loads(row.metrics_json, {}),
+                "equity_curve": _safe_loads(row.equity_curve_json, []),
                 "monthly_breakdown": row.monthly_breakdown_json or {},
                 "drawdown_periods": row.drawdown_periods_json or [],
                 "parameter_evolution": row.parameter_evolution_log_json or {},
