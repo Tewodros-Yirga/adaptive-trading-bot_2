@@ -224,6 +224,7 @@ def apply_news_adjustments(
     strategy_signals: dict[str, str | None],
     symbol: str,
     db: Database,
+    factor_scores: dict[str, dict[str, float]] | None = None,  # ADD THIS
 ) -> tuple[dict[str, float], dict, bool]:
     """
     Adjust scores based on news bias and potentially veto the whole signal.
@@ -265,9 +266,16 @@ def apply_news_adjustments(
         max_n = int(crud.get_setting(db, "picker_max_simultaneous_strategies") or 1)
         min_score = float(crud.get_setting(db, "picker_min_score") or 0.3)
         sec_threshold = float(crud.get_setting(db, "picker_secondary_threshold") or 0.85)
-        # Note: factor_scores not available here; veto operates on composite scores only.
-        top_strategies = select_strategies(adjusted, max_n, min_score, sec_threshold)
-        if top_strategies and all(strategy_signals.get(s) != bias_direction for s in top_strategies):
+        # Pass factor_scores so the veto only considers actually-signaling strategies
+        top_strategies = select_strategies(
+            adjusted, max_n, min_score, sec_threshold, factor_scores
+        )
+        # Only veto if there are signaling strategies going the wrong way.
+        # If nothing is signaling, there's nothing to veto.
+        signaling_top = [s for s in top_strategies if strategy_signals.get(s)]
+        if signaling_top and all(
+            strategy_signals.get(s) != bias_direction for s in signaling_top
+        ):
             veto = True
             news_influence["veto"] = True
 
@@ -417,7 +425,7 @@ async def pick_and_route(
 
     # ── News adjustments (synchronous) ────────────────────────────────────
     adjusted_scores, news_influence, veto = apply_news_adjustments(
-        scores, strategy_signals, symbol, db
+        scores, strategy_signals, symbol, db, factor_scores=all_factor_scores  # ADD THIS
     )
 
     if veto:
