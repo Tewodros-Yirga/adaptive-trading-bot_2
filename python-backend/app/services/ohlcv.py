@@ -114,12 +114,12 @@ def fetch_yfinance(symbol: str, from_date: str, to_date: str, timeframe: str = "
             )
             if df is not None and not df.empty:
                 break
-            logger.warning("yfinance returned empty data for %s (attempt %d)", yf_symbol, attempt + 1)
+            logger.debug("yfinance returned empty data for %s (attempt %d)", yf_symbol, attempt + 1)
         except Exception as exc:
             err = str(exc).lower()
             if "rate" in err or "too many" in err:
                 delay = 2 ** (attempt + 1)
-                logger.warning("yfinance rate limited for %s, retrying in %ds", yf_symbol, delay)
+                logger.debug("yfinance rate limited for %s, retrying in %ds", yf_symbol, delay)
                 _time.sleep(delay)
             else:
                 raise

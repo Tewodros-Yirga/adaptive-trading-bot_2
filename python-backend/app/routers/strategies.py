@@ -8,7 +8,9 @@ from ..auth_deps import require_write_access, require_admin
 from pymongo.database import Database
 
 from .. import crud
-from ..db import get_db, COLL_STRATEGIES, COLL_TRADES, next_id
+from ..db import (
+    get_db, COLL_STRATEGIES, COLL_TRADES, COLL_BACKTEST_CANDIDATES, next_id
+)
 from ..models import Strategy, Trade
 from ..schemas import BacktestCandidateOut, SearchStatusOut, SearchSettingsIn
 from ..services.orchestrator import get_ensemble_config, set_ensemble_config, set_strategy_live

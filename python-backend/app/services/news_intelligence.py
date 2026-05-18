@@ -279,6 +279,10 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
             continue
         seen_headlines.add(headline)
 
+        # Skip if headline already exists in the database (cross-fetch deduplication)
+        if db[COLL_NEWS].find_one({"headline": headline}, {"_id": 1}):
+            continue
+
         sentiment = analyze_sentiment(headline, item.get("summary", ""), groq_key)
         pub_dt = _parse_dt(item.get("published_at"))
 

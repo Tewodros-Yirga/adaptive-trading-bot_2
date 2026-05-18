@@ -188,7 +188,23 @@ def get_risk_status(db: Database) -> dict:
     stats = crud.get_stats(db)
     balance = settings["account_balance"]
 
+    # ── Live balance from MT5 bridge (preferred source) ───────────────────
+    live_balance: float | None = None
+    live_equity: float | None = None
+    try:
+        from .bridge_client import bridge_client
+        acct = bridge_client.get_account()
+        if acct and acct.get("balance") is not None:
+            live_balance = float(acct["balance"])
+            live_equity = float(acct.get("equity", acct["balance"]))
+            balance = live_balance  # use live value for risk calculations
+    except Exception:
+        pass  # bridge unavailable — fall back to stored setting
+
     return {
+        "account_balance": live_balance if live_balance is not None else settings["account_balance"],
+        "account_equity": live_equity,
+        "balance_source": "mt5_bridge" if live_balance is not None else "settings",
         "open_trades_count": open_count,
         "daily_pnl": round(today_pnl, 4),
         "daily_loss_pct": round((-today_pnl / balance * 100) if balance > 0 else 0.0, 2),

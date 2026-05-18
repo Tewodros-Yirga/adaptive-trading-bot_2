@@ -80,7 +80,7 @@ async def run(
         return BatchBacktestResponse(batch_id=batch_id, run_count=len(batch_req.runs))
 
     else:
-        # ── Single-run mode (existing behaviour, backward-compatible) ─────────
+        # ── Single-run mode ───────────────────────────────────────────────────
         strategy_name = body.get("strategy_name", "DTC")
         symbol = body.get("symbol", "XAUUSD")
         from_date = body.get("from_date", "2024-01-01")
@@ -90,6 +90,9 @@ async def run(
         leverage = int(body.get("leverage", 100))
         risk_per_trade_pct = float(body.get("risk_per_trade_pct", 1.0))
 
+        # NOTE: run_backtest() saves to backtest_results for historical record.
+        # It does NOT update strategy parameters — parameter updates only happen
+        # when the backtester microservice promotes a candidate.
         bt_id = run_backtest(
             db,
             strategy_name=strategy_name,
@@ -191,6 +194,23 @@ def get_result(bt_id: int, db: Database = Depends(get_db)):
         "created_at": row.created_at,
         "completed_at": row.completed_at,
     }
+
+
+# ---------------------------------------------------------------------------
+# DELETE /backtest/results/{id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/results/{bt_id}")
+def delete_result(bt_id: int, db: Database = Depends(get_db), _w=Depends(require_write_access)):
+    """
+    Permanently remove a single backtest result record.
+    Strategy parameters are NEVER modified by backtest runs, so deletion
+    is safe and only affects the historical record.
+    """
+    result = db[COLL_BACKTEST_RESULTS].delete_one({"_id": bt_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Backtest not found")
+    return {"deleted": True, "id": bt_id}
 
 
 # ---------------------------------------------------------------------------

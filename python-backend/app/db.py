@@ -161,6 +161,7 @@ def create_indexes(db: Database) -> None:
     # news_items
     db[COLL_NEWS_ITEMS].create_index([("published_at", DESCENDING)], background=True)
     db[COLL_NEWS_ITEMS].create_index([("fetched_at", DESCENDING)], background=True)
+    db[COLL_NEWS_ITEMS].create_index([("headline", ASCENDING)], background=True)  # fast dedup lookups
 
     logger.info("MongoDB indexes created/verified.")
 
