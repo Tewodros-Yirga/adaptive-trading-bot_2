@@ -817,3 +817,68 @@ def compare(body: dict, db: Database = Depends(get_db)):
                 "batch_id": row.batch_id,
             })
     return {"comparisons": results}
+
+
+# ---------------------------------------------------------------------------
+# OHLCV Cache status & trigger (MongoDB-mediated, no direct backtester call)
+# ---------------------------------------------------------------------------
+
+@router.get("/cache-status")
+def get_cache_status(
+    db: Database = Depends(get_db),
+    _a=Depends(get_current_user),
+):
+    """
+    Read the OHLCV cache status written by the backtester microservice into
+    MongoDB app_settings.  The backtester updates 'ohlcv_cache_status' (JSON)
+    after every preload operation.
+
+    Returns:
+      running       — whether a preload is currently in progress
+      progress      — per-(symbol/tf) status string
+      errors        — list of error messages from the last run
+      coverage      — per-(symbol, tf) bar count and date range
+      last_updated  — ISO timestamp of the last status write
+    """
+    raw = crud.get_setting(db, "ohlcv_cache_status")
+    if not raw:
+        return {
+            "running": False,
+            "progress": {},
+            "errors": [],
+            "coverage": [],
+            "last_updated": None,
+        }
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"running": False, "progress": {}, "errors": ["Corrupt status JSON"], "coverage": [], "last_updated": None}
+
+
+@router.post("/trigger-cache-preload")
+def trigger_cache_preload(
+    body: dict,
+    db: Database = Depends(get_db),
+    _w=Depends(require_write_access),
+):
+    """
+    Save OHLCV cache settings and set the trigger flag.
+    The backtester's monitor loop polls for ohlcv_cache_trigger="1" and
+    runs the preload when it finds it, then resets the flag.
+
+    Body: { symbols: str, timeframes: str, years: int }
+    """
+    symbols    = str(body.get("symbols", "XAUUSD"))
+    timeframes = str(body.get("timeframes", "15m,1h,4h,1d"))
+    years      = str(max(1, min(int(body.get("years", 4)), 10)))
+
+    crud.set_setting(db, "ohlcv_cache_symbols",    symbols)
+    crud.set_setting(db, "ohlcv_cache_timeframes",  timeframes)
+    crud.set_setting(db, "ohlcv_cache_years",       years)
+    crud.set_setting(db, "ohlcv_cache_trigger",     "1")
+
+    return {
+        "ok": True,
+        "message": f"Preload scheduled for {symbols} × {timeframes} × {years} years. "
+                   "The backtester will start shortly and write progress to /backtest/cache-status.",
+    }
