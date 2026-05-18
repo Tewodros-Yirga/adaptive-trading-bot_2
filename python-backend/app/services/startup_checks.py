@@ -124,29 +124,29 @@ async def run_startup_checks(db) -> list[dict]:
         })
 
     # ── 5. MT5 bridge connectivity ─────────────────────────────────────────
+    # NOTE: The bridge is always checked — it's used for OHLCV candle data
+    # regardless of simulation_mode. Only order placement is gated by simulation_mode.
     try:
         from app.services.bridge_client import bridge_client
         from app.config import settings
 
-        if settings.simulation_mode:
-            checks.append({
-                "name": "bridge_connectivity",
-                "status": "OK",
-                "message": "Simulation mode active — bridge not required",
-            })
-        else:
-            account = bridge_client.get_account()
-            balance = account.get("balance", "?")
-            checks.append({
-                "name": "bridge_connectivity",
-                "status": "OK",
-                "message": f"MT5 bridge reachable — balance: {balance}",
-            })
+        account = bridge_client.get_account()
+        balance = account.get("balance", "?")
+        mode_note = " (simulation_mode=ON — orders simulated)" if settings.simulation_mode else ""
+        checks.append({
+            "name": "bridge_connectivity",
+            "status": "OK",
+            "message": f"MT5 bridge reachable — balance: {balance}{mode_note}",
+        })
     except Exception as e:
         checks.append({
             "name": "bridge_connectivity",
             "status": "WARN",
-            "message": f"MT5 bridge unreachable: {e} — live trading will not work",
+            "message": (
+                f"MT5 bridge unreachable: {e} — "
+                f"OHLCV data will fall back to yfinance/AlphaVantage. "
+                f"Check MT_BRIDGE_URL in your .env file."
+            ),
         })
 
     # ── 6. WeasyPrint availability (PDF reports) ───────────────────────────

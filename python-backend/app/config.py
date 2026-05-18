@@ -26,9 +26,9 @@ class Settings(BaseSettings):
         validation_alias="MONGODB_URI",
     )
 
-    mt_bridge_url: str = "http://localhost:5555"
-    mt_bridge_secret: str = "bridge_secret_token"
-    mt_bridge_hf_token: str = ""
+    mt_bridge_url: str = Field(default="http://localhost:5555", validation_alias="MT_BRIDGE_URL")
+    mt_bridge_secret: str = Field(default="bridge_secret_token", validation_alias="MT_BRIDGE_SECRET")
+    mt_bridge_hf_token: str = Field(default="", validation_alias="MT_BRIDGE_HF_TOKEN")
 
     adaptation_min_closed_trades: int = 20
     adaptation_cooldown_trades: int = 20

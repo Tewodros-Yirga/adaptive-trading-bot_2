@@ -593,14 +593,10 @@ def fetch_ohlcv_sync(
     errors: list[str] = []
 
     # Whether this timeframe has intraday resolution (sub-daily).
-    # For intraday TFs we must preserve the full timestamp so that
-    # _build_mtf_bars_for_index can create a proper per-bar index.
     _INTRADAY_TFS = {"1m", "5m", "15m", "30m", "1h", "4h"}
     is_intraday = timeframe in _INTRADAY_TFS
 
-    # ── Source 1: MT5 Bridge — chunked to avoid HF Spaces nginx 60s timeout ──
-    # Large ranges (e.g. 6 months × 15m = ~17k bars) cause 502.
-    # Chunking keeps each request small (~1-2k bars) and fast.
+    # ── Source 1: MT5 Bridge ──────────────────────────────────────────────
     _BRIDGE_CHUNK_DAYS: dict[str, int] = {
         "15m": 20, "1h": 60, "4h": 90, "1d": 365, "1w": 730,
     }
@@ -616,11 +612,11 @@ def fetch_ohlcv_sync(
         all_bridge_records: list[dict] = []
         seen_keys: set[str] = set()
         chunk_start = start_dt
+        _bridge_fatal = False  # set True on unrecoverable errors to break early
 
-        while chunk_start <= end_dt:
+        while chunk_start <= end_dt and not _bridge_fatal:
             chunk_end = min(chunk_start + _td(days=chunk_days - 1), end_dt)
             try:
-                # Pass raw symbol — bridge adapter handles XAUUSDm ↔ XAUUSD internally.
                 candles = _bridge.get_candles(
                     symbol=symbol,
                     timeframe=timeframe,
@@ -634,10 +630,6 @@ def fetch_ohlcv_sync(
                         if dedup_key in seen_keys:
                             continue
                         seen_keys.add(dedup_key)
-                        # FIX: for intraday timeframes keep the full datetime string
-                        # (e.g. "2023-01-15 08:00:00") so _build_mtf_bars_for_index
-                        # produces a per-bar index instead of collapsing all same-day
-                        # bars to midnight.  Daily/weekly bars keep date-only strings.
                         date_value = str(raw_dt) if is_intraday else str(raw_dt)[:10]
                         all_bridge_records.append({
                             "date":   date_value,
@@ -650,10 +642,26 @@ def fetch_ohlcv_sync(
                     except (KeyError, ValueError, TypeError):
                         continue
             except Exception as chunk_exc:
-                logger.warning(
-                    "bridge chunk %s–%s failed for %s %s: %s",
-                    chunk_start.date(), chunk_end.date(), symbol, timeframe, chunk_exc,
-                )
+                exc_str = str(chunk_exc).lower()
+                # Fatal errors — bridge is down or misconfigured; no point
+                # trying remaining chunks, bail out immediately.
+                _is_fatal = any(x in exc_str for x in (
+                    "connection refused", "connect error", "connectionerror",
+                    "name or service not known", "no route to host",
+                    "401", "auth", "403 forbidden", "404",
+                ))
+                if _is_fatal:
+                    logger.warning(
+                        "MT5 bridge fatal error for %s %s — skipping bridge: %s",
+                        symbol, timeframe, chunk_exc,
+                    )
+                    _bridge_fatal = True
+                    errors.append(f"mt5_bridge (fatal): {chunk_exc}")
+                else:
+                    logger.warning(
+                        "bridge chunk %s–%s failed for %s %s: %s",
+                        chunk_start.date(), chunk_end.date(), symbol, timeframe, chunk_exc,
+                    )
             chunk_start = chunk_end + _td(days=1)
 
         if all_bridge_records:
@@ -662,13 +670,41 @@ def fetch_ohlcv_sync(
                 symbol, timeframe, len(all_bridge_records), chunk_days,
             )
             return all_bridge_records
+
+        if not _bridge_fatal:
+            logger.warning(
+                "MT5 bridge returned 0 candles for %s %s %s–%s — falling back to yfinance",
+                symbol, timeframe, from_date, to_date,
+            )
         errors.append("mt5_bridge: 0 candles returned across all chunks")
     except Exception as exc:
+        logger.warning("MT5 bridge client error for %s: %s — falling back", symbol, exc)
         errors.append(f"mt5_bridge: {exc}")
 
-    # ── Source 2: yfinance (fallback — limited history for intraday) ───────
+    # ── Source 2: yfinance (fallback) ─────────────────────────────────────
+    # yfinance prints "1 Failed download: ['GC=F']: ..." directly to stdout,
+    # bypassing Python logging. Suppress it by redirecting sys.stdout/stderr.
     try:
-        df = fetch_yfinance(symbol, from_date, to_date, timeframe)
+        import io as _io
+        import sys as _sys
+        _captured_out = _io.StringIO()
+        _captured_err = _io.StringIO()
+        _old_stdout, _old_stderr = _sys.stdout, _sys.stderr
+        _sys.stdout = _captured_out
+        _sys.stderr = _captured_err
+        try:
+            df = fetch_yfinance(symbol, from_date, to_date, timeframe)
+        finally:
+            _sys.stdout = _old_stdout
+            _sys.stderr = _old_stderr
+            # Log suppressed yfinance output at DEBUG so it's available for debugging
+            _yf_out = _captured_out.getvalue().strip()
+            _yf_err = _captured_err.getvalue().strip()
+            if _yf_out:
+                logger.debug("yfinance stdout: %s", _yf_out)
+            if _yf_err:
+                logger.debug("yfinance stderr: %s", _yf_err)
+
         if not df.empty:
             logger.info("fetch_ohlcv_sync: yfinance for %s %s", symbol, timeframe)
             return df_to_ohlcv_list(df)
