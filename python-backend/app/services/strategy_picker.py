@@ -81,7 +81,10 @@ def compute_factor_scores(
 
     if len(recent_trades) < min_live_trades:
         best_candidate = crud.get_best_backtest_candidate(db, strategy_name)
-        bt_score = best_candidate.composite_score if best_candidate else 0.3
+        # Default to 0.1 (not 0.3) so a strategy with zero backtest history
+        # stays well below the picker_min_score threshold (default 0.3) and
+        # doesn't accidentally get selected due to floating-point noise.
+        bt_score = best_candidate.composite_score if best_candidate else 0.1
 
         # Use strategy-specific factors even without live trades
         latest_param = crud.get_latest_param_version_for_strategy(db, strategy_name)
@@ -171,12 +174,28 @@ def select_strategies(
     max_n: int,
     min_score: float,
     secondary_threshold: float,
+    factor_scores: dict[str, dict[str, float]] | None = None,
 ) -> list[str]:
     """
     Returns up to max_n strategy names.
     Secondary strategies must score >= top_score * secondary_threshold.
+
+    Hard gate: any strategy whose signal_confidence factor score is 0.0 is
+    excluded regardless of its composite score.  A strategy that isn't firing
+    right now should never be selected — the historical factors would carry it
+    over the min_score threshold and then resolve_direction would find no
+    direction to vote with, returning confidence=0.0 every time.
     """
-    eligible = {k: v for k, v in scores.items() if v >= min_score}
+    # Exclude strategies that are not currently signaling.
+    def _is_signaling(name: str) -> bool:
+        if factor_scores is None:
+            return True  # can't tell — don't gate
+        return (factor_scores.get(name, {}).get("signal_confidence", 0.0) or 0.0) > 0.0
+
+    eligible = {
+        k: v for k, v in scores.items()
+        if v >= min_score and _is_signaling(k)
+    }
     if not eligible:
         return []
     ranked = sorted(eligible, key=eligible.__getitem__, reverse=True)
@@ -246,6 +265,7 @@ def apply_news_adjustments(
         max_n = int(crud.get_setting(db, "picker_max_simultaneous_strategies") or 1)
         min_score = float(crud.get_setting(db, "picker_min_score") or 0.3)
         sec_threshold = float(crud.get_setting(db, "picker_secondary_threshold") or 0.85)
+        # Note: factor_scores not available here; veto operates on composite scores only.
         top_strategies = select_strategies(adjusted, max_n, min_score, sec_threshold)
         if top_strategies and all(strategy_signals.get(s) != bias_direction for s in top_strategies):
             veto = True
@@ -423,7 +443,7 @@ async def pick_and_route(
             "veto_reason": "NEWS_VETO",
         }
 
-    selected = select_strategies(adjusted_scores, max_n, min_score, sec_threshold)
+    selected = select_strategies(adjusted_scores, max_n, min_score, sec_threshold, all_factor_scores)
     if not selected:
         decision = StrategyPickerDecision(
             symbol=symbol,

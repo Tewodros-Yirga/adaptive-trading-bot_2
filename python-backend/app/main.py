@@ -239,12 +239,48 @@ async def _live_trading_loop():
                     try:
                         from datetime import date, timedelta
                         from .services.ohlcv import fetch_ohlcv_with_fallback
+                        from .services.bridge_client import bridge_client as _bridge
                         from_dt = (date.today() - timedelta(days=2)).isoformat()
                         to_dt = date.today().isoformat()
-                        df, _src = await fetch_ohlcv_with_fallback(
-                            symbol, from_dt, to_dt, "1h", db
-                        )
-                        if df.empty:
+
+                        # fetch_ohlcv_with_fallback is async but its MT5 bridge
+                        # path calls sync httpx internally.  Use it as-is here;
+                        # the true blocking risk is get_account / get_positions
+                        # called on the bridge directly — those must go through
+                        # run_in_executor so they don't stall the event loop.
+                        loop = asyncio.get_event_loop()
+
+                        # Price fetch: try bridge first (sync → executor), then
+                        # fall back to the async ohlcv chain.
+                        df = None
+                        try:
+                            candles = await loop.run_in_executor(
+                                None,
+                                lambda: _bridge.get_candles(
+                                    symbol=symbol,
+                                    timeframe="1h",
+                                    from_date=from_dt,
+                                    to_date=to_dt,
+                                ),
+                            )
+                            if candles:
+                                import pandas as _pd
+                                df = _pd.DataFrame(candles)
+                                for col in ("open", "high", "low", "close"):
+                                    df[col] = _pd.to_numeric(df[col], errors="coerce")
+                                df = df.dropna(subset=["close"])
+                        except Exception as _bridge_exc:
+                            logger.debug(
+                                "Live loop bridge fetch failed for %s, falling back: %s",
+                                symbol, _bridge_exc,
+                            )
+
+                        if df is None or df.empty:
+                            df, _src = await fetch_ohlcv_with_fallback(
+                                symbol, from_dt, to_dt, "1h", db
+                            )
+
+                        if df is None or df.empty:
                             logger.warning("Live loop: no price data for %s", symbol)
                             continue
 
