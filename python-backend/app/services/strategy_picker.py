@@ -224,11 +224,16 @@ def apply_news_adjustments(
     strategy_signals: dict[str, str | None],
     symbol: str,
     db: Database,
-    factor_scores: dict[str, dict[str, float]] | None = None,  # ADD THIS
+    factor_scores: dict[str, dict[str, float]] | None = None,
 ) -> tuple[dict[str, float], dict, bool]:
     """
     Adjust scores based on news bias and potentially veto the whole signal.
     Returns (adjusted_scores, news_influence_json, veto_triggered).
+
+    factor_scores: when provided, the veto check uses the signal_confidence
+    hard gate so only actually-firing strategies are considered.  Without it
+    (e.g. called from tests) the gate is skipped and composite scores alone
+    decide which strategies are "top".
     """
     from ..services.news_intelligence import get_news_bias
 
@@ -259,19 +264,24 @@ def apply_news_adjustments(
                 adjusted[name] = score * (1 - penalty)
                 news_influence["adjustments"][name] = f"-{penalty * 100:.0f}%"
 
-    # Veto check
+    # Veto check — only fires when news confidence is very high (>= veto_threshold)
+    # AND at least one currently-signaling strategy is going against the bias.
+    # Passing factor_scores enables the signal_confidence hard gate so silent
+    # strategies are excluded, preventing spurious vetoes like the 06:05 incident
+    # where all non-Alchemist strategies (score 0.16, not signaling) were counted
+    # as "going against the bias" and triggered the veto incorrectly.
     veto = False
     if news_confidence > veto_threshold:
         bias_direction = "BUY" if news_bias > 0 else "SELL"
         max_n = int(crud.get_setting(db, "picker_max_simultaneous_strategies") or 1)
         min_score = float(crud.get_setting(db, "picker_min_score") or 0.3)
         sec_threshold = float(crud.get_setting(db, "picker_secondary_threshold") or 0.85)
-        # Pass factor_scores so the veto only considers actually-signaling strategies
         top_strategies = select_strategies(
             adjusted, max_n, min_score, sec_threshold, factor_scores
         )
-        # Only veto if there are signaling strategies going the wrong way.
-        # If nothing is signaling, there's nothing to veto.
+        # Only veto if there are strategies that are ACTUALLY signaling and ALL
+        # of them are going the wrong way.  If nothing is signaling there is
+        # nothing to veto — let the normal NO_SIGNAL path handle it.
         signaling_top = [s for s in top_strategies if strategy_signals.get(s)]
         if signaling_top and all(
             strategy_signals.get(s) != bias_direction for s in signaling_top
@@ -425,7 +435,7 @@ async def pick_and_route(
 
     # ── News adjustments (synchronous) ────────────────────────────────────
     adjusted_scores, news_influence, veto = apply_news_adjustments(
-        scores, strategy_signals, symbol, db, factor_scores=all_factor_scores  # ADD THIS
+        scores, strategy_signals, symbol, db, factor_scores=all_factor_scores
     )
 
     if veto:
