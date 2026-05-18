@@ -417,11 +417,11 @@ async def fetch_mt5_bridge(
     Fetch OHLCV from the MT5 bridge service (async wrapper around the sync client).
     NOTE: simulation_mode does NOT block this call — it only prevents order placement.
     """
-    from .bridge_client import get_bridge_client
+    from .bridge_client import bridge_client
 
     # Pass raw symbol — the bridge adapter handles XAUUSDm ↔ XAUUSD fallback itself.
     # _normalize_symbol is only needed for yfinance/AV ticker mapping, not for MT5.
-    candles = get_bridge_client().get_candles(
+    candles = bridge_client.get_candles(
         symbol=symbol,
         timeframe=timeframe,
         from_date=from_date,
@@ -606,8 +606,8 @@ def fetch_ohlcv_sync(
     }
     try:
         from datetime import datetime as _dt, timedelta as _td
-        from .bridge_client import get_bridge_client
-        _bridge = get_bridge_client()
+        from .bridge_client import bridge_client
+        _bridge = bridge_client
 
         chunk_days = _BRIDGE_CHUNK_DAYS.get(timeframe, 30)
         start_dt = _dt.fromisoformat(from_date)
