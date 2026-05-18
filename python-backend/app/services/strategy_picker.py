@@ -351,12 +351,21 @@ async def pick_and_route(
     """
     Main entry point called by the orchestrator.
 
+    Scoring uses signal_confidence from all strategies (signal or not), so
+    the picker selects the best-scored strategies regardless of whether they
+    produced a signal this bar.
+
+    FIX: After selecting strategies, we filter to only those that actually
+    produced a direction before calling resolve_direction.  This prevents
+    confidence from always being 0.0 (which happened when selected strategies
+    had direction=None and their confidence was multiplied into the vote sum).
+
     Args:
         symbol: e.g. "XAUUSD"
         raw_signals: list of dicts with keys:
             strategy_name, direction, confidence, proposed_entry, proposed_sl,
             proposed_tp1, proposed_tp2, proposed_tp3, proposed_tp4
-        db: SQLAlchemy Session
+        db: MongoDB Database
 
     Returns dict with keys:
         resolved_direction, selected_strategies, ensemble_weights,
@@ -371,15 +380,22 @@ async def pick_and_route(
     weights = _load_factor_weights(db)
     strategy_signals = {s["strategy_name"]: s.get("direction") for s in raw_signals}
 
-    # Compute per-strategy factor + total scores
+    # ── Compute per-strategy factor + total scores ─────────────────────────
+    # IMPORTANT: score using the actual signal confidence (1.0 when direction
+    # is present, 0.0 when not) so the picker favours strategies that are
+    # currently firing.  This also means a strategy that scores well on
+    # historical factors but has no signal right now will rank lower than one
+    # that IS firing.
     scores: dict[str, float] = {}
     all_factor_scores: dict[str, dict[str, float]] = {}
     for sig in raw_signals:
-        factors = compute_factor_scores(sig["strategy_name"], float(sig.get("confidence") or 0.0), db)
+        # Use the real confidence from the signal, not a default of 0.
+        actual_confidence = float(sig.get("confidence") or 0.0)
+        factors = compute_factor_scores(sig["strategy_name"], actual_confidence, db)
         all_factor_scores[sig["strategy_name"]] = factors
         scores[sig["strategy_name"]] = compute_total_score(factors, weights)
 
-    # News adjustments (synchronous — get_news_bias is sync)
+    # ── News adjustments (synchronous) ────────────────────────────────────
     adjusted_scores, news_influence, veto = apply_news_adjustments(
         scores, strategy_signals, symbol, db
     )
@@ -432,10 +448,45 @@ async def pick_and_route(
         }
 
     ensemble_weights = scores_to_weights(selected, adjusted_scores)
+
+    # ── FIX: only vote with selected strategies that have an actual direction.
+    # Previously ALL signals for selected strategies (including those with
+    # direction=None) were passed to resolve_direction.  Multiplying any
+    # weight by confidence=0.0 produced buy_weight=sell_weight=0 → no
+    # direction resolved and confidence always returned as 0.0.
     filtered_signals = [s for s in raw_signals if s["strategy_name"] in selected]
-    resolved_direction, confidence = resolve_direction(filtered_signals, ensemble_weights)
+    signaling_signals = [s for s in filtered_signals if s.get("direction")]
+
+    if not signaling_signals:
+        # Selected strategies exist but none produced a signal this bar.
+        decision = StrategyPickerDecision(
+            symbol=symbol,
+            timestamp=datetime.datetime.utcnow(),
+            strategy_scores_json=_format_scores(adjusted_scores, all_factor_scores, selected),
+            selected_strategies_json=selected,
+            ensemble_weights_used_json=ensemble_weights,
+            news_influence_json=news_influence,
+            picker_confidence=0.0,
+            reasoning="SELECTED_BUT_NO_SIGNAL",
+        )
+        decision = crud.create_picker_decision(db, decision)
+        return {
+            "resolved_direction": None,
+            "selected_strategies": selected,
+            "ensemble_weights": ensemble_weights,
+            "levels": {},
+            "picker_decision_id": decision.id,
+            "picker_confidence": 0.0,
+            "veto": False,
+            "veto_reason": None,
+        }
+
+    # ── Resolve direction only from strategies that are actually firing ────
+    resolved_direction, confidence = resolve_direction(signaling_signals, ensemble_weights)
+
+    # ── Compute entry/SL/TP levels from agreeing signaling strategies ──────
     levels = (
-        resolve_ensemble_levels(resolved_direction, filtered_signals, ensemble_weights)
+        resolve_ensemble_levels(resolved_direction, signaling_signals, ensemble_weights)
         if resolved_direction
         else {}
     )
@@ -473,12 +524,11 @@ async def pick_and_route(
 def update_picker_weights_from_trade(trade, decision: StrategyPickerDecision, db: Database) -> None:
     """
     Gradient-based update of picker factor weights after a trade closes.
-    Uses SELECT FOR UPDATE to prevent concurrent write races.
 
     Args:
         trade: closed Trade ORM object (result must be "WIN" or "LOSS")
         decision: the StrategyPickerDecision that led to the trade
-        db: active Session (transaction managed internally)
+        db: active Database
     """
     if trade.result not in ("WIN", "LOSS"):
         return

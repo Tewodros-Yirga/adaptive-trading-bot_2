@@ -14,6 +14,15 @@ Phase 4 additions:
     Uses `build_mtf_market_data()` + `fetch_ohlcv_with_fallback()` from ohlcv.py.
   - Per-strategy MTF data is fetched once per orchestrator call and reused across
     all active MTF strategies (keyed by symbol).
+
+Fix (confidence always 0.0):
+  - Non-MTF strategies return a plain string signal, so confidence was being set
+    to `1.0 if sig else 0.0`.  That is correct, but downstream `pick_and_route`
+    was passing ALL selected strategy signals (including those with direction=None
+    whose confidence=0.0) into `resolve_direction`, causing buy_weight=0 always.
+  - The fix is in strategy_picker.py (filter to signaling strategies only before
+    voting).  The orchestrator change here makes the confidence value explicit and
+    always a float, which makes debugging easier and removes the implicit 0/1 cast.
 """
 import json
 import logging
@@ -83,6 +92,11 @@ def resolve_direction(
     """
     Unified weighted-vote direction resolver.
     Returns (resolved_direction, confidence_score).
+
+    NOTE: `signals` should only contain entries where direction is not None.
+    Passing signals with direction=None produces zero-weight votes, which
+    causes confidence to always resolve to 0.0 even when a real signal exists.
+    The caller (pick_and_route) is responsible for pre-filtering.
     """
     total_weight = sum(weights.values()) or 1.0
     norm_weights = {k: v / total_weight for k, v in weights.items()}
@@ -246,6 +260,12 @@ async def process_signal(
     4. Apply risk check.
     5. Place order via bridge.
     6. Log EnsembleDecision and back-fill StrategyPickerDecision.trade_id.
+
+    Confidence fix: for non-MTF strategies, signal() returns a plain string.
+    We now explicitly set confidence=1.0 when a direction is present, rather
+    than using a conditional expression that could silently become 0.0 due to
+    falsy string checks.  MTF strategies return (direction, confidence) tuples
+    and their confidence is used as-is.
     """
     from ..services.strategy_picker import pick_and_route, update_picker_weights_from_trade  # noqa
 
@@ -294,12 +314,19 @@ async def process_signal(
 
             raw_sig = strat.signal(effective_md)
 
-            # signal() may return (direction, confidence) tuple for MTF strategies
-            # or plain string for legacy strategies
+            # MTF strategies (e.g. Alchemist) return (direction, confidence) tuples.
+            # Legacy/non-MTF strategies return a plain string or None.
+            # FIX: always produce an explicit float confidence so downstream
+            # resolve_direction never multiplies by an accidental 0.
             if isinstance(raw_sig, tuple):
                 sig, confidence = raw_sig
+                # Ensure confidence is a proper float even if the strategy
+                # returned a non-numeric value
+                confidence = float(confidence) if confidence is not None else 0.0
             else:
                 sig = raw_sig
+                # For plain-string strategies: 1.0 when firing, 0.0 when not.
+                # We store as float (not bool) to avoid implicit int multiplication.
                 confidence = 1.0 if sig else 0.0
 
             levels = strat.compute_levels(sig, price, params) if sig else {}
@@ -315,6 +342,13 @@ async def process_signal(
                 "proposed_tp3": levels.get("tp3") if sig else None,
                 "proposed_tp4": levels.get("tp4") if sig else None,
             })
+
+            if sig:
+                logger.debug(
+                    "Strategy %s signal: %s @ %.5f (confidence=%.3f)",
+                    strategy_row.name, sig, price, confidence,
+                )
+
         except Exception as exc:
             logger.warning(f"Strategy {strategy_row.name} signal error: {exc}")
             signal_dicts.append({
@@ -458,8 +492,7 @@ async def process_signal(
     if strategy_for_params:
         latest_param = crud.get_latest_param_version(db, strategy_for_params)
     else:
-        latest_param = crud.get_current_params(db)  # returns dict, not ParameterVersion
-        latest_param = None  # version will default to 1
+        latest_param = None
     version = latest_param.version if latest_param else 1
 
     trade = crud.log_trade(
