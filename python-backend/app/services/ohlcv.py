@@ -417,11 +417,11 @@ async def fetch_mt5_bridge(
     Fetch OHLCV from the MT5 bridge service (async wrapper around the sync client).
     NOTE: simulation_mode does NOT block this call — it only prevents order placement.
     """
-    from .bridge_client import bridge_client
+    from .bridge_client import get_bridge_client
 
     # Pass raw symbol — the bridge adapter handles XAUUSDm ↔ XAUUSD fallback itself.
     # _normalize_symbol is only needed for yfinance/AV ticker mapping, not for MT5.
-    candles = bridge_client.get_candles(
+    candles = get_bridge_client().get_candles(
         symbol=symbol,
         timeframe=timeframe,
         from_date=from_date,
@@ -534,11 +534,25 @@ async def fetch_ohlcv_with_fallback(
 
 
 def df_to_ohlcv_list(df: pd.DataFrame) -> list[dict]:
-    """Convert a DataFrame (index=datetime, cols=open/high/low/close/volume) to list[dict]."""
+    """Convert a DataFrame (index=datetime, cols=open/high/low/close/volume) to list[dict].
+
+    The ``date`` field carries the FULL ISO datetime string for intraday data
+    (e.g. "2023-01-15 08:00:00") so that _build_mtf_bars_for_index can build a
+    proper per-bar DatetimeIndex instead of collapsing same-day bars to midnight.
+    For daily/weekly data the index only has date precision so the string is
+    naturally date-only ("2023-01-15").
+    """
     records = []
     for ts, row in df.iterrows():
         try:
-            date_str = ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10]
+            # Preserve full timestamp for intraday frames; daily bars naturally
+            # have no time component and isoformat() returns "YYYY-MM-DD".
+            if hasattr(ts, "isoformat"):
+                date_str = ts.isoformat()  # e.g. "2023-01-15T08:00:00" or "2023-01-15"
+                # Normalise the separator from "T" to space for consistency with bridge records
+                date_str = date_str.replace("T", " ")
+            else:
+                date_str = str(ts)
             records.append({
                 "date": date_str,
                 "open": float(row["open"]),
@@ -567,9 +581,22 @@ def fetch_ohlcv_sync(
 
     Safe to call from subprocesses (ProcessPoolExecutor) and threads.
     Returns a list[dict] with keys: date, open, high, low, close, volume.
+
+    IMPORTANT — the ``date`` field always carries the FULL ISO datetime string
+    (e.g. "2023-01-15 08:00:00") for intraday timeframes so that
+    _build_mtf_bars_for_index can reconstruct a proper per-bar datetime index.
+    For daily/weekly timeframes it remains a date-only string ("2023-01-15").
+    Callers that only need the calendar date must slice [:10] themselves.
+
     Raises RuntimeError if all sources fail.
     """
     errors: list[str] = []
+
+    # Whether this timeframe has intraday resolution (sub-daily).
+    # For intraday TFs we must preserve the full timestamp so that
+    # _build_mtf_bars_for_index can create a proper per-bar index.
+    _INTRADAY_TFS = {"1m", "5m", "15m", "30m", "1h", "4h"}
+    is_intraday = timeframe in _INTRADAY_TFS
 
     # ── Source 1: MT5 Bridge — chunked to avoid HF Spaces nginx 60s timeout ──
     # Large ranges (e.g. 6 months × 15m = ~17k bars) cause 502.
@@ -579,7 +606,8 @@ def fetch_ohlcv_sync(
     }
     try:
         from datetime import datetime as _dt, timedelta as _td
-        from .bridge_client import bridge_client
+        from .bridge_client import get_bridge_client
+        _bridge = get_bridge_client()
 
         chunk_days = _BRIDGE_CHUNK_DAYS.get(timeframe, 30)
         start_dt = _dt.fromisoformat(from_date)
@@ -593,7 +621,7 @@ def fetch_ohlcv_sync(
             chunk_end = min(chunk_start + _td(days=chunk_days - 1), end_dt)
             try:
                 # Pass raw symbol — bridge adapter handles XAUUSDm ↔ XAUUSD internally.
-                candles = bridge_client.get_candles(
+                candles = _bridge.get_candles(
                     symbol=symbol,
                     timeframe=timeframe,
                     from_date=chunk_start.date().isoformat(),
@@ -606,8 +634,13 @@ def fetch_ohlcv_sync(
                         if dedup_key in seen_keys:
                             continue
                         seen_keys.add(dedup_key)
+                        # FIX: for intraday timeframes keep the full datetime string
+                        # (e.g. "2023-01-15 08:00:00") so _build_mtf_bars_for_index
+                        # produces a per-bar index instead of collapsing all same-day
+                        # bars to midnight.  Daily/weekly bars keep date-only strings.
+                        date_value = str(raw_dt) if is_intraday else str(raw_dt)[:10]
                         all_bridge_records.append({
-                            "date":   str(raw_dt)[:10],
+                            "date":   date_value,
                             "open":   float(c["open"]),
                             "high":   float(c["high"]),
                             "low":    float(c["low"]),
