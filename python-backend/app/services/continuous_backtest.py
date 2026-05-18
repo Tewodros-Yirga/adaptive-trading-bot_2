@@ -146,7 +146,7 @@ async def start_continuous_backtest(strategy_name: str, executor, startup_delay:
                 wr_weight = float(_setting("score_weight_win_rate", 0.6))
                 roi_weight = float(_setting("score_weight_roi", 0.4))
                 timeframes = json.loads(_setting("backtest_timeframes", '["1h","4h","1d"]'))
-                symbols = json.loads(_setting("backtest_symbols", '["XAUUSD","EURUSD"]'))
+                symbols = json.loads(_setting("backtest_symbols", '["XAUUSD"]'))
                 range_months = int(_setting("range_expansion_months", 6))
                 max_months = int(_setting("max_history_months", 36))
             except Exception as exc:

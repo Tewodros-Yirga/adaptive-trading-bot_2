@@ -52,7 +52,7 @@ Settings follow the pattern `{strategy_name}_{suffix}`, where `{strategy_name}` 
 | `{strategy}_score_weight_roi` | float | `0.4` | Weight of net ROI in the candidate composite score. `score_weight_win_rate + score_weight_roi` should equal 1.0. |
 | `{strategy}_backtest_interval_seconds` | int | `300` | How often (in seconds) the continuous backtest engine evaluates a new parameter candidate for this strategy. |
 | `{strategy}_backtest_timeframes` | JSON list | `["1h","4h","1d"]` | Timeframes used when running candidate backtests. Each candidate is evaluated against all listed timeframes. |
-| `{strategy}_backtest_symbols` | JSON list | `["XAUUSD","EURUSD"]` | Symbols used when running candidate backtests. |
+| `{strategy}_backtest_symbols` | JSON list | `["XAUUSD"]` | Symbols used when running candidate backtests. |
 | `{strategy}_param_step_size` | float | `0.05` | Fractional step size used by the parameter search engine when perturbing numeric parameters. A value of `0.05` means each parameter is changed by ±5% of its allowed range per search step. |
 | `{strategy}_range_expansion_months` | int | `6` | When a candidate scores well enough, the backtest date range is extended by this many months to validate on out-of-sample data. |
 | `{strategy}_max_history_months` | int | `36` | Maximum historical look-back in months for backtest data fetching. Older data is discarded to keep memory usage bounded. |

@@ -604,7 +604,7 @@ def seed_default_settings(db: Database) -> None:
         "score_weight_roi": "0.4",
         "backtest_interval_seconds": "300",
         "backtest_timeframes": '["1h","4h","1d"]',
-        "backtest_symbols": '["XAUUSD","EURUSD"]',
+        "backtest_symbols": '["XAUUSD"]',
         "param_step_size": "0.05",
         "range_expansion_months": "6",
         "max_history_months": "36",

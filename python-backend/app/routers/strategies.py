@@ -13,10 +13,12 @@ from ..models import Strategy, Trade
 from ..schemas import BacktestCandidateOut, SearchStatusOut, SearchSettingsIn
 from ..services.orchestrator import get_ensemble_config, set_ensemble_config, set_strategy_live
 from ..strategy.registry import STRATEGY_REGISTRY, list_strategies
-from fastapi import APIRouter, HTTPException
-from ..services.backtester_client import BacktesterClient, BacktesterUnavailable
- 
+from pymongo import DESCENDING as _DESC
+
 router = APIRouter(prefix="/strategies", tags=["strategies"])
+
+# Collection written exclusively by the backtester microservice
+COLL_BACKTESTER_RUNS = "backtester_runs"
 
 
 def _ensure_strategies_exist(db: Database):
@@ -472,53 +474,107 @@ def _get_strategy_stats(db: Database, strategy_name: str) -> dict:
 
     
 @router.get("/{strategy_name}/search-status")
-async def search_status(strategy_name: str):
+def search_status(strategy_name: str, db: Database = Depends(get_db)):
     """
-    Proxy GET /status/{strategy_name} → backtester service.
-    Returns current phase, iterations, best score, pause state, etc.
+    Read the backtester microservice's latest status directly from MongoDB.
+
+    The backtester writes to:
+      • strategies collection  — promotion meta (last_composite_score, last_phase, …)
+      • backtester_runs collection — per-iteration audit log (most recent = current state)
+
+    No HTTP proxy — works even when the backtester is between iterations or restarting.
     """
-    client = BacktesterClient()
-    try:
-        return await client.get_status(strategy_name)
-    except BacktesterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        # Surface the error so the frontend can show a meaningful message
-        # instead of a generic network failure.
-        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
- 
- 
-@router.post("/{strategy_name}/pause-search")
-async def pause_search_route(strategy_name: str):
-    """Proxy POST /pause/{strategy_name} → backtester service."""
-    client = BacktesterClient()
-    try:
-        return await client.pause(strategy_name)
-    except BacktesterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
- 
- 
-@router.post("/{strategy_name}/resume-search")
-async def resume_search_route(strategy_name: str):
-    """Proxy POST /resume/{strategy_name} → backtester service."""
-    client = BacktesterClient()
-    try:
-        return await client.resume(strategy_name)
-    except BacktesterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
- 
- 
-@router.post("/{strategy_name}/trigger-search")
-async def trigger_search_route(strategy_name: str):
-    """Proxy POST /trigger/{strategy_name} → backtester service (skip current sleep)."""
-    client = BacktesterClient()
-    try:
-        return await client.trigger(strategy_name)
-    except BacktesterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Backtester unreachable: {exc}")
+    _ensure_strategies_exist(db)
+    strategy_doc = db[COLL_STRATEGIES].find_one({"name": strategy_name})
+    if not strategy_doc:
+        raise HTTPException(404, f"Strategy {strategy_name} not found")
+
+    # Most-recent backtester_runs entry tells us phase/iteration/score right now
+    latest_run = db[COLL_BACKTESTER_RUNS].find_one(
+        {"strategy_name": strategy_name},
+        sort=[("timestamp", _DESC)],
+    )
+
+    # Promotion meta stamped onto the strategies doc by the backtester on every promotion
+    last_score  = float(strategy_doc.get("last_composite_score") or 0.0)
+    last_pf     = float(strategy_doc.get("last_profit_factor")   or 0.0)
+    last_trades = int(  strategy_doc.get("last_total_trades")    or 0)
+    last_phase  = int(  strategy_doc.get("last_phase")           or 1)
+
+    # Count total iterations from audit log
+    total_iters = db[COLL_BACKTESTER_RUNS].count_documents({"strategy_name": strategy_name})
+
+    # Find the best-ever qualified candidate for best_params
+    best_candidate = db[COLL_BACKTEST_CANDIDATES].find_one(
+        {"strategy_name": strategy_name, "qualified": True},
+        sort=[("composite_score", _DESC)],
+    )
+    best_params = best_candidate.get("params_json", {}) if best_candidate else {}
+
+    # Derive is_running: if the most recent run was within the last configured interval
+    # we treat the backtester as running; otherwise "idle between runs"
+    is_running = False
+    last_run_at = None
+    if latest_run:
+        last_run_at = latest_run.get("timestamp")
+        if last_run_at:
+            from datetime import timezone as _tz
+            now_utc = datetime.now(_tz.utc)
+            ts = last_run_at if last_run_at.tzinfo else last_run_at.replace(tzinfo=_tz.utc)
+            interval_setting = crud.get_setting(db, f"{strategy_name}_backtest_interval_seconds") or "300"
+            interval_sec = float(interval_setting)
+            is_running = (now_utc - ts).total_seconds() < interval_sec * 2.5
+
+    return {
+        "strategy_name": strategy_name,
+        # Field names match what normalizeStatus() in Backtesting.tsx expects
+        "phase":        latest_run.get("phase", last_phase)     if latest_run else last_phase,
+        "iteration":    latest_run.get("iteration", total_iters) if latest_run else total_iters,
+        "best_score":   last_score,
+        "best_params":  best_params,
+        "is_running":   is_running,
+        "is_paused":    False,   # pause state lives only in the backtester process memory
+        # Extra fields the frontend can use
+        "last_win_rate":       latest_run.get("win_rate")       if latest_run else None,
+        "last_profit_factor":  latest_run.get("profit_factor")  if latest_run else last_pf,
+        "last_total_trades":   latest_run.get("total_trades")   if latest_run else last_trades,
+        "last_composite_score": latest_run.get("composite_score") if latest_run else last_score,
+        "last_qualified":      latest_run.get("qualified")       if latest_run else None,
+        "last_promoted":       latest_run.get("promoted")        if latest_run else None,
+        "last_run_at":         last_run_at,
+        "total_iterations":    total_iters,
+    }
+
+
+@router.get("/{strategy_name}/search-runs")
+def search_runs(
+    strategy_name: str,
+    limit: int = Query(50, ge=1, le=500),
+    db: Database = Depends(get_db),
+):
+    """
+    Return recent backtester_runs audit log entries for a strategy.
+    The backtester writes one document per iteration.
+    """
+    _ensure_strategies_exist(db)
+    docs = list(
+        db[COLL_BACKTESTER_RUNS]
+        .find({"strategy_name": strategy_name})
+        .sort("timestamp", _DESC)
+        .limit(limit)
+    )
+    result = []
+    for d in docs:
+        d.pop("_id", None)
+        # Convert datetime → isoformat for JSON
+        for k, v in d.items():
+            if hasattr(v, "isoformat"):
+                d[k] = v.isoformat()
+        result.append(d)
+    return result
+
+
+# NOTE: pause / resume / trigger are intentionally NOT exposed here.
+# The backtester microservice manages its own run loop internally.
+# Control it by setting backtest_interval_seconds via /settings/bulk,
+# or by restarting the backtester Space on HuggingFace.
