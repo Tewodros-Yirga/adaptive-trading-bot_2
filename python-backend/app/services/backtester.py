@@ -854,6 +854,64 @@ def run_backtest_sync_standalone(
 
 
 # ---------------------------------------------------------------------------
+# Promoted-parameter resolver (read-only — never writes to DB)
+# ---------------------------------------------------------------------------
+
+def _resolve_params(db: Database, strategy_name: str, override_params: dict) -> dict:
+    """
+    Return the effective params for a strategy in this priority order:
+      1. ``override_params`` if non-empty (caller explicitly supplied them)
+      2. ``strategies.params_json`` for the strategy (last promoted params)
+      3. ``parameter_versions`` latest entry for the strategy
+      4. Strategy class ``default_params()``
+
+    This function is **read-only** — it never modifies the database.
+    """
+    if override_params:
+        return override_params
+
+    # 1. Latest promoted params stored in the strategies collection
+    try:
+        strategy_doc = crud.get_strategy_by_name(db, strategy_name)
+        if strategy_doc:
+            promoted = json.loads(strategy_doc.params_json or "{}")
+            if promoted:
+                logger.info(
+                    "Backtest using promoted params from strategies collection for %s",
+                    strategy_name,
+                )
+                return promoted
+    except Exception as exc:
+        logger.warning("Could not load promoted params from strategies for %s: %s", strategy_name, exc)
+
+    # 2. Latest entry in parameter_versions for this strategy
+    try:
+        pv = crud.get_latest_param_version_for_strategy(db, strategy_name)
+        if pv:
+            versioned = json.loads(pv.params_json or "{}")
+            if versioned:
+                logger.info(
+                    "Backtest using parameter_versions (v%s) for %s",
+                    pv.version, strategy_name,
+                )
+                return versioned
+    except Exception as exc:
+        logger.warning("Could not load parameter_versions for %s: %s", strategy_name, exc)
+
+    # 3. Strategy class defaults
+    try:
+        strat_cls = get_strategy(strategy_name, {})
+        defaults = strat_cls.default_params()
+        if defaults:
+            logger.info("Backtest falling back to default_params() for %s", strategy_name)
+            return defaults
+    except Exception as exc:
+        logger.warning("Could not get default_params for %s: %s", strategy_name, exc)
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Single-run DB-backed backtest
 # ---------------------------------------------------------------------------
 
@@ -872,8 +930,21 @@ def run_backtest(
     """
     Create a backtest record and run synchronously.
     Returns backtest ID.
+
+    ``params`` is treated as **override** parameters. When it is empty (the
+    typical case from the backtest UI), the function automatically loads the
+    latest promoted parameters from the database in this order:
+      1. strategies collection  (backtester-promoted params)
+      2. parameter_versions collection (adaptation log entries)
+      3. strategy class default_params()
+
+    No database writes are performed as part of this resolution.
     """
     from .ohlcv import fetch_ohlcv_sync
+
+    # Resolve effective params — never writes to DB
+    params = _resolve_params(db, strategy_name, params)
+    logger.info("Backtest [%s/%s] using params: %s", strategy_name, symbol, params)
 
     adapt_every_n = int(crud.get_setting(db, "backtest_adapt_every_n_trades") or "20")
     av_key = crud.get_setting(db, "alphavantage_key") or ""

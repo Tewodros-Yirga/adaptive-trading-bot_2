@@ -112,11 +112,27 @@ async def _run_batch_background(
     runs: list[dict],
     shared_settings: dict,
 ) -> None:
-    """Background coroutine wrapper — creates its own DB session."""
+    """Background coroutine wrapper — creates its own DB session.
+
+    Resolves promoted parameters from the database for each run whose
+    ``params`` dict is empty BEFORE dispatching to the executor pool.
+    ``run_backtest_sync_standalone`` has no DB access, so resolution must
+    happen here.  This is read-only — no DB writes occur.
+    """
     from ..db import get_database
+    from ..services.backtester import _resolve_params
+
     db = get_database()
+
+    # Pre-resolve promoted params for every run that didn't supply explicit ones
+    resolved_runs = []
+    for run in runs:
+        run = dict(run)
+        run["params"] = _resolve_params(db, run["strategy_name"], run.get("params") or {})
+        resolved_runs.append(run)
+
     try:
-        await run_batch_backtest(db, batch_id, runs, shared_settings, None)
+        await run_batch_backtest(db, batch_id, resolved_runs, shared_settings, None)
     finally:
         pass  # pymongo client is managed at app level; no per-request close needed
 
