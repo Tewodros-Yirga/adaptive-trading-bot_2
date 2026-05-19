@@ -81,10 +81,10 @@ def compute_factor_scores(
 
     if len(recent_trades) < min_live_trades:
         best_candidate = crud.get_best_backtest_candidate(db, strategy_name)
-        # Default to 0.1 (not 0.3) so a strategy with zero backtest history
-        # stays well below the picker_min_score threshold (default 0.3) and
-        # doesn't accidentally get selected due to floating-point noise.
-        bt_score = best_candidate.composite_score if best_candidate else 0.1
+        # Default to 0.2 (not 0.1) — strategies with no backtest history get a
+        # small but non-zero score so they can pass picker_min_score (default 0.2)
+        # and be evaluated on live signals rather than being permanently frozen out.
+        bt_score = best_candidate["composite_score"] if best_candidate else 0.2
 
         # Use strategy-specific factors even without live trades
         latest_param = crud.get_latest_param_version_for_strategy(db, strategy_name)
@@ -412,7 +412,7 @@ async def pick_and_route(
     from ..services.orchestrator import resolve_direction, resolve_ensemble_levels
 
     max_n = int(crud.get_setting(db, "picker_max_simultaneous_strategies") or 1)
-    min_score = float(crud.get_setting(db, "picker_min_score") or 0.3)
+    min_score = float(crud.get_setting(db, "picker_min_score") or 0.2)
     sec_threshold = float(crud.get_setting(db, "picker_secondary_threshold") or 0.85)
 
     weights = _load_factor_weights(db)
