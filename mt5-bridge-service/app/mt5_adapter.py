@@ -478,15 +478,39 @@ class MT5Adapter:
         symbol = payload["symbol"]
         side = payload["type"].upper()
 
-        tick = self._mt.symbol_info_tick(symbol)
+        # ── Symbol selection + variant fallback ─────────────────────────────────
+        # symbol_info_tick returns None when the symbol is not in Market Watch.
+        # symbol_select() adds it; then try the broker suffix variant (XAUUSDm).
+        def _alt(s: str) -> str | None:
+            if s.upper().endswith("M"):
+                return s[:-1]
+            if s.upper() in {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}:
+                return s + "m"
+            return None
+
+        tick = None
+        resolved_symbol = symbol
+        for sym in [symbol] + ([_alt(symbol)] if _alt(symbol) else []):
+            try:
+                self._mt.symbol_select(sym, True)
+            except Exception:
+                pass
+            tick = self._mt.symbol_info_tick(sym)
+            if tick is not None:
+                resolved_symbol = sym
+                break
+
         if tick is None:
-            raise RuntimeError(f"symbol tick unavailable for {symbol}")
+            raise RuntimeError(
+                f"symbol tick unavailable for {symbol} (also tried variant). "
+                f"Ensure the symbol is enabled in Market Watch."
+            )
 
         order_type = self._mt.ORDER_TYPE_BUY if side == "BUY" else self._mt.ORDER_TYPE_SELL
         price = tick.ask if side == "BUY" else tick.bid
         request = {
             "action": self._mt.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": resolved_symbol,
             "volume": payload["volume"],
             "type": order_type,
             "price": price,
@@ -506,7 +530,7 @@ class MT5Adapter:
             raise RuntimeError(f"order_send failed retcode={result.retcode}")
         return {
             "ticket": result.order,
-            "symbol": symbol,
+            "symbol": resolved_symbol,
             "type": side,
             "volume": payload["volume"],
             "openPrice": price,
@@ -526,6 +550,12 @@ class MT5Adapter:
         symbol = pos.symbol
 
         side_close = self._mt.ORDER_TYPE_SELL if pos.type == self._mt.ORDER_TYPE_BUY else self._mt.ORDER_TYPE_BUY
+
+        # Ensure symbol is in Market Watch before tick lookup
+        try:
+            self._mt.symbol_select(symbol, True)
+        except Exception:
+            pass
         tick = self._mt.symbol_info_tick(symbol)
         if tick is None:
             raise RuntimeError(f"symbol tick unavailable for {symbol}")
