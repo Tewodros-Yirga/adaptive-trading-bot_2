@@ -177,25 +177,17 @@ def select_strategies(
     factor_scores: dict[str, dict[str, float]] | None = None,
 ) -> list[str]:
     """
-    Returns up to max_n strategy names.
-    Secondary strategies must score >= top_score * secondary_threshold.
+    Returns up to max_n strategy names ranked by composite score.
 
-    Hard gate: any strategy whose signal_confidence factor score is 0.0 is
-    excluded regardless of its composite score.  A strategy that isn't firing
-    right now should never be selected — the historical factors would carry it
-    over the min_score threshold and then resolve_direction would find no
-    direction to vote with, returning confidence=0.0 every time.
+    Strategies are selected purely on score — the old signal_confidence binary
+    gate has been removed.  If the selected strategy isn't firing this bar the
+    caller already handles it via the SELECTED_BUT_NO_SIGNAL path, so the gate
+    was just preventing the picker from ever producing decisions.
+
+    factor_scores is kept as a parameter so the news-veto caller can still pass
+    it through; it is no longer used for the eligibility check here.
     """
-    # Exclude strategies that are not currently signaling.
-    def _is_signaling(name: str) -> bool:
-        if factor_scores is None:
-            return True  # can't tell — don't gate
-        return (factor_scores.get(name, {}).get("signal_confidence", 0.0) or 0.0) > 0.0
-
-    eligible = {
-        k: v for k, v in scores.items()
-        if v >= min_score and _is_signaling(k)
-    }
+    eligible = {k: v for k, v in scores.items() if v >= min_score}
     if not eligible:
         return []
     ranked = sorted(eligible, key=eligible.__getitem__, reverse=True)
@@ -412,7 +404,7 @@ async def pick_and_route(
     from ..services.orchestrator import resolve_direction, resolve_ensemble_levels
 
     max_n = int(crud.get_setting(db, "picker_max_simultaneous_strategies") or 1)
-    min_score = float(crud.get_setting(db, "picker_min_score") or 0.2)
+    min_score = float(crud.get_setting(db, "picker_min_score") or 0.15)
     sec_threshold = float(crud.get_setting(db, "picker_secondary_threshold") or 0.85)
 
     weights = _load_factor_weights(db)
@@ -480,16 +472,16 @@ async def pick_and_route(
     # ── Diagnostic: explain eligibility for each strategy ────────────────
     for name, score in adjusted_scores.items():
         is_signaling = (all_factor_scores.get(name, {}).get("signal_confidence", 0.0) or 0.0) > 0.0
-        if score >= min_score and not is_signaling:
-            logger.info(
-                "[Picker] %s gated out: score=%.4f >= min_score=%.4f BUT signal_confidence=0 "
-                "(strategy not firing this bar)",
+        if score < min_score:
+            logger.debug(
+                "[Picker] %s below min_score: score=%.4f < %.4f (not eligible)",
                 name, score, min_score,
             )
-        elif score < min_score:
+        elif not is_signaling:
             logger.debug(
-                "[Picker] %s below min_score: score=%.4f < %.4f",
-                name, score, min_score,
+                "[Picker] %s eligible (score=%.4f) but not firing this bar — "
+                "will be selected; downstream handles SELECTED_BUT_NO_SIGNAL",
+                name, score,
             )
 
     selected = select_strategies(adjusted_scores, max_n, min_score, sec_threshold, all_factor_scores)

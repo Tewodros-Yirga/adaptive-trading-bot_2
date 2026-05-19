@@ -536,21 +536,62 @@ async def process_signal(
     selected_strategies: list[str] = picker_result.get("selected_strategies") or []
 
     if not final_direction:
-        decision = _log_ensemble_decision(
-            db, symbol, signal_dicts, ensemble_weights, None, 0.0,
-            levels={}, news_bias=None,
-        )
-        signals_summary = {sd["strategy_name"]: sd["direction"] for sd in signal_dicts}
-        return {
-            "status": "NO_SIGNAL",
-            "signals": signals_summary,
-            "picker_decision_id": picker_decision_id,
-            "ensemble_decision_id": decision.id,
-        }
+        # ── News-driven fallback ───────────────────────────────────────────
+        # When no strategy fires, synthesize a direction from news bias alone.
+        # Thresholds are intentionally very relaxed so the system trades often.
+        # Override via AppSettings: news_signal_bias_threshold / news_signal_confidence_threshold
+        _bias_data     = get_news_bias(db, symbol)
+        _nb            = float(_bias_data["bias"])
+        _nc            = float(_bias_data["confidence"])
+        _bias_min      = float(crud.get_setting(db, "news_signal_bias_threshold")       or 0.05)
+        _conf_min      = float(crud.get_setting(db, "news_signal_confidence_threshold") or 0.10)
+        _news_enabled  = (crud.get_setting(db, "news_signal_trading_enabled") or "true").lower() != "false"
+
+        if _news_enabled and abs(_nb) >= _bias_min and _nc >= _conf_min:
+            # Synthesize direction from news bias
+            final_direction     = "BUY" if _nb > 0 else "SELL"
+            resolved_confidence = round(_nc * abs(_nb), 4)
+            ensemble_weights    = {"NEWS_DRIVEN": 1.0}
+            selected_strategies = ["NEWS_DRIVEN"]
+            news_bias           = _nb
+
+            # ATR-based SL / TP (strategy didn't provide levels)
+            _atr     = market_data.get("atr") or price * 0.005
+            _sl_mult = float(crud.get_setting(db, "news_signal_sl_atr_mult")  or 1.0)
+            _tp_mult = float(crud.get_setting(db, "news_signal_tp_atr_mult")  or 1.5)
+            if final_direction == "BUY":
+                _sl  = price - _atr * _sl_mult
+                _tp1 = price + _atr * _tp_mult
+            else:
+                _sl  = price + _atr * _sl_mult
+                _tp1 = price - _atr * _tp_mult
+            levels = {"entry": price, "sl": _sl, "tp1": _tp1, "tp2": None, "tp3": None, "tp4": None}
+
+            logger.info(
+                "[News-Driven] %s %s @ %.5f | bias=%.3f conf=%.3f "
+                "SL=%.5f TP1=%.5f (atr=%.5f sl_mult=%.1f tp_mult=%.1f)",
+                final_direction, symbol, price, _nb, _nc,
+                _sl, _tp1, _atr, _sl_mult, _tp_mult,
+            )
+        else:
+            # Truly no tradeable signal — no strategy fired, news too neutral
+            decision = _log_ensemble_decision(
+                db, symbol, signal_dicts, ensemble_weights, None, 0.0,
+                levels={}, news_bias=_nb,
+            )
+            signals_summary = {sd["strategy_name"]: sd["direction"] for sd in signal_dicts}
+            return {
+                "status": "NO_SIGNAL",
+                "signals": signals_summary,
+                "news_bias": _nb,
+                "news_confidence": _nc,
+                "picker_decision_id": picker_decision_id,
+                "ensemble_decision_id": decision.id,
+            }
 
     # ── News bias ──────────────────────────────────────────────────────────
     bias_data = get_news_bias(db, symbol)
-    news_bias: float = bias_data["bias"]
+    news_bias: float = locals().get("news_bias", bias_data["bias"])  # preserve news-driven value
 
     # ── Fallback levels ────────────────────────────────────────────────────
     if not levels:
