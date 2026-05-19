@@ -523,11 +523,26 @@ class MT5Adapter:
             "type_filling": self._mt.ORDER_FILLING_IOC,
         }
 
-        result = self._mt.order_send(request)
-        if result is None:
-            raise RuntimeError(f"order_send returned None: {self._last_error_repr()}")
-        if result.retcode != self._mt.TRADE_RETCODE_DONE:
-            raise RuntimeError(f"order_send failed retcode={result.retcode}")
+        _RETCODE_DONE             = self._mt.TRADE_RETCODE_DONE
+        _RETCODE_TOO_MANY_REQUESTS = 10027
+        result = None
+        for _attempt in range(3):
+            result = self._mt.order_send(request)
+            if result is None:
+                raise RuntimeError(f"order_send returned None: {self._last_error_repr()}")
+            if result.retcode == _RETCODE_DONE:
+                break
+            if result.retcode == _RETCODE_TOO_MANY_REQUESTS and _attempt < 2:
+                logger.warning(
+                    "order_send retcode=10027 (too many requests) — retry %d/3 in 3s",
+                    _attempt + 1,
+                )
+                time.sleep(3)
+                continue
+            raise RuntimeError(
+                f"order_send failed retcode={result.retcode} "
+                f"(see https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes)"
+            )
         return {
             "ticket": result.order,
             "symbol": resolved_symbol,

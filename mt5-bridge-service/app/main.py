@@ -450,7 +450,13 @@ def debug_screenshot():
 
 @app.get("/account", dependencies=[Depends(require_secret)])
 def account():
-    return adapter.account()
+    try:
+        return adapter.account()
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
 
 
 @app.post("/reset", dependencies=[Depends(require_secret)])
