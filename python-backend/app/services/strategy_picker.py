@@ -84,7 +84,7 @@ def compute_factor_scores(
         # Default to 0.2 (not 0.1) — strategies with no backtest history get a
         # small but non-zero score so they can pass picker_min_score (default 0.2)
         # and be evaluated on live signals rather than being permanently frozen out.
-        bt_score = best_candidate["composite_score"] if best_candidate else 0.2
+        bt_score = best_candidate.composite_score if best_candidate else 0.2
 
         # Use strategy-specific factors even without live trades
         latest_param = crud.get_latest_param_version_for_strategy(db, strategy_name)
