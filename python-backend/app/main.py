@@ -229,88 +229,85 @@ async def _live_trading_loop():
                 _crud.get_setting(db, "live_trading_interval_seconds") or 60
             )
 
-            if _settings.simulation_mode:
-                logger.debug("Live trading loop: simulation_mode=True, skipping order placement.")
-            else:
-                active_symbols_raw = _crud.get_setting(db, "live_trading_symbols") or "XAUUSD"
-                symbols = [s.strip() for s in active_symbols_raw.split(",") if s.strip()]
+            active_symbols_raw = _crud.get_setting(db, "live_trading_symbols") or "XAUUSD"
+            symbols = [s.strip() for s in active_symbols_raw.split(",") if s.strip()]
 
-                for symbol in symbols:
+            for symbol in symbols:
+                try:
+                    from datetime import date, timedelta
+                    from .services.ohlcv import fetch_ohlcv_with_fallback
+                    from .services.bridge_client import bridge_client as _bridge
+                    from_dt = (date.today() - timedelta(days=2)).isoformat()
+                    to_dt = date.today().isoformat()
+
+                    loop = asyncio.get_event_loop()
+
+                    # Price fetch: try bridge first (sync → executor), then
+                    # fall back to the async ohlcv chain.
+                    df = None
                     try:
-                        from datetime import date, timedelta
-                        from .services.ohlcv import fetch_ohlcv_with_fallback
-                        from .services.bridge_client import bridge_client as _bridge
-                        from_dt = (date.today() - timedelta(days=2)).isoformat()
-                        to_dt = date.today().isoformat()
+                        candles = await loop.run_in_executor(
+                            None,
+                            lambda: _bridge.get_candles(
+                                symbol=symbol,
+                                timeframe="1h",
+                                from_date=from_dt,
+                                to_date=to_dt,
+                            ),
+                        )
+                        if candles:
+                            import pandas as _pd
+                            df = _pd.DataFrame(candles)
+                            for col in ("open", "high", "low", "close"):
+                                df[col] = _pd.to_numeric(df[col], errors="coerce")
+                            df = df.dropna(subset=["close"])
+                    except Exception as _bridge_exc:
+                        logger.debug(
+                            "Live loop bridge fetch failed for %s, falling back: %s",
+                            symbol, _bridge_exc,
+                        )
 
-                        # fetch_ohlcv_with_fallback is async but its MT5 bridge
-                        # path calls sync httpx internally.  Use it as-is here;
-                        # the true blocking risk is get_account / get_positions
-                        # called on the bridge directly — those must go through
-                        # run_in_executor so they don't stall the event loop.
-                        loop = asyncio.get_event_loop()
+                    if df is None or df.empty:
+                        df, _src = await fetch_ohlcv_with_fallback(
+                            symbol, from_dt, to_dt, "1h", db
+                        )
 
-                        # Price fetch: try bridge first (sync → executor), then
-                        # fall back to the async ohlcv chain.
-                        df = None
-                        try:
-                            candles = await loop.run_in_executor(
-                                None,
-                                lambda: _bridge.get_candles(
-                                    symbol=symbol,
-                                    timeframe="1h",
-                                    from_date=from_dt,
-                                    to_date=to_dt,
-                                ),
-                            )
-                            if candles:
-                                import pandas as _pd
-                                df = _pd.DataFrame(candles)
-                                for col in ("open", "high", "low", "close"):
-                                    df[col] = _pd.to_numeric(df[col], errors="coerce")
-                                df = df.dropna(subset=["close"])
-                        except Exception as _bridge_exc:
-                            logger.debug(
-                                "Live loop bridge fetch failed for %s, falling back: %s",
-                                symbol, _bridge_exc,
-                            )
+                    if df is None or df.empty:
+                        logger.warning("Live loop: no price data for %s", symbol)
+                        continue
 
-                        if df is None or df.empty:
-                            df, _src = await fetch_ohlcv_with_fallback(
-                                symbol, from_dt, to_dt, "1h", db
-                            )
+                    price = float(df["close"].iloc[-1])
+                    atr = float((df["high"] - df["low"]).tail(14).mean()) if len(df) >= 14 else price * 0.005
 
-                        if df is None or df.empty:
-                            logger.warning("Live loop: no price data for %s", symbol)
-                            continue
+                    market_data = {
+                        "symbol": symbol,
+                        "price": price,
+                        "current_price": price,
+                        "atr": atr,
+                        # Raw DataFrame passed so the orchestrator can compute
+                        # per-strategy indicators (EMA, RSI, MACD, BB, VWAP)
+                        # via _enrich_market_data_from_df().  Not serialised.
+                        "_df": df,
+                    }
 
-                        price = float(df["close"].iloc[-1])
-                        atr = float((df["high"] - df["low"]).tail(14).mean()) if len(df) >= 14 else price * 0.005
+                    # Always run the full pipeline (signals → picker → ensemble)
+                    # so picker decisions are recorded even in simulation mode.
+                    # Order placement is gated inside bridge_client by simulation_mode.
+                    sim = _settings.simulation_mode
+                    result = await process_signal(db, market_data, symbol, price)
+                    status = result.get("status", "?")
 
-                        market_data = {
-                            "symbol": symbol,
-                            "price": price,
-                            "current_price": price,
-                            "atr": atr,
-                            # Raw DataFrame passed so the orchestrator can compute
-                            # per-strategy indicators (EMA, RSI, MACD, BB, VWAP)
-                            # via _enrich_market_data_from_df().  Not serialised.
-                            "_df": df,
-                        }
+                    if status == "OK":
+                        logger.info(
+                            "Live trade %s: %s %s @ %.5f (trade_id=%s)",
+                            "SIMULATED" if sim else "PLACED",
+                            result.get("signal"), symbol, price, result.get("trade_id")
+                        )
+                    elif status not in ("NO_SIGNAL", "NO_ACTIVE_STRATEGIES"):
+                        logger.info("Live loop %s: %s", symbol, status)
 
-                        result = await process_signal(db, market_data, symbol, price)
-                        status = result.get("status", "?")
-
-                        if status == "OK":
-                            logger.info(
-                                "Live trade placed: %s %s @ %.5f (trade_id=%s)",
-                                result.get("signal"), symbol, price, result.get("trade_id")
-                            )
-                        elif status not in ("NO_SIGNAL", "NO_ACTIVE_STRATEGIES"):
-                            logger.info("Live loop %s: %s", symbol, status)
-
-                    except Exception as sym_exc:
-                        logger.warning("Live loop error for %s: %s", symbol, sym_exc)
+                except Exception as sym_exc:
+                    logger.warning("Live loop error for %s: %s", symbol, sym_exc)
 
         except Exception as exc:
             logger.error("Live trading loop crashed: %s", exc, exc_info=True)
