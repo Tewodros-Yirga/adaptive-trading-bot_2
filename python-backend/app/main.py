@@ -237,10 +237,38 @@ async def _live_trading_loop():
                     from datetime import date, timedelta
                     from .services.ohlcv import fetch_ohlcv_with_fallback
                     from .services.bridge_client import bridge_client as _bridge
-                    from_dt = (date.today() - timedelta(days=2)).isoformat()
-                    to_dt = date.today().isoformat()
 
                     loop = asyncio.get_event_loop()
+
+                    # ── Open position guard ───────────────────────────────────
+                    # Skip signal evaluation entirely if a position for this
+                    # symbol is already open.  This prevents retcode 10027
+                    # (too many requests) caused by sending orders on every
+                    # tick while a trade is already running.
+                    try:
+                        open_positions = await loop.run_in_executor(
+                            None, _bridge.get_positions
+                        )
+                        symbol_variants = {symbol, symbol.rstrip("m"), symbol + "m"}
+                        already_open = any(
+                            p.get("symbol", "") in symbol_variants
+                            for p in (open_positions or [])
+                        )
+                        if already_open:
+                            logger.debug(
+                                "Live loop: position already open for %s — skipping tick",
+                                symbol,
+                            )
+                            continue
+                    except Exception as _pos_exc:
+                        logger.debug(
+                            "Live loop: could not check open positions for %s: %s",
+                            symbol, _pos_exc,
+                        )
+                        # Non-fatal — proceed with signal evaluation
+
+                    from_dt = (date.today() - timedelta(days=2)).isoformat()
+                    to_dt = date.today().isoformat()
 
                     # Price fetch: try bridge first (sync → executor), then
                     # fall back to the async ohlcv chain.

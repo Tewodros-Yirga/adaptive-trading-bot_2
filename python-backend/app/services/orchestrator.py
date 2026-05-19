@@ -648,6 +648,123 @@ async def process_signal(
             "ensemble_decision_id": decision.id,
         }
 
+    # ── Duplicate position awareness ───────────────────────────────────────
+    # Fetch live MT5 positions to check for existing same-direction exposure
+    # on this symbol.  Duplicates are NOT prohibited but require stricter
+    # criteria so they are only opened with genuine additional conviction:
+    #
+    #   1. Higher confidence   (duplicate_min_confidence,         default 0.75)
+    #   2. ATR price distance  (duplicate_min_price_distance_atr, default 1.0)
+    #      The new entry must be ≥ N×ATR away from the closest existing entry
+    #      — prevents pyramiding into the exact same price level.
+    #   3. Strategy agreement  (duplicate_min_strategy_count,     default 2)
+    #      At least N strategies must agree on the direction.
+    #
+    # All thresholds are configurable via AppSettings (no restart needed).
+    existing_same_dir: list[dict] = []
+    try:
+        live_positions = bridge_client.get_positions()
+        # Normalize symbol variants (XAUUSD ↔ XAUUSDm) for comparison
+        _sym_variants: set[str] = {symbol.upper()}
+        _sym_u = symbol.upper()
+        if _sym_u.endswith("M"):
+            _sym_variants.add(_sym_u[:-1])
+        else:
+            _sym_variants.add(_sym_u + "M")
+        existing_same_dir = [
+            p for p in live_positions
+            if p.get("symbol", "").upper() in _sym_variants
+            and p.get("type", "").upper() == final_direction.upper()
+        ]
+    except Exception as _dup_exc:
+        logger.warning("Could not fetch live positions for duplicate check: %s", _dup_exc)
+
+    if existing_same_dir:
+        # Pull thresholds (configurable; safe defaults ensure stricter gate)
+        dup_min_conf     = float(crud.get_setting(db, "duplicate_min_confidence")         or 0.75)
+        dup_min_atr_dist = float(crud.get_setting(db, "duplicate_min_price_distance_atr") or 1.0)
+        dup_min_strats   = int(  crud.get_setting(db, "duplicate_min_strategy_count")     or 2)
+        _atr             = float(market_data.get("atr") or price * 0.005)
+
+        reasons_blocked: list[str] = []
+
+        # Criterion 1 — confidence
+        if resolved_confidence < dup_min_conf:
+            reasons_blocked.append(
+                f"confidence {resolved_confidence:.3f} < required {dup_min_conf:.3f} for duplicate"
+            )
+
+        # Criterion 2 — price distance from the nearest existing entry
+        min_price_dist = min(
+            abs(price - float(p.get("openPrice", price)))
+            for p in existing_same_dir
+        )
+        required_dist = _atr * dup_min_atr_dist
+        if min_price_dist < required_dist:
+            reasons_blocked.append(
+                f"price distance {min_price_dist:.5f} < {dup_min_atr_dist:.1f}×ATR "
+                f"({required_dist:.5f}) — too close to existing entry"
+            )
+
+        # Criterion 3 — strategy agreement count
+        agreeing_count = sum(
+            1 for s in signal_dicts
+            if s.get("direction") == final_direction and float(s.get("confidence") or 0) > 0
+        )
+        if agreeing_count < dup_min_strats:
+            reasons_blocked.append(
+                f"only {agreeing_count} strategy/ies agree "
+                f"(need ≥{dup_min_strats} for a duplicate)"
+            )
+
+        existing_summary = [
+            {
+                "ticket":    p.get("ticket"),
+                "entry":     p.get("openPrice"),
+                "volume":    p.get("volume"),
+                "profit":    p.get("profit"),
+            }
+            for p in existing_same_dir
+        ]
+
+        if reasons_blocked:
+            logger.warning(
+                "[DuplicateGuard] BLOCKED %s %s — %d existing position(s) %s | %s",
+                final_direction, symbol, len(existing_same_dir),
+                existing_summary, "; ".join(reasons_blocked),
+            )
+            _dup_decision = _log_ensemble_decision(
+                db, symbol, signal_dicts, ensemble_weights,
+                final_direction, resolved_confidence,
+                levels=levels, news_bias=news_bias,
+                block_reason="duplicate_blocked: " + "; ".join(reasons_blocked),
+            )
+            return {
+                "status":               "BLOCKED_DUPLICATE_POSITION",
+                "reason":               "; ".join(reasons_blocked),
+                "existing_positions":   existing_summary,
+                "resolved_confidence":  resolved_confidence,
+                "required_confidence":  dup_min_conf,
+                "price_distance":       round(min_price_dist, 5),
+                "required_distance":    round(required_dist, 5),
+                "agreeing_strategies":  agreeing_count,
+                "required_strategies":  dup_min_strats,
+                "picker_decision_id":   picker_decision_id,
+                "ensemble_decision_id": _dup_decision.id,
+            }
+
+        # All criteria met — proceed, but make it explicit in logs
+        logger.info(
+            "[DuplicateGuard] INTENTIONAL DUPLICATE approved: %s %s | "
+            "confidence=%.3f (≥%.3f), price_dist=%.5f (≥%.5f), "
+            "agreeing_strategies=%d (≥%d) | existing: %s",
+            final_direction, symbol,
+            resolved_confidence, dup_min_conf,
+            min_price_dist, required_dist,
+            agreeing_count, dup_min_strats,
+            existing_summary,
+        )
+
     # ── Place order ────────────────────────────────────────────────────────
     order = bridge_client.place_order(
         {
