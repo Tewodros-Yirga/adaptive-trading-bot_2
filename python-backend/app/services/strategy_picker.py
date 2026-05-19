@@ -433,6 +433,22 @@ async def pick_and_route(
         all_factor_scores[sig["strategy_name"]] = factors
         scores[sig["strategy_name"]] = compute_total_score(factors, weights)
 
+    # ── Diagnostic log: show signal directions + composite scores ──────────
+    signaling_count = sum(1 for s in raw_signals if s.get("direction"))
+    logger.info(
+        "[Picker] %s | %d/%d strategies firing | raw_scores: %s",
+        symbol,
+        signaling_count,
+        len(raw_signals),
+        {k: round(v, 4) for k, v in scores.items()},
+    )
+    if signaling_count == 0:
+        logger.info(
+            "[Picker] No strategy produced a direction this bar. "
+            "Directions: %s",
+            {s["strategy_name"]: s.get("direction") for s in raw_signals},
+        )
+
     # ── News adjustments (synchronous) ────────────────────────────────────
     adjusted_scores, news_influence, veto = apply_news_adjustments(
         scores, strategy_signals, symbol, db, factor_scores=all_factor_scores
@@ -460,6 +476,21 @@ async def pick_and_route(
             "veto": True,
             "veto_reason": "NEWS_VETO",
         }
+
+    # ── Diagnostic: explain eligibility for each strategy ────────────────
+    for name, score in adjusted_scores.items():
+        is_signaling = (all_factor_scores.get(name, {}).get("signal_confidence", 0.0) or 0.0) > 0.0
+        if score >= min_score and not is_signaling:
+            logger.info(
+                "[Picker] %s gated out: score=%.4f >= min_score=%.4f BUT signal_confidence=0 "
+                "(strategy not firing this bar)",
+                name, score, min_score,
+            )
+        elif score < min_score:
+            logger.debug(
+                "[Picker] %s below min_score: score=%.4f < %.4f",
+                name, score, min_score,
+            )
 
     selected = select_strategies(adjusted_scores, max_n, min_score, sec_threshold, all_factor_scores)
     if not selected:

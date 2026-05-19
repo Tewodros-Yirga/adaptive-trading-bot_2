@@ -41,6 +41,127 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Indicator enrichment for non-MTF strategies
+# ---------------------------------------------------------------------------
+
+def _enrich_market_data_from_df(df, params: dict) -> dict:
+    """
+    Compute all technical indicators needed by non-MTF strategies from a
+    DataFrame of OHLCV candles (columns: open, high, low, close, volume).
+
+    Covers:
+      - DTC / Multi_EMA_Scalper : ema_values, previous_bull, previous_bear
+      - RSI_Reversal             : rsi, prev_rsi
+      - MACD_Momentum            : macd_line, macd_signal, macd_histogram,
+                                   prev_macd_line, prev_macd_signal
+      - Bollinger_Breakout       : bb_upper, bb_lower, prev_bb_upper,
+                                   prev_bb_lower, prev_price
+      - VWAP_Reversion           : vwap
+
+    EMA periods and other hyper-params are read from `params` so each
+    strategy gets indicators computed with *its own* parameter set.
+    Falls back to industry defaults when a param key is absent.
+    Returns {} on any error so callers always get a safe dict.
+    """
+    try:
+        import math
+        import pandas as _pd
+
+        if df is None or df.empty or len(df) < 3:
+            return {}
+
+        close = df["close"].astype(float)
+        high = df["high"].astype(float) if "high" in df.columns else close
+        low = df["low"].astype(float) if "low" in df.columns else close
+        volume = (
+            df["volume"].astype(float)
+            if "volume" in df.columns
+            else _pd.Series(1.0, index=df.index)
+        )
+
+        def _ema(series, period: int):
+            return series.ewm(span=max(period, 1), adjust=False).mean()
+
+        enriched: dict = {}
+
+        # ── EMA cascade (DTC & Multi_EMA_Scalper — param-driven periods) ─────
+        ema_periods = {
+            "ema_1": int(params.get("ema_1", 30)),
+            "ema_2": int(params.get("ema_2", 35)),
+            "ema_3": int(params.get("ema_3", 40)),
+            "ema_4": int(params.get("ema_4", 45)),
+            "ema_5": int(params.get("ema_5", 50)),
+            "ema_6": int(params.get("ema_6", 60)),
+        }
+        ema_series = {k: _ema(close, v) for k, v in ema_periods.items()}
+        ema_values = {k: float(s.iloc[-1]) for k, s in ema_series.items()}
+        prev_ema_values = {k: float(s.iloc[-2]) for k, s in ema_series.items()}
+
+        enriched["ema_values"] = ema_values
+        _keys = ["ema_1", "ema_2", "ema_3", "ema_4", "ema_5", "ema_6"]
+        enriched["previous_bull"] = all(
+            prev_ema_values[_keys[i]] > prev_ema_values[_keys[i + 1]] for i in range(5)
+        )
+        enriched["previous_bear"] = all(
+            prev_ema_values[_keys[i]] < prev_ema_values[_keys[i + 1]] for i in range(5)
+        )
+
+        # ── RSI ───────────────────────────────────────────────────────────────
+        rsi_period = int(params.get("rsi_period", 14))
+        delta = close.diff()
+        avg_gain = delta.clip(lower=0).ewm(com=rsi_period - 1, adjust=False).mean()
+        avg_loss = (-delta).clip(lower=0).ewm(com=rsi_period - 1, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, float("inf"))
+        rsi_series = 100.0 - 100.0 / (1.0 + rs)
+        if len(rsi_series) >= 2:
+            enriched["rsi"] = float(rsi_series.iloc[-1])
+            enriched["prev_rsi"] = float(rsi_series.iloc[-2])
+
+        # ── MACD ──────────────────────────────────────────────────────────────
+        fast_p = int(params.get("fast_period", 12))
+        slow_p = int(params.get("slow_period", 26))
+        sig_p = int(params.get("signal_period", 9))
+        macd_line = _ema(close, fast_p) - _ema(close, slow_p)
+        macd_signal_line = _ema(macd_line, sig_p)
+        macd_hist = macd_line - macd_signal_line
+        if len(macd_line) >= 2:
+            enriched["macd_line"] = float(macd_line.iloc[-1])
+            enriched["macd_signal"] = float(macd_signal_line.iloc[-1])
+            enriched["macd_histogram"] = float(macd_hist.iloc[-1])
+            enriched["prev_macd_line"] = float(macd_line.iloc[-2])
+            enriched["prev_macd_signal"] = float(macd_signal_line.iloc[-2])
+
+        # ── Bollinger Bands ───────────────────────────────────────────────────
+        bb_period = int(params.get("bb_period", 20))
+        bb_std = float(params.get("bb_std", 2.0))
+        if len(close) >= bb_period:
+            bb_mean = close.rolling(bb_period).mean()
+            bb_sigma = close.rolling(bb_period).std(ddof=0)
+            bb_upper = bb_mean + bb_std * bb_sigma
+            bb_lower = bb_mean - bb_std * bb_sigma
+            enriched["bb_upper"] = float(bb_upper.iloc[-1])
+            enriched["bb_lower"] = float(bb_lower.iloc[-1])
+            if len(bb_upper) >= 2:
+                enriched["prev_bb_upper"] = float(bb_upper.iloc[-2])
+                enriched["prev_bb_lower"] = float(bb_lower.iloc[-2])
+                enriched["prev_price"] = float(close.iloc[-2])
+
+        # ── VWAP (rolling approximation over available bars) ──────────────────
+        typical = (high + low + close) / 3.0
+        cum_vol = volume.cumsum().replace(0, float("nan"))
+        vwap_series = (typical * volume).cumsum() / cum_vol
+        last_vwap = vwap_series.iloc[-1]
+        if not math.isnan(last_vwap):
+            enriched["vwap"] = float(last_vwap)
+
+        return enriched
+
+    except Exception as exc:
+        logger.warning("_enrich_market_data_from_df failed: %s", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Ensemble configuration helpers
 # ---------------------------------------------------------------------------
 
@@ -310,7 +431,17 @@ async def process_signal(
                 effective_md.update({k: v for k, v in market_data.items() if k not in effective_md})
                 effective_md["current_price"] = price
             else:
-                effective_md = {**market_data, "price": price}
+                # Compute technical indicators from the raw candle DataFrame
+                # so non-MTF strategies (DTC, RSI_Reversal, MACD_Momentum,
+                # Bollinger_Breakout, Multi_EMA_Scalper, VWAP_Reversion) can
+                # generate real signals instead of always returning None.
+                _df = market_data.get("_df")
+                _indicator_data = (
+                    _enrich_market_data_from_df(_df, params)
+                    if _df is not None
+                    else {}
+                )
+                effective_md = {**market_data, "price": price, **_indicator_data}
 
             raw_sig = strat.signal(effective_md)
 

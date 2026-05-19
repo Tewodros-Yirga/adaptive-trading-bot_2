@@ -292,6 +292,10 @@ async def _live_trading_loop():
                             "price": price,
                             "current_price": price,
                             "atr": atr,
+                            # Raw DataFrame passed so the orchestrator can compute
+                            # per-strategy indicators (EMA, RSI, MACD, BB, VWAP)
+                            # via _enrich_market_data_from_df().  Not serialised.
+                            "_df": df,
                         }
 
                         result = await process_signal(db, market_data, symbol, price)
