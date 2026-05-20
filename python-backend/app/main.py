@@ -103,6 +103,12 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(_backtester_keepalive_loop()))
     logger.info("Started backtester keepalive loop.")
 
+    # ── 10. Start position reconciliation loop ───────────────────────────────
+    # Detects ghost open trades in MongoDB (closed externally by MT5)
+    # and marks them as WIN/LOSS using deal history from the bridge.
+    bg_tasks.append(asyncio.create_task(_position_reconciliation_loop()))
+    logger.info("Started position reconciliation loop.")
+
     logger.info("Application startup complete.")
     yield
 
@@ -339,6 +345,48 @@ async def _live_trading_loop():
 
         except Exception as exc:
             logger.error("Live trading loop crashed: %s", exc, exc_info=True)
+
+        await asyncio.sleep(interval)
+
+
+async def _position_reconciliation_loop():
+    """
+    Position reconciliation background loop.
+
+    Every `position_reconciliation_interval_seconds` (default 60s):
+      1. Fetch live MT5 positions via the bridge.
+      2. Compare against MongoDB open trades that have mt5_ticket set.
+      3. For any DB-open trade NOT in MT5 live positions (ghost trade):
+         - Fetch deal history to get close price + PnL.
+         - Mark the trade as WIN/LOSS in MongoDB via crud.close_trade().
+
+    Skips gracefully if the bridge is unreachable — never crashes the loop.
+    Runs in a thread executor because bridge_client uses synchronous httpx.
+    """
+    # Initial delay: let the live trading loop and bridge warm up first.
+    await asyncio.sleep(90)
+
+    while True:
+        interval = 60  # default
+        try:
+            db = get_database()
+            from . import crud as _crud
+            interval = float(
+                _crud.get_setting(db, "position_reconciliation_interval_seconds") or 60
+            )
+
+            from .services.position_reconciler import reconcile_positions
+            loop = asyncio.get_event_loop()
+            summary = await loop.run_in_executor(None, reconcile_positions, db)
+
+            if summary.get("ghost_found", 0) > 0:
+                logger.info(
+                    "Reconciliation complete: checked=%d ghost=%d closed=%d no_data=%d errors=%d",
+                    summary["checked"], summary["ghost_found"],
+                    summary["closed"], summary["no_deal_data"], summary["errors"],
+                )
+        except Exception as exc:
+            logger.warning("Position reconciliation loop error: %s", exc)
 
         await asyncio.sleep(interval)
 

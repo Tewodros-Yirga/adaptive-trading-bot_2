@@ -596,6 +596,8 @@ def seed_default_settings(db: Database) -> None:
     live_trading_defaults: dict[str, str] = {
         "live_trading_interval_seconds": "60",
         "live_trading_symbols": "XAUUSD",
+        # How often (seconds) to check for ghost trades closed externally by MT5
+        "position_reconciliation_interval_seconds": "60",
     }
 
     per_strategy_defaults: dict[str, str] = {
@@ -608,6 +610,11 @@ def seed_default_settings(db: Database) -> None:
         "param_step_size": "0.05",
         "range_expansion_months": "6",
         "max_history_months": "36",
+        # Exploration thresholds — used for coordinate-ascent momentum decisions only.
+        # Lower than qualify thresholds to allow gradient signal even below promotion bar.
+        "explore_threshold_win_rate": "35.0",
+        "explore_threshold_profit_factor": "0.5",
+        "explore_min_trades": "5",
     }
 
     def _maybe_insert(key: str, value: str) -> None:

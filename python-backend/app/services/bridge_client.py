@@ -84,6 +84,19 @@ class MT5BridgeClient:
         data = self._request("GET", "/positions")
         return data.get("positions", data)
 
+    def get_deals(self, ticket: int, lookback_days: int = 14) -> list[dict]:
+        """
+        Fetch historical deal records for a closed MT5 position ticket.
+        Returns empty list on error (non-fatal for reconciliation purposes).
+        """
+        if settings.simulation_mode:
+            return []
+        try:
+            data = self._request("GET", f"/deals/{ticket}", payload=None)
+            return data.get("deals", [])
+        except Exception:
+            return []
+
     def get_candles(
         self,
         symbol: str,
