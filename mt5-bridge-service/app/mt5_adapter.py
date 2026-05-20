@@ -525,20 +525,29 @@ class MT5Adapter:
 
         _RETCODE_DONE             = self._mt.TRADE_RETCODE_DONE
         _RETCODE_TOO_MANY_REQUESTS = 10027
+        _MAX_RETRIES = 5
         result = None
-        for _attempt in range(3):
+        for _attempt in range(_MAX_RETRIES):
             result = self._mt.order_send(request)
             if result is None:
                 raise RuntimeError(f"order_send returned None: {self._last_error_repr()}")
             if result.retcode == _RETCODE_DONE:
                 break
-            if result.retcode == _RETCODE_TOO_MANY_REQUESTS and _attempt < 2:
-                logger.warning(
-                    "order_send retcode=10027 (too many requests) — retry %d/3 in 3s",
-                    _attempt + 1,
+            if result.retcode == _RETCODE_TOO_MANY_REQUESTS:
+                if _attempt < _MAX_RETRIES - 1:
+                    _sleep = 5 * (2 ** _attempt)  # 5s, 10s, 20s, 40s, 80s
+                    logger.warning(
+                        "order_send retcode=10027 (too many requests) — retry %d/%d in %ds",
+                        _attempt + 1, _MAX_RETRIES, _sleep,
+                    )
+                    time.sleep(_sleep)
+                    continue
+                # All retries exhausted on 10027 — raise distinct error so the
+                # bridge endpoint can return HTTP 429 instead of 500.
+                raise TooManyRequestsError(
+                    f"order_send retcode=10027 after {_MAX_RETRIES} attempts — "
+                    f"broker is rate-limiting order requests"
                 )
-                time.sleep(3)
-                continue
             raise RuntimeError(
                 f"order_send failed retcode={result.retcode} "
                 f"(see https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes)"
@@ -718,6 +727,87 @@ class MT5Adapter:
                 continue
 
         return candles
+
+    def history_deals_get(
+        self,
+        ticket: int,
+        lookback_days: int = 7,
+    ) -> list[dict]:
+        """
+        Fetch closed deals for a given position ticket from MT5 deal history.
+
+        Uses history_deals_get(position=ticket) to find the closing deal.
+        Falls back to a date-range search over the last `lookback_days` days
+        if the positional lookup returns nothing.
+
+        Returns a list of dicts with keys:
+            ticket, order, position_id, time, type, entry, symbol,
+            volume, price, profit, swap, commission, comment
+        """
+        from datetime import datetime, timedelta, timezone
+
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: "
+                f"{self.last_error or 'connection unavailable'}"
+            )
+
+        # Primary: look up by position id
+        try:
+            deals = self._mt.history_deals_get(position=ticket)
+        except Exception as exc:
+            raise RuntimeError(f"history_deals_get(position={ticket}) failed: {exc}") from exc
+
+        if deals is None or (hasattr(deals, '__len__') and len(deals) == 0):
+            # Fallback: date-range search for the past N days
+            dt_from = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            dt_to   = datetime.now(timezone.utc)
+            try:
+                deals = self._mt.history_deals_get(dt_from, dt_to)
+            except Exception as exc:
+                raise RuntimeError(f"history_deals_get(date_range) failed: {exc}") from exc
+            # Filter to our position ticket
+            if deals is not None and hasattr(deals, '__len__'):
+                deals = [
+                    d for d in deals
+                    if getattr(d, 'position_id', None) == ticket
+                ]
+            else:
+                deals = []
+
+        if deals is None:
+            return []
+
+        result: list[dict] = []
+        for d in deals:
+            try:
+                result.append({
+                    "ticket":      int(getattr(d, 'ticket',      0)),
+                    "order":       int(getattr(d, 'order',       0)),
+                    "position_id": int(getattr(d, 'position_id', ticket)),
+                    "time":        int(getattr(d, 'time',        0)),
+                    "type":        int(getattr(d, 'type',        0)),
+                    "entry":       int(getattr(d, 'entry',       0)),
+                    "symbol":      str(getattr(d, 'symbol',      '')),
+                    "volume":      float(getattr(d, 'volume',    0.0)),
+                    "price":       float(getattr(d, 'price',     0.0)),
+                    "profit":      float(getattr(d, 'profit',    0.0)),
+                    "swap":        float(getattr(d, 'swap',      0.0)),
+                    "commission":  float(getattr(d, 'commission',0.0)),
+                    "comment":     str(getattr(d, 'comment',    '')),
+                })
+            except Exception:
+                continue
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Custom exception so the bridge endpoint can return HTTP 429
+# ---------------------------------------------------------------------------
+
+class TooManyRequestsError(RuntimeError):
+    """Raised when MT5 retcode 10027 exhausts all retries."""
 
 
 adapter = MT5Adapter()

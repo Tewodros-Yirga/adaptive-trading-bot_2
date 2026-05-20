@@ -512,3 +512,31 @@ def candles(payload: CandlesRequest = Depends()):
         raise HTTPException(status_code=502, detail=err_msg)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get("/deals/{ticket}", dependencies=[Depends(require_secret)])
+def deals(ticket: int, lookback_days: int = Query(default=14, ge=1, le=90)):
+    """
+    Fetch historical deal records for a closed MT5 position ticket.
+
+    Used by the backend position reconciler to determine the closing price
+    and PnL of trades that were closed externally (SL hit, TP hit, manual close).
+
+    Args:
+        ticket: MT5 position ticket number
+        lookback_days: how many days of deal history to search (default 14)
+
+    Returns:
+        List of deal dicts with keys: ticket, order, position_id, time, type,
+        entry, symbol, volume, price, profit, swap, commission, comment
+    """
+    try:
+        deals_list = adapter.history_deals_get(ticket=ticket, lookback_days=lookback_days)
+        return {"deals": deals_list, "count": len(deals_list), "ticket": ticket}
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=f"MT5 not connected: {err_msg}")
+        raise HTTPException(status_code=502, detail=err_msg)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
