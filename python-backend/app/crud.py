@@ -5,7 +5,7 @@ The `db` parameter throughout is a pymongo `Database` object (from get_database(
 NOT a SQLAlchemy Session. All collection names come from db.py constants.
 """
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pymongo.database import Database
 
@@ -29,41 +29,98 @@ from .models import (
 # ---------------------------------------------------------------------------
 
 def log_trade(db: Database, fields: dict) -> Trade:
+    """
+    Insert a new trade document.
+
+    Guarantees:
+    - ``opened_at`` defaults to utcnow if not supplied.
+    - ``result`` defaults to ``"OPEN"`` if not supplied.
+    - ``closed_at`` is explicitly removed from the insert document so that
+      ``get_recent_trades`` (which queries ``closed_at: {$exists: false}``)
+      correctly finds it as an open trade.
+    """
     fields = dict(fields)
     fields.setdefault("opened_at", datetime.utcnow())
+    fields.setdefault("result", "OPEN")
+    # Never persist closed_at on a freshly opened trade
+    fields.pop("closed_at", None)
     fields["_id"] = next_id(db, COLL_TRADES)
     db[COLL_TRADES].insert_one(fields)
     return Trade.from_doc(fields)
 
 
-def close_trade(db: Database, trade_id: int, exit_price: float, pnl: float, result: str) -> Trade | None:
+def close_trade(
+    db: Database,
+    trade_id: int,
+    exit_price: float,
+    pnl: float,
+    result: str,
+    mt5_ticket: int | None = None,
+) -> Trade | None:
+    """
+    Mark a trade as closed.
+
+    Args:
+        db: MongoDB database handle.
+        trade_id: Integer ``_id`` of the trade document.
+        exit_price: Price at which the position was closed.
+        pnl: Realised profit/loss in account currency.
+        result: ``"WIN"``, ``"LOSS"``, or ``"BLOCKED"``.
+        mt5_ticket: Optional MT5 ticket number. Written to the document if provided,
+                    enabling future reconciliation lookups.
+
+    Returns:
+        Updated :class:`Trade` dataclass, or ``None`` if not found.
+    """
     doc = db[COLL_TRADES].find_one({"_id": trade_id})
     if not doc:
         return None
     now = datetime.utcnow()
     opened_at = doc.get("opened_at")
     duration_mins = ((now - opened_at).total_seconds() / 60.0) if opened_at else None
-    update = {
+    update: dict = {
         "exit_price": exit_price,
         "pnl": pnl,
         "result": result,
         "closed_at": now,
         "duration_mins": round(duration_mins, 1) if duration_mins is not None else None,
     }
+    if mt5_ticket is not None:
+        update["mt5_ticket"] = mt5_ticket
     db[COLL_TRADES].update_one({"_id": trade_id}, {"$set": update})
     doc.update(update)
     return Trade.from_doc(doc)
 
 
 def get_recent_trades(db: Database, limit: int = 50) -> list[Trade]:
-    docs = db[COLL_TRADES].find().sort("opened_at", -1).limit(limit)
+    """
+    Return the most-recent *open* trades (those with no ``closed_at`` field).
+
+    Previously this returned all trades sorted by open time, which meant closed
+    trades appeared in the "open positions" view. The query now strictly filters
+    to documents where ``closed_at`` does not exist.
+    """
+    docs = (
+        db[COLL_TRADES]
+        .find({"closed_at": {"$exists": False}})
+        .sort("opened_at", -1)
+        .limit(limit)
+    )
     return [Trade.from_doc(d) for d in docs]
 
 
 def get_closed_trades(db: Database, limit: int = 100) -> list[Trade]:
+    """
+    Return recently closed trades (result WIN, LOSS, or BLOCKED) that also
+    have a ``closed_at`` timestamp — the two conditions together prevent
+    partially-updated documents from leaking into analytics.
+    """
     docs = (
         db[COLL_TRADES]
-        .find({"result": {"$in": ["WIN", "LOSS"]}})
+        .find({
+            "result": {"$in": ["WIN", "LOSS", "BLOCKED"]},
+            "closed_at": {"$exists": True},
+        })
         .sort("closed_at", -1)
         .limit(limit)
     )
@@ -87,8 +144,30 @@ get_recent_closed_trades = get_recent_closed_trades_for_strategy
 
 
 def get_stats(db: Database) -> dict:
+    """
+    Compute aggregate trading statistics.
+
+    Returns:
+        Dict with keys:
+        - ``total_trades``, ``wins``, ``losses``, ``win_rate`` (decimal 0–1),
+          ``profit_factor``, ``total_pnl``, ``max_drawdown``, ``avg_rr``
+        - ``today_pnl`` — sum of PnL for trades closed today (UTC)
+        - ``today_trades`` — count of trades *opened* today (UTC)
+        - ``open_trades`` — count of trades currently open (no ``closed_at``)
+    """
     trades = get_closed_trades(db, 1000)
+
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
     if not trades:
+        # Still compute today/open counts even with no closed trades
+        today_pnl = 0.0
+        today_trades = db[COLL_TRADES].count_documents({
+            "opened_at": {"$gte": today_start},
+        })
+        open_trades = db[COLL_TRADES].count_documents({"closed_at": {"$exists": False}})
         return {
             "total_trades": 0,
             "wins": 0,
@@ -98,17 +177,23 @@ def get_stats(db: Database) -> dict:
             "total_pnl": 0.0,
             "max_drawdown": 0.0,
             "avg_rr": 0.0,
+            "today_pnl": today_pnl,
+            "today_trades": today_trades,
+            "open_trades": open_trades,
         }
+
     wins = [t for t in trades if t.result == "WIN"]
     losses = [t for t in trades if t.result == "LOSS"]
     gross_profit = sum(t.pnl or 0 for t in wins)
     gross_loss = abs(sum(t.pnl or 0 for t in losses))
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 999.0
+
     cumulative, peak, max_drawdown = 0.0, 0.0, 0.0
     for t in reversed(trades):
         cumulative += t.pnl or 0
         peak = max(peak, cumulative)
         max_drawdown = max(max_drawdown, peak - cumulative)
+
     rr_values = []
     for t in trades:
         if t.entry_price and t.stop_loss and t.take_profit:
@@ -117,15 +202,38 @@ def get_stats(db: Database) -> dict:
             if risk > 0:
                 rr_values.append(reward / risk)
     avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0.0
+
+    # Today's PnL — only trades with closed_at >= today UTC midnight
+    today_pnl = sum(
+        (t.pnl or 0)
+        for t in trades
+        if t.closed_at and (
+            t.closed_at if t.closed_at.tzinfo
+            else t.closed_at.replace(tzinfo=timezone.utc)
+        ) >= today_start
+    )
+
+    # Today's opened trade count (open + closed that started today)
+    today_trades = db[COLL_TRADES].count_documents({
+        "opened_at": {"$gte": today_start},
+    })
+
+    # Currently open positions
+    open_trades = db[COLL_TRADES].count_documents({"closed_at": {"$exists": False}})
+
     return {
         "total_trades": len(trades),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate": round((len(wins) / len(trades)) * 100, 2),
+        # win_rate as decimal (0.0–1.0) so the frontend multiplies by 100
+        "win_rate": round(len(wins) / len(trades), 4) if trades else 0.0,
         "profit_factor": round(profit_factor, 3),
         "total_pnl": round(sum(t.pnl or 0 for t in trades), 4),
         "max_drawdown": round(max_drawdown, 4),
         "avg_rr": round(avg_rr, 2),
+        "today_pnl": round(today_pnl, 4),
+        "today_trades": today_trades,
+        "open_trades": open_trades,
     }
 
 
@@ -563,6 +671,7 @@ def seed_default_settings(db: Database) -> None:
         "global_context_interval_minutes": "30",
         "news_analysis_system_prompt": "",
         "global_market_context": "{}",
+        "news_trade_learning_window_hours": "4",
     }
 
     # ── Backtest engine ────────────────────────────────────────────────────

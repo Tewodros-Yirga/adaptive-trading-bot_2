@@ -1,3 +1,12 @@
+"""
+News router — exposes news fetching, sentiment analysis, bias queries, and
+real-time trade-learning analytics to the frontend.
+
+Model 2 additions:
+  - GET  /news/source-credibility        — per-source credibility scores
+  - GET  /news/trade-impact-timeline     — trade↔news correlation timeline
+  - POST /news/learn-now                 — manual batch learning trigger
+"""
 from datetime import datetime, timedelta, timezone
 import math
 
@@ -8,13 +17,16 @@ from .. import crud
 from ..auth_deps import require_write_access
 from ..db import get_db, COLL_NEWS_ITEMS, COLL_TRADES
 from ..models import NewsItem, Trade
+from ..schemas import NewsLearningTriggerOut
 
 from ..services.news_intelligence import (
     fetch_and_store_news,
     get_global_context,
     get_news_bias,
+    learn_from_trade,
     run_retrospective_learning,
     update_global_context,
+    update_source_credibility,
 )
 
 router = APIRouter(prefix="/news", tags=["news"])
@@ -65,7 +77,11 @@ def get_context(db: Database = Depends(get_db)):
 
 
 @router.post("/fetch")
-def trigger_fetch(body: dict | None = None, db: Database = Depends(get_db), _w=Depends(require_write_access)):
+def trigger_fetch(
+    body: dict | None = None,
+    db: Database = Depends(get_db),
+    _w=Depends(require_write_access),
+):
     symbol = (body or {}).get("symbol")
     count = fetch_and_store_news(db, symbol)
     context = update_global_context(db)
@@ -201,3 +217,163 @@ def trade_correlation(
         "best_predictions": sorted_samples[:5],
         "worst_predictions": sorted_samples[-5:][::-1],
     }
+
+
+# ── Model 2 new endpoints ──────────────────────────────────────────────────────
+
+
+@router.get("/source-credibility")
+def get_source_credibility(db: Database = Depends(get_db)):
+    """
+    Return per-source credibility scores from the ``news_source_credibility``
+    AppSetting.  Scores are 0.0–1.0; higher is more accurate.
+    Returns an empty dict if the setting has not been computed yet.
+    """
+    from .. import crud as _crud
+    raw = _crud.get_setting(db, "news_source_credibility")
+    if raw:
+        try:
+            import json as _json
+            return _json.loads(raw)
+        except Exception:
+            pass
+    return {}
+
+
+@router.get("/trade-impact-timeline")
+def trade_impact_timeline(
+    symbol: str = Query(..., description="Trading symbol, e.g. XAUUSD"),
+    days: int = Query(7, ge=1, le=90, description="Look-back window in days"),
+    db: Database = Depends(get_db),
+):
+    """
+    For each closed trade in the last N days for the given symbol, find news
+    items published in the 4 hours before the trade opened and return a
+    correlation timeline.
+
+    Each entry includes the trade summary and a list of correlated news items
+    with predicted vs actual impact, direction alignment flag, and learning weight.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    news_window_hours = int(crud.get_setting(db, "news_trade_learning_window_hours") or 4)
+
+    trade_docs = list(
+        db[COLL_TRADES]
+        .find({
+            "symbol": symbol,
+            "result": {"$in": ["WIN", "LOSS"]},
+            "closed_at": {"$gte": cutoff},
+        })
+        .sort("opened_at", -1)
+        .limit(100)
+    )
+
+    timeline = []
+    for tdoc in trade_docs:
+        trade = Trade.from_doc(tdoc)
+        opened_at = trade.opened_at
+        if not opened_at:
+            continue
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+
+        window_start = opened_at - timedelta(hours=news_window_hours)
+
+        news_docs = list(
+            db[COLL_NEWS_ITEMS].find(
+                {"published_at": {"$gte": window_start, "$lte": opened_at}}
+            )
+        )
+
+        correlated_news = []
+        for ndoc in news_docs:
+            try:
+                sym_list: list[str] = __import__("json").loads(ndoc.get("symbols_mentioned") or "[]")
+            except Exception:
+                sym_list = []
+            if sym_list and symbol not in sym_list:
+                continue
+
+            ai_label = (ndoc.get("ai_sentiment_label") or "NEUTRAL").upper()
+            direction = (trade.direction or "").upper()
+            aligned = (
+                (direction == "BUY" and ai_label == "BULLISH") or
+                (direction == "SELL" and ai_label == "BEARISH")
+            )
+            correlated_news.append({
+                "headline": (ndoc.get("headline") or "")[:120],
+                "source": ndoc.get("source", "unknown"),
+                "ai_sentiment_label": ai_label,
+                "ai_sentiment_score": ndoc.get("ai_sentiment_score"),
+                "market_impact_predicted": ndoc.get("market_impact_predicted"),
+                "market_impact_actual": ndoc.get("market_impact_actual"),
+                "impact_learning_weight": ndoc.get("impact_learning_weight", 1.0),
+                "aligned_with_trade": aligned,
+            })
+
+        timeline.append({
+            "trade_id": trade.id,
+            "trade_result": trade.result,
+            "trade_pnl": round(trade.pnl or 0.0, 4),
+            "trade_direction": trade.direction,
+            "trade_opened_at": opened_at.isoformat(),
+            "news_items": correlated_news,
+        })
+
+    return timeline
+
+
+@router.post("/learn-now", response_model=NewsLearningTriggerOut)
+def learn_now(
+    db: Database = Depends(get_db),
+    _w=Depends(require_write_access),
+):
+    """
+    Manually trigger real-time learning for ALL closed trades in the last 7 days.
+
+    For each closed trade, ``learn_from_trade`` is called so that news items
+    published before the trade opened get their ``market_impact_actual`` and
+    ``impact_learning_weight`` updated.  Also re-computes source credibility.
+
+    Returns the number of updated news items and trades processed.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    trade_docs = list(
+        db[COLL_TRADES]
+        .find({
+            "result": {"$in": ["WIN", "LOSS"]},
+            "closed_at": {"$exists": True, "$gte": cutoff},
+        })
+        .sort("closed_at", -1)
+    )
+
+    total_updated = 0
+    trades_processed = 0
+
+    for tdoc in trade_docs:
+        trade = Trade.from_doc(tdoc)
+        trade_dict = {
+            "symbol": trade.symbol,
+            "direction": trade.direction,
+            "opened_at": trade.opened_at,
+            "closed_at": trade.closed_at,
+            "pnl": trade.pnl,
+            "result": trade.result,
+        }
+        try:
+            n = learn_from_trade(db, trade_dict)
+            total_updated += n
+            trades_processed += 1
+        except Exception:
+            pass
+
+    # Refresh source credibility after batch learning
+    try:
+        update_source_credibility(db)
+    except Exception:
+        pass
+
+    return NewsLearningTriggerOut(
+        updated_items=total_updated,
+        trades_processed=trades_processed,
+    )

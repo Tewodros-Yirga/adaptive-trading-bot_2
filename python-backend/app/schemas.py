@@ -426,3 +426,13 @@ class AlchemistParamsSchema(BaseModel):
     class Config:
         # Allow the model to be constructed from ORM objects or raw dicts
         from_attributes = True
+
+
+
+
+ 
+class NewsLearningTriggerOut(BaseModel):
+    """Response schema for POST /news/learn-now."""
+    updated_items: int
+    trades_processed: int
+ 

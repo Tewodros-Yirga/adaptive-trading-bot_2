@@ -23,6 +23,11 @@ Fix (confidence always 0.0):
   - The fix is in strategy_picker.py (filter to signaling strategies only before
     voting).  The orchestrator change here makes the confidence value explicit and
     always a float, which makes debugging easier and removes the implicit 0/1 cast.
+
+Model 2 changes:
+  - After `crud.log_trade(...)` creates an OPEN trade, immediately call
+    `learn_from_trade` from news_intelligence so that news items published
+    before this trade are flagged as ``trade_correlation_pending = True``.
 """
 import json
 import logging
@@ -372,7 +377,7 @@ async def process_signal(
     extra_trade_fields: dict | None = None,
 ) -> dict:
     """
-    Main orchestrator entry point (Phase 3 + Phase 4 MTF).
+    Main orchestrator entry point (Phase 3 + Phase 4 MTF + Model 2 news learning).
 
     1. Determine which active strategies require MTF data; fetch once.
     2. Gather signals from all active strategies (injecting MTF market_data
@@ -381,6 +386,8 @@ async def process_signal(
     4. Apply risk check.
     5. Place order via bridge.
     6. Log EnsembleDecision and back-fill StrategyPickerDecision.trade_id.
+    7. (Model 2) Call learn_from_trade so news items published before this
+       trade are marked as trade_correlation_pending for later learning.
 
     Confidence fix: for non-MTF strategies, signal() returns a plain string.
     We now explicitly set confidence=1.0 when a direction is present, rather
@@ -649,22 +656,9 @@ async def process_signal(
         }
 
     # ── Duplicate position awareness ───────────────────────────────────────
-    # Fetch live MT5 positions to check for existing same-direction exposure
-    # on this symbol.  Duplicates are NOT prohibited but require stricter
-    # criteria so they are only opened with genuine additional conviction:
-    #
-    #   1. Higher confidence   (duplicate_min_confidence,         default 0.75)
-    #   2. ATR price distance  (duplicate_min_price_distance_atr, default 1.0)
-    #      The new entry must be ≥ N×ATR away from the closest existing entry
-    #      — prevents pyramiding into the exact same price level.
-    #   3. Strategy agreement  (duplicate_min_strategy_count,     default 2)
-    #      At least N strategies must agree on the direction.
-    #
-    # All thresholds are configurable via AppSettings (no restart needed).
     existing_same_dir: list[dict] = []
     try:
         live_positions = bridge_client.get_positions()
-        # Normalize symbol variants (XAUUSD ↔ XAUUSDm) for comparison
         _sym_variants: set[str] = {symbol.upper()}
         _sym_u = symbol.upper()
         if _sym_u.endswith("M"):
@@ -680,7 +674,6 @@ async def process_signal(
         logger.warning("Could not fetch live positions for duplicate check: %s", _dup_exc)
 
     if existing_same_dir:
-        # Pull thresholds (configurable; safe defaults ensure stricter gate)
         dup_min_conf     = float(crud.get_setting(db, "duplicate_min_confidence")         or 0.75)
         dup_min_atr_dist = float(crud.get_setting(db, "duplicate_min_price_distance_atr") or 1.0)
         dup_min_strats   = int(  crud.get_setting(db, "duplicate_min_strategy_count")     or 2)
@@ -688,13 +681,11 @@ async def process_signal(
 
         reasons_blocked: list[str] = []
 
-        # Criterion 1 — confidence
         if resolved_confidence < dup_min_conf:
             reasons_blocked.append(
                 f"confidence {resolved_confidence:.3f} < required {dup_min_conf:.3f} for duplicate"
             )
 
-        # Criterion 2 — price distance from the nearest existing entry
         min_price_dist = min(
             abs(price - float(p.get("openPrice", price)))
             for p in existing_same_dir
@@ -706,7 +697,6 @@ async def process_signal(
                 f"({required_dist:.5f}) — too close to existing entry"
             )
 
-        # Criterion 3 — strategy agreement count
         agreeing_count = sum(
             1 for s in signal_dicts
             if s.get("direction") == final_direction and float(s.get("confidence") or 0) > 0
@@ -753,7 +743,6 @@ async def process_signal(
                 "ensemble_decision_id": _dup_decision.id,
             }
 
-        # All criteria met — proceed, but make it explicit in logs
         logger.info(
             "[DuplicateGuard] INTENTIONAL DUPLICATE approved: %s %s | "
             "confidence=%.3f (≥%.3f), price_dist=%.5f (≥%.5f), "
@@ -800,6 +789,20 @@ async def process_signal(
             **(extra_trade_fields or {}),
         },
     )
+
+    # ── Model 2: notify news intelligence of the new open trade ───────────
+    try:
+        from ..services.news_intelligence import learn_from_trade as _learn_news
+        _learn_news(db, {
+            "symbol": symbol,
+            "direction": final_direction,
+            "opened_at": datetime.utcnow(),
+            "pnl": None,
+            "result": "OPEN",
+            "closed_at": None,
+        })
+    except Exception as exc:
+        logger.warning("News learn-from-open failed: %s", exc)
 
     decision = _log_ensemble_decision(
         db, symbol, signal_dicts, ensemble_weights, final_direction, resolved_confidence,

@@ -3,6 +3,11 @@ News Intelligence Service
 Uses free APIs: NewsAPI, Alpha Vantage, Finnhub, and RSS feeds.
 Sentiment analysis uses Groq (free tier) with llama-3 as replacement for Claude API.
 Falls back to simple keyword-based scoring if no AI key is available.
+
+Model 2 additions:
+  - learn_from_trade()         — real-time learning from opened/closed trades
+  - update_source_credibility() — per-source accuracy aggregation
+  - get_news_bias()            — now weights by source credibility score
 """
 import json
 import math
@@ -304,6 +309,8 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
                 "market_impact_predicted": sentiment["market_impact_predicted"],
                 "market_impact_actual": None,
                 "impact_learning_weight": 1.0,
+                "trade_correlation_pending": False,
+                "last_learned_from_trade_at": None,
             })
             stored += 1
         except Exception as e:
@@ -313,7 +320,31 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
     return stored
 
 
+# ── Source credibility helpers ─────────────────────────────────────────────────
+
+def _load_source_credibility(db: Database) -> dict[str, float]:
+    """
+    Load the per-source credibility scores from AppSettings.
+    Returns a dict mapping source name → credibility score (0.0–1.0).
+    Defaults to an empty dict (callers should default missing keys to 1.0).
+    """
+    raw = crud.get_setting(db, "news_source_credibility")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    return {}
+
+
 def get_news_bias(db: Database, symbol: str, hours: int = 12) -> dict:
+    """
+    Compute a weighted sentiment bias for the given symbol over the past N hours.
+
+    Model 2 change: each news item's weight now incorporates the source credibility
+    score loaded from the ``news_source_credibility`` AppSetting. High-credibility
+    sources count proportionally more; missing sources default to 1.0.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     docs = list(
         db[COLL_NEWS]
@@ -324,6 +355,9 @@ def get_news_bias(db: Database, symbol: str, hours: int = 12) -> dict:
     items = docs
     if not items:
         return {"bias": 0.0, "confidence": 0.0, "item_count": 0}
+
+    # Load source credibility once for the whole batch
+    credibility_map = _load_source_credibility(db)
 
     now = datetime.now(timezone.utc)
     total_weight = 0.0
@@ -337,7 +371,16 @@ def get_news_bias(db: Database, symbol: str, hours: int = 12) -> dict:
         pub_tz = pub.replace(tzinfo=timezone.utc) if pub.tzinfo is None else pub
         age_hours = (now - pub_tz).total_seconds() / 3600
         recency_decay = math.exp(-0.15 * age_hours)
-        w = recency_decay * (item.get("impact_learning_weight") or 1.0) * (item.get("ai_confidence") or 0.5)
+
+        # Source credibility multiplier (default 1.0 for unknown sources)
+        source_cred = float(credibility_map.get(item.get("source", ""), 1.0))
+
+        w = (
+            recency_decay
+            * (item.get("impact_learning_weight") or 1.0)
+            * (item.get("ai_confidence") or 0.5)
+            * source_cred
+        )
         weighted_score += w * item["ai_sentiment_score"]
         total_weight += w
 
@@ -386,6 +429,189 @@ def run_retrospective_learning(db: Database) -> int:
         updated += 1
     return updated
 
+
+# ── Real-time trade learning (Model 2) ────────────────────────────────────────
+
+def learn_from_trade(db: Database, trade: dict) -> int:
+    """
+    Update news items in real time based on a trade event.
+
+    Call this whenever a trade is opened OR closed.  The function finds all
+    news items published within ``news_trade_learning_window_hours`` before
+    ``trade["opened_at"]`` whose ``symbols_mentioned`` contains the trade
+    symbol.
+
+    For **open** trades (no ``closed_at`` / ``pnl`` is None):
+      - Sets ``trade_correlation_pending = True`` on matching items so we
+        know to revisit them once the trade closes.
+
+    For **closed** trades (``pnl`` is not None):
+      - Computes ``impact_actual`` from the realised PnL scaled by account
+        balance (clipped to [-1, 1]).
+      - Checks direction alignment (BUY+BULLISH or SELL+BEARISH → +0.1 bonus).
+      - Updates ``market_impact_actual``, ``impact_learning_weight`` (EMA),
+        and ``last_learned_from_trade_at``.
+
+    Args:
+        db:    MongoDB database handle.
+        trade: Dict with keys: symbol, direction, opened_at, closed_at,
+               pnl, result.
+
+    Returns:
+        Count of news items updated.
+    """
+    import logging as _log
+    logger = _log.getLogger(__name__)
+
+    symbol: str = trade.get("symbol", "")
+    direction: str = (trade.get("direction") or "").upper()
+    opened_at: datetime | None = trade.get("opened_at")
+    pnl: float | None = trade.get("pnl")
+    is_closed: bool = trade.get("closed_at") is not None and pnl is not None
+
+    if not opened_at:
+        return 0
+
+    # Ensure timezone-aware
+    if isinstance(opened_at, datetime) and opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=timezone.utc)
+
+    window_hours = int(crud.get_setting(db, "news_trade_learning_window_hours") or 4)
+    window_start = opened_at - timedelta(hours=window_hours)
+
+    # Find news items in the look-back window that mention this symbol
+    docs = list(
+        db[COLL_NEWS].find(
+            {"published_at": {"$gte": window_start, "$lte": opened_at}}
+        )
+    )
+
+    # Filter by symbol in symbols_mentioned (JSON list field)
+    matching_docs = []
+    for doc in docs:
+        try:
+            sym_list: list[str] = json.loads(doc.get("symbols_mentioned") or "[]")
+        except Exception:
+            sym_list = []
+        if not sym_list or symbol in sym_list:
+            matching_docs.append(doc)
+
+    if not matching_docs:
+        return 0
+
+    updated = 0
+
+    if not is_closed:
+        # Trade just opened — mark items as pending correlation
+        for doc in matching_docs:
+            db[COLL_NEWS].update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"trade_correlation_pending": True}},
+            )
+            updated += 1
+        return updated
+
+    # Trade closed — compute actual impact and update learning weights
+    account_balance = float(crud.get_setting(db, "account_balance") or 10000.0)
+    impact_actual = max(-1.0, min(1.0, (pnl or 0.0) * 10.0 / account_balance))
+
+    now_utc = datetime.now(timezone.utc)
+
+    for doc in matching_docs:
+        predicted = doc.get("market_impact_predicted")
+        ai_label: str = (doc.get("ai_sentiment_label") or "NEUTRAL").upper()
+
+        # Direction alignment bonus
+        aligned = (
+            (direction == "BUY" and ai_label == "BULLISH") or
+            (direction == "SELL" and ai_label == "BEARISH")
+        )
+        alignment_bonus = 0.1 if aligned else 0.0
+
+        accuracy: float
+        if predicted is not None:
+            accuracy = min(1.0, (1.0 - abs(float(predicted) - impact_actual) / 2.0) + alignment_bonus)
+        else:
+            # No previous prediction — use alignment bonus only
+            accuracy = 0.5 + alignment_bonus
+
+        old_weight = float(doc.get("impact_learning_weight") or 1.0)
+        new_weight = round(0.8 * old_weight + 0.2 * accuracy, 4)
+
+        update_fields: dict = {
+            "market_impact_actual": impact_actual,
+            "impact_learning_weight": new_weight,
+            "trade_correlation_pending": False,
+            "last_learned_from_trade_at": now_utc,
+        }
+
+        try:
+            db[COLL_NEWS].update_one({"_id": doc["_id"]}, {"$set": update_fields})
+            updated += 1
+        except Exception as exc:
+            logger.warning("learn_from_trade update failed for doc %s: %s", doc.get("_id"), exc)
+
+    return updated
+
+
+def update_source_credibility(db: Database, symbol: str | None = None) -> dict:
+    """
+    Aggregate per-source accuracy from news items that have both predicted
+    and actual market impact values.
+
+    The credibility score for each source is the average accuracy across all
+    its evaluated items, where accuracy = 1 - |predicted - actual| / 2.
+
+    The result dict (source → credibility_score) is persisted to the
+    ``news_source_credibility`` AppSetting key and also returned.
+
+    Args:
+        db:     MongoDB database handle.
+        symbol: Optional — if provided, only items mentioning this symbol
+                are included (for symbol-specific credibility).  When None,
+                all evaluated items are used.
+
+    Returns:
+        Dict mapping source name → credibility score (0.0–1.0).
+    """
+    query: dict = {
+        "market_impact_predicted": {"$ne": None},
+        "market_impact_actual": {"$ne": None},
+    }
+    docs = list(db[COLL_NEWS].find(query))
+
+    # Optional symbol filter
+    if symbol:
+        filtered = []
+        for doc in docs:
+            try:
+                sym_list: list[str] = json.loads(doc.get("symbols_mentioned") or "[]")
+            except Exception:
+                sym_list = []
+            if not sym_list or symbol in sym_list:
+                filtered.append(doc)
+        docs = filtered
+
+    # Group by source
+    source_buckets: dict[str, list[float]] = {}
+    for doc in docs:
+        src = doc.get("source") or "unknown"
+        predicted = doc.get("market_impact_predicted")
+        actual = doc.get("market_impact_actual")
+        if predicted is None or actual is None:
+            continue
+        accuracy = 1.0 - abs(float(predicted) - float(actual)) / 2.0
+        source_buckets.setdefault(src, []).append(accuracy)
+
+    credibility: dict[str, float] = {}
+    for src, accuracies in source_buckets.items():
+        credibility[src] = round(sum(accuracies) / len(accuracies), 4)
+
+    crud.set_setting(db, "news_source_credibility", json.dumps(credibility))
+    return credibility
+
+
+# ── Global context helpers ─────────────────────────────────────────────────────
 
 def get_global_context(db: Database) -> dict:
     raw = crud.get_setting(db, "global_market_context")

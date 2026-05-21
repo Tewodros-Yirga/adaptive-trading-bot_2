@@ -68,10 +68,137 @@ class MT5BridgeClient:
             "simulated": False,
         }
 
-    def close_position(self, ticket: int, lot_size: float) -> dict:
+    def place_limit_order(
+        self,
+        symbol: str,
+        order_type: str,
+        volume: float,
+        price: float,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        expiration: str | None = None,
+    ) -> dict:
+        """
+        Place a pending limit or stop order on the broker.
+
+        Args:
+            symbol: Trading symbol (e.g. "XAUUSD").
+            order_type: One of "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP".
+            volume: Lot size for the order.
+            price: Trigger price for the pending order.
+            stop_loss: Optional stop-loss price.
+            take_profit: Optional take-profit price.
+            expiration: Optional ISO datetime string for order expiry.
+
+        Returns:
+            Dict with order details from the bridge (or simulated response).
+        """
+        valid_types = {"BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"}
+        if order_type not in valid_types:
+            raise ValueError(f"order_type must be one of {valid_types}, got {order_type!r}")
+
         if settings.simulation_mode:
-            return {"closed": True, "ticket": ticket, "simulated": True}
-        return self._request("POST", "/close", {"ticket": ticket, "volume": lot_size})
+            ticket = random.randint(100000, 999999)
+            return {
+                "orderId": str(ticket),
+                "symbol": symbol,
+                "order_type": order_type,
+                "volume": volume,
+                "price": price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "expiration": expiration,
+                "simulated": True,
+            }
+
+        body: dict = {
+            "symbol": symbol,
+            "type": order_type,
+            "volume": volume,
+            "price": price,
+        }
+        if stop_loss is not None:
+            body["stopLoss"] = stop_loss
+        if take_profit is not None:
+            body["takeProfit"] = take_profit
+        if expiration is not None:
+            body["expiration"] = expiration
+
+        data = self._request("POST", "/order/limit", body)
+        return {
+            "orderId": str(data.get("ticket")),
+            "symbol": data.get("symbol", symbol),
+            "order_type": data.get("type", order_type),
+            "volume": data.get("volume", volume),
+            "price": data.get("openPrice", price),
+            "stop_loss": data.get("sl", stop_loss),
+            "take_profit": data.get("tp", take_profit),
+            "expiration": expiration,
+            "simulated": False,
+        }
+
+    def close_position(self, ticket: int, lot_size: float, partial: bool = False) -> dict:
+        """
+        Close (or partially close) a live MT5 position.
+
+        Args:
+            ticket: MT5 position ticket number.
+            lot_size: Volume to close. For a full close this equals the position volume.
+            partial: If True, performs a partial close and the position remains open
+                     for the remaining volume.
+
+        Returns:
+            Dict with keys: closed, ticket, partial, closedVolume, remainVolume, simulated.
+        """
+        if settings.simulation_mode:
+            return {
+                "closed": True,
+                "ticket": ticket,
+                "partial": False,
+                "closedVolume": lot_size,
+                "remainVolume": 0.0,
+                "simulated": True,
+            }
+        data = self._request("POST", "/close", {"ticket": ticket, "volume": lot_size, "partial": partial})
+        return {
+            "closed": data.get("closed", True),
+            "ticket": ticket,
+            "partial": data.get("partial", partial),
+            "closedVolume": data.get("closedVolume", lot_size),
+            "remainVolume": data.get("remainVolume", 0.0),
+            "simulated": False,
+        }
+
+    def modify_position(
+        self,
+        ticket: int,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+    ) -> dict:
+        """
+        Modify the stop-loss and/or take-profit of an open MT5 position.
+
+        Pass ``None`` to leave a field unchanged on the broker side.
+        Pass ``0.0`` to explicitly remove SL or TP.
+
+        Args:
+            ticket: MT5 position ticket number.
+            stop_loss: New stop-loss price, or None to leave unchanged.
+            take_profit: New take-profit price, or None to leave unchanged.
+
+        Returns:
+            Dict with modification result from the bridge (or simulated response).
+        """
+        if settings.simulation_mode:
+            return {"modified": True, "ticket": ticket, "simulated": True}
+
+        payload: dict = {"ticket": ticket}
+        if stop_loss is not None:
+            payload["stopLoss"] = stop_loss
+        if take_profit is not None:
+            payload["takeProfit"] = take_profit
+
+        return self._request("POST", "/modify", payload)
 
     def get_account(self) -> dict:
         if settings.simulation_mode:
