@@ -9,25 +9,14 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .config import settings, validate_required_settings
-from .mt5_adapter import adapter
-from .schemas import CandlesRequest, CloseRequest, OrderRequest
+from .mt5_adapter import TooManyRequestsError, adapter
+from .schemas import CandlesRequest, CloseRequest, LimitOrderRequest, ModifyRequest, OrderRequest
 
 app = FastAPI(title="Adaptive MT5 Bridge")
 logger = logging.getLogger(__name__)
 
 
 async def _background_connect_loop() -> None:
-    """Proactively call ensure_connection in a thread pool every 60 s.
-
-    Starts after a 15-second grace period to let Xvfb + Wine + the RPyC server
-    come up before the first attempt. Once connected, continues polling to
-    detect and recover from disconnections.
-
-    IMPORTANT: ensure_connection() is synchronous and blocks for the full
-    mt5.initialize() timeout (up to 180s). Running it directly in an async
-    coroutine would block the event loop, freezing ALL endpoints. Use
-    asyncio.to_thread so it runs in a thread-pool worker instead.
-    """
     await asyncio.sleep(15)
     while True:
         try:
@@ -68,8 +57,6 @@ async def _peer_keepalive_loop() -> None:
 @app.on_event("startup")
 async def startup_validation() -> None:
     validate_required_settings()
-    # Kick off the background reconnect loop so the adapter connects
-    # proactively without waiting for the first HTTP request.
     asyncio.create_task(_background_connect_loop())
     asyncio.create_task(_peer_keepalive_loop())
 
@@ -80,6 +67,10 @@ def require_secret(x_bridge_secret: str = Header(default="")) -> None:
     if x_bridge_secret != settings.mt_bridge_secret:
         raise HTTPException(status_code=403, detail="Invalid bridge secret (check X-Bridge-Secret)")
 
+
+# ---------------------------------------------------------------------------
+# Health / root
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -172,7 +163,6 @@ def _wine_mt5_ipc_probe_script(
     portable: bool,
     timeout_ms: int,
 ) -> str:
-    """Python source for `wine python.exe -c` — mirrors start.sh IPC probe."""
     if not with_credentials:
         return (
             "import MetaTrader5 as mt5; "
@@ -191,13 +181,12 @@ def _wine_mt5_ipc_probe_script(
     )
 
 
+# ---------------------------------------------------------------------------
+# Debug endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/debug/mt5", dependencies=[Depends(require_secret)])
 def debug_mt5():
-    """
-    Operational debug endpoint for Render deployments.
-    Shows whether mt5linux (RPyC) port is reachable and tails relevant logs.
-    """
-
     logdir = Path(os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"))
     ready_file = logdir / "bootstrap.ready"
     failed_file = logdir / "bootstrap.failed"
@@ -273,13 +262,9 @@ def debug_mt5():
 
 @app.get("/debug/processes", dependencies=[Depends(require_secret)])
 def debug_processes():
-    """Check which Wine/MT5 processes are running inside the container."""
     import subprocess
     try:
-        ps = subprocess.run(
-            ["ps", "aux"],
-            capture_output=True, text=True, timeout=5
-        )
+        ps = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
         all_lines = ps.stdout.splitlines()
         wine_lines = [l for l in all_lines if any(
             kw in l.lower() for kw in ["wine", "terminal", "xvfb", "python", "mt5"]
@@ -291,30 +276,10 @@ def debug_processes():
 
 @app.get("/debug/mt5-ipc-test", dependencies=[Depends(require_secret)])
 def debug_mt5_ipc_test(
-    with_credentials: bool = Query(
-        True,
-        description=(
-            "If true (default), call initialize(login, password, server, timeout=…) like start.sh; "
-            "if false, bare initialize(timeout=…) only."
-        ),
-    ),
-    portable: bool | None = Query(
-        None,
-        description="If set, forces portable=True on initialize when with_credentials is true; "
-        "if omitted, uses MT5_CONTEXT_MODE==portable from the environment.",
-    ),
-    timeout_ms: int = Query(
-        60_000,
-        ge=5_000,
-        le=120_000,
-        description="mt5.initialize timeout in milliseconds (matches start.sh probe default).",
-    ),
+    with_credentials: bool = Query(True),
+    portable: bool | None = Query(None),
+    timeout_ms: int = Query(60_000, ge=5_000, le=120_000),
 ):
-    """
-    Run MetaTrader5.initialize() directly inside Wine Python (bypasses RPyC).
-    By default uses the same credentialized initialize() call as the IPC probe in start.sh.
-    Subprocess wall-clock timeout is max(95, timeout_ms // 1000 + 35) seconds.
-    """
     import subprocess
 
     python_path = Path("/opt/wine_python_exe.path")
@@ -323,8 +288,7 @@ def debug_mt5_ipc_test(
     wine_python = python_path.read_text().strip()
 
     portable_flag = (
-        portable
-        if portable is not None
+        portable if portable is not None
         else (os.environ.get("MT5_CONTEXT_MODE", "").lower() == "portable")
     )
     if with_credentials and not settings.mt_login:
@@ -367,15 +331,11 @@ def debug_mt5_ipc_test(
 
 @app.get("/debug/pipes", dependencies=[Depends(require_secret)])
 def debug_pipes():
-    """List named pipes in Wine to see if terminal64.exe has registered its IPC pipe."""
     import subprocess
     python_path = Path("/opt/wine_python_exe.path")
     wine_python = python_path.read_text().strip() if python_path.exists() else None
-    env = {**os.environ, "DISPLAY": ":99", "WINEPREFIX": "/opt/wineprefix",
-           "WINEDEBUG": "-all"}
+    env = {**os.environ, "DISPLAY": ":99", "WINEPREFIX": "/opt/wineprefix", "WINEDEBUG": "-all"}
     results = {}
-
-    # 1. List \\.\pipe\ via Wine cmd
     try:
         r = subprocess.run(
             ["wine", "cmd", "/c", "dir \\\\.\\pipe\\"],
@@ -384,8 +344,6 @@ def debug_pipes():
         results["cmd_dir_pipe"] = (r.stdout + r.stderr).strip()[-3000:]
     except Exception as exc:
         results["cmd_dir_pipe"] = f"error: {exc}"
-
-    # 2. Enumerate pipes from Python inside Wine
     if wine_python:
         script = (
             "import ctypes, ctypes.wintypes\n"
@@ -415,18 +373,15 @@ def debug_pipes():
             results["wine_python_windows"] = (r2.stdout + r2.stderr).strip()[-3000:]
         except Exception as exc:
             results["wine_python_windows"] = f"error: {exc}"
-
     return results
 
 
 @app.get("/debug/screenshot", dependencies=[Depends(require_secret)])
 def debug_screenshot():
-    """Take a screenshot of the Xvfb display and return as base64 PNG."""
     import subprocess
     import base64
     env = {**os.environ, "DISPLAY": ":99"}
     path = "/tmp/mt5-screenshot.png"
-    # Try scrot first, then ffmpeg
     for cmd in [
         ["scrot", "-z", path],
         ["ffmpeg", "-y", "-f", "x11grab", "-video_size", "1280x720",
@@ -448,6 +403,10 @@ def debug_screenshot():
     return {"error": "Neither scrot nor ffmpeg available"}
 
 
+# ---------------------------------------------------------------------------
+# Account / connection management
+# ---------------------------------------------------------------------------
+
 @app.get("/account", dependencies=[Depends(require_secret)])
 def account():
     try:
@@ -461,28 +420,129 @@ def account():
 
 @app.post("/reset", dependencies=[Depends(require_secret)])
 def reset_connection():
-    """Force the adapter to reconnect to MT5 on the next request."""
     adapter.reset_connection()
     return {"reset": True, "message": "Adapter connection reset. Next request will reconnect."}
 
+
+# ---------------------------------------------------------------------------
+# Positions
+# ---------------------------------------------------------------------------
 
 @app.get("/positions", dependencies=[Depends(require_secret)])
 def positions():
     return {"positions": adapter.positions()}
 
 
+# ---------------------------------------------------------------------------
+# Orders
+# ---------------------------------------------------------------------------
+
 @app.post("/order", dependencies=[Depends(require_secret)])
 def order(payload: OrderRequest):
+    """Place a market order (BUY or SELL at current price)."""
     side = payload.type.upper()
     if side not in {"BUY", "SELL"}:
         raise HTTPException(status_code=400, detail="type must be BUY or SELL")
-    return adapter.place_order(payload.model_dump())
+    try:
+        return adapter.place_order(payload.model_dump())
+    except TooManyRequestsError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
 
+
+@app.post("/order/limit", dependencies=[Depends(require_secret)])
+def limit_order(payload: LimitOrderRequest):
+    """
+    Place a pending limit or stop order.
+
+    **type** must be one of: `BUY_LIMIT`, `SELL_LIMIT`, `BUY_STOP`, `SELL_STOP`.
+
+    - **BUY_LIMIT** — buy when Ask drops to `price` (price < current Ask)
+    - **SELL_LIMIT** — sell when Bid rises to `price` (price > current Bid)
+    - **BUY_STOP** — buy when Ask rises to `price` (price > current Ask)
+    - **SELL_STOP** — sell when Bid drops to `price` (price < current Bid)
+
+    Optionally set `expiration` (ISO datetime) to auto-cancel the order.
+    """
+    order_type = payload.type.upper()
+    valid_types = {"BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"}
+    if order_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"type must be one of {sorted(valid_types)}")
+    try:
+        return adapter.place_limit_order(payload.model_dump())
+    except TooManyRequestsError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
+
+
+# ---------------------------------------------------------------------------
+# Close (full or partial)
+# ---------------------------------------------------------------------------
 
 @app.post("/close", dependencies=[Depends(require_secret)])
 def close(payload: CloseRequest):
-    return adapter.close_position(payload.ticket, payload.volume)
+    """
+    Close a position fully or partially.
 
+    Omit `volume` (or set to null) to close the full position.
+    Supply `volume` less than the position size for a partial close.
+    """
+    try:
+        return adapter.close_position(payload.ticket, payload.volume)
+    except TooManyRequestsError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
+
+
+# ---------------------------------------------------------------------------
+# Modify SL/TP
+# ---------------------------------------------------------------------------
+
+@app.post("/modify", dependencies=[Depends(require_secret)])
+def modify(payload: ModifyRequest):
+    """
+    Modify the stop loss and/or take profit of an open position.
+
+    - Pass `stopLoss` and/or `takeProfit` to update them.
+    - Omit a field (or pass `null`) to leave it unchanged.
+    - Pass `0.0` to remove an existing SL or TP.
+
+    Only open positions are supported; pending orders are not.
+    """
+    if payload.stopLoss is None and payload.takeProfit is None:
+        raise HTTPException(status_code=400, detail="Provide at least one of stopLoss or takeProfit")
+    try:
+        return adapter.modify_position(payload.ticket, payload.stopLoss, payload.takeProfit)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
+
+
+# ---------------------------------------------------------------------------
+# Historical data / deals
+# ---------------------------------------------------------------------------
 
 @app.get("/candles", dependencies=[Depends(require_secret)])
 def candles(payload: CandlesRequest = Depends()):
@@ -505,8 +565,6 @@ def candles(payload: CandlesRequest = Depends()):
         return {"candles": data, "count": len(data), "symbol": payload.symbol, "timeframe": payload.timeframe}
     except RuntimeError as exc:
         err_msg = str(exc)
-        # "mt5 not connected" → 503 Service Unavailable so callers know
-        # the bridge is up but MT5 terminal is not reachable (yet).
         if "not connected" in err_msg or "ipc not ready" in err_msg:
             raise HTTPException(status_code=503, detail=f"MT5 not connected: {err_msg}")
         raise HTTPException(status_code=502, detail=err_msg)
@@ -518,17 +576,6 @@ def candles(payload: CandlesRequest = Depends()):
 def deals(ticket: int, lookback_days: int = Query(default=14, ge=1, le=90)):
     """
     Fetch historical deal records for a closed MT5 position ticket.
-
-    Used by the backend position reconciler to determine the closing price
-    and PnL of trades that were closed externally (SL hit, TP hit, manual close).
-
-    Args:
-        ticket: MT5 position ticket number
-        lookback_days: how many days of deal history to search (default 14)
-
-    Returns:
-        List of deal dicts with keys: ticket, order, position_id, time, type,
-        entry, symbol, volume, price, profit, swap, commission, comment
     """
     try:
         deals_list = adapter.history_deals_get(ticket=ticket, lookback_days=lookback_days)

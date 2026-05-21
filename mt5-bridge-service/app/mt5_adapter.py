@@ -1,5 +1,6 @@
 import os
 import random
+import threading
 import time
 import re
 from typing import Any
@@ -19,12 +20,29 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# How long to wait before retrying after a failed connection attempt.
-# MT5 terminal installation can take 10-15 minutes on cold Render instances,
-# so we use a generous backoff ceiling.
+# Retry / backoff constants
 # ---------------------------------------------------------------------------
-_RETRY_BACKOFF_SECONDS = [5, 10, 20, 30, 60, 120, 180, 300]  # per attempt
-_MAX_RETRY_INTERVAL = 300  # cap: retry at most every 5 minutes
+_RETRY_BACKOFF_SECONDS = [5, 10, 20, 30, 60, 120, 180, 300]
+_MAX_RETRY_INTERVAL = 300
+
+# ---------------------------------------------------------------------------
+# Global order-send serialisation lock + rate-limit cooldown.
+#
+# Root cause of retcode 10027: multiple concurrent callers (one per bot
+# instance) each block a thread doing exponential-backoff retries, which
+# compounds the pressure on the broker's rate limiter and guarantees that
+# every caller exhausts their retries.
+#
+# Fix: serialise all order_send calls through a threading.Lock so only one
+# runs at a time, and enforce a minimum inter-order gap after any 10027 hit.
+# ---------------------------------------------------------------------------
+_ORDER_LOCK = threading.Lock()
+
+# Minimum seconds to wait between successive order_send calls after a 10027.
+# Broker docs say the window is typically 1-2 seconds; we use 3s to be safe.
+_ORDER_MIN_GAP_AFTER_10027 = float(os.environ.get("MT5_ORDER_MIN_GAP_SECONDS", "3"))
+_last_order_send_at: float = 0.0          # monotonic timestamp of last send
+_order_cooldown_until: float = 0.0        # monotonic timestamp: don't send before this
 
 
 class MT5Adapter:
@@ -35,20 +53,17 @@ class MT5Adapter:
         self._mt: Any | None = None
         self._backend: str | None = None
         self._resolved_terminal_exe: str | None = None
-        # Time-based retry tracking.
         self._connect_attempts: int = 0
-        self._next_connect_at: float = 0.0  # epoch seconds
+        self._next_connect_at: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _resolve_terminal_exe(self) -> str:
-        """
-        Resolve the MetaTrader 5 terminal executable inside the active Wine prefix.
-        Checks the sentinel file written by bootstrap first (most reliable), then
-        falls back to the configured path and a bounded filesystem search.
-        """
         if self._resolved_terminal_exe and os.path.isfile(self._resolved_terminal_exe):
             return self._resolved_terminal_exe
 
-        # 1) Check sentinel file written by bootstrap after install.
         logdir = os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs")
         sentinel_path = os.path.join(logdir, "mt5_terminal_exe.path")
         if os.path.isfile(sentinel_path):
@@ -60,13 +75,11 @@ class MT5Adapter:
             except Exception:
                 pass
 
-        # 2) Configured env var.
         configured = settings.mt_terminal_exe
         if configured and os.path.isfile(configured):
             self._resolved_terminal_exe = configured
             return configured
 
-        # 3) Derived candidates from WINEPREFIX.
         wineprefix = (os.environ.get("WINEPREFIX") or "/home/wineuser/.wineprefix").rstrip("/")
         derived_candidates = [
             os.path.join(wineprefix, "drive_c", "Program Files", "MetaTrader 5", "terminal64.exe"),
@@ -77,7 +90,6 @@ class MT5Adapter:
                 self._resolved_terminal_exe = c
                 return c
 
-        # 4) Bounded filesystem search.
         drive_c = os.path.join(wineprefix, "drive_c")
         if os.path.isdir(drive_c):
             for root, _dirs, files in os.walk(drive_c):
@@ -86,7 +98,6 @@ class MT5Adapter:
                     self._resolved_terminal_exe = resolved
                     return resolved
 
-        # Return the configured/default even if it doesn't exist yet.
         self._resolved_terminal_exe = configured or derived_candidates[0]
         return self._resolved_terminal_exe
 
@@ -111,10 +122,6 @@ class MT5Adapter:
         return "unknown"
 
     def _infer_context_mode(self) -> str:
-        """
-        Infer MT5 context mode deterministically from start.sh.
-        start.sh writes ${LOGDIR}/mt5_context.status as: mode=<...>; exe=...; args=...
-        """
         logdir = os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs")
         context_status_file = os.path.join(logdir, "mt5_context.status")
         try:
@@ -125,22 +132,14 @@ class MT5Adapter:
                     return m.group(1).strip().lower()
         except Exception:
             pass
-
         return os.environ.get("MT5_CONTEXT_MODE", "default").strip().lower()
 
     def _linux_to_windows_path(self, linux_path: str) -> str | None:
-        """
-        Convert Wine linux executable paths like:
-          /opt/wineprefix/drive_c/Program Files/MetaTrader 5/terminal64.exe
-        into:
-          C:\\Program Files\\MetaTrader 5\\terminal64.exe
-        """
         try:
             wineprefix = (os.environ.get("WINEPREFIX") or "/opt/wineprefix").rstrip("/")
             rel = linux_path
             if linux_path.startswith(wineprefix):
-                rel = linux_path[len(wineprefix) :]
-            # Expect /drive_<letter>/<path...>
+                rel = linux_path[len(wineprefix):]
             m = re.search(r"/drive_([a-zA-Z])/((?:.*)$)", rel)
             if not m:
                 return None
@@ -151,29 +150,88 @@ class MT5Adapter:
             return None
 
     def _retry_backoff(self) -> float:
-        """Return how many seconds to wait before the next connection attempt."""
         idx = min(self._connect_attempts, len(_RETRY_BACKOFF_SECONDS) - 1)
         return _RETRY_BACKOFF_SECONDS[idx]
 
-    def ensure_connection(self) -> None:
-        """
-        Attempt to connect to MT5 (native or via mt5linux RPyC).
+    # ------------------------------------------------------------------
+    # Rate-limit aware order_send wrapper
+    # ------------------------------------------------------------------
 
-        Uses time-based cooldown instead of a fixed attempt counter so that:
-        - A terminal that is still installing will be retried after each cooldown.
-        - Already-connected adapters skip the check entirely.
-        - A permanently broken setup retries at most every _MAX_RETRY_INTERVAL seconds.
+    def _order_send_with_ratelimit(self, request: dict) -> Any:
         """
+        Serialise all order_send calls through a process-level lock and
+        enforce a cooldown period after any retcode 10027 response.
+
+        This prevents concurrent callers from compounding broker rate-limit
+        pressure. With the lock, at most one order_send is in-flight at any
+        moment; after a 10027 the cooldown drains before the next attempt.
+        """
+        global _last_order_send_at, _order_cooldown_until
+
+        _RETCODE_DONE              = self._mt.TRADE_RETCODE_DONE
+        _RETCODE_TOO_MANY_REQUESTS = 10027
+        _MAX_RETRIES               = 5
+
+        with _ORDER_LOCK:
+            result = None
+            for attempt in range(_MAX_RETRIES):
+                # Honour any active cooldown before sending
+                now = time.monotonic()
+                wait = max(0.0, _order_cooldown_until - now)
+                if wait > 0:
+                    logger.info(
+                        "order_send: honouring rate-limit cooldown %.1fs before attempt %d/%d",
+                        wait, attempt + 1, _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+
+                _last_order_send_at = time.monotonic()
+                result = self._mt.order_send(request)
+
+                if result is None:
+                    raise RuntimeError(f"order_send returned None: {self._last_error_repr()}")
+
+                if result.retcode == _RETCODE_DONE:
+                    # Reset cooldown on success
+                    _order_cooldown_until = 0.0
+                    return result
+
+                if result.retcode == _RETCODE_TOO_MANY_REQUESTS:
+                    sleep_s = 5 * (2 ** attempt)   # 5 10 20 40 80
+                    # Set global cooldown so the NEXT caller also waits
+                    _order_cooldown_until = time.monotonic() + sleep_s
+                    if attempt < _MAX_RETRIES - 1:
+                        logger.warning(
+                            "order_send retcode=10027 (too many requests) — retry %d/%d in %ds",
+                            attempt + 1, _MAX_RETRIES, sleep_s,
+                        )
+                        time.sleep(sleep_s)
+                        continue
+                    raise TooManyRequestsError(
+                        f"order_send retcode=10027 after {_MAX_RETRIES} attempts — "
+                        f"broker is rate-limiting order requests"
+                    )
+
+                raise RuntimeError(
+                    f"order_send failed retcode={result.retcode} "
+                    f"(see https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes)"
+                )
+
+            # Should never reach here
+            raise RuntimeError("order_send: exhausted retries without result")
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def ensure_connection(self) -> None:
         if self.connected and self._mt is not None:
             return
 
         now = time.monotonic()
         if now < self._next_connect_at:
-            # Still in cooldown — return whatever state we have.
             return
 
-        # Reset per-attempt resolution cache so we re-check the sentinel file
-        # (bootstrap may have installed the terminal since the last attempt).
         self._resolved_terminal_exe = None
         terminal_exe = self._resolve_terminal_exe()
 
@@ -181,17 +239,12 @@ class MT5Adapter:
         backoff = min(self._retry_backoff(), _MAX_RETRY_INTERVAL)
         self._next_connect_at = now + backoff
 
-        # In deterministic pre-launch mode, fail fast until IPC probe confirms
-        # the terminal is attachable. This avoids long RPC waits on every request.
         launch_terminal_enabled = os.environ.get("MT5_LAUNCH_TERMINAL", "false").lower() == "true"
         ipc_ready_file = os.path.join(
             os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"),
             "mt5_ipc.ready",
         )
         if launch_terminal_enabled and not os.path.isfile(ipc_ready_file):
-            # Fast-fail for the first attempts to avoid blocking the event loop.
-            # After enough retries, attempt connection anyway so real MT5 errors
-            # (e.g. -10003 / -10005) surface in logs for diagnosis.
             if self._connect_attempts < 3:
                 self.connected = False
                 self.last_error = "mt5 ipc not ready yet"
@@ -200,10 +253,7 @@ class MT5Adapter:
                     raise RuntimeError(self.last_error)
                 return
 
-        # 1) Try native MetaTrader5 — Windows only.
-        #    The native package uses Windows DLLs (CreateFileMapping / named pipes)
-        #    that cannot work in a Linux process. Skip entirely on non-Windows so the
-        #    adapter proceeds immediately to the mt5linux TCP bridge (backend #2).
+        # 1) Native (Windows only)
         if os.name == "nt" and mt5_native is not None:
             try:
                 ok = mt5_native.initialize(
@@ -227,44 +277,31 @@ class MT5Adapter:
                 self.last_error = f"mt5 native initialize exception: {exc}"
                 self.last_error_class = self._classify_error_text(self.last_error)
 
-        # 2) Try mt5linux (Wine + RPyC). Expected path for Linux containers.
+        # 2) mt5linux (Linux containers)
         if mt5linux_cls is not None:
             try:
                 host_candidates: list[str] = [settings.mt5linux_host]
                 if settings.mt5linux_host.strip().lower() == "localhost":
-                    # Some environments resolve `localhost` to IPv6 (`::1`) first,
-                    # while mt5linux typically binds to IPv4 (`127.0.0.1`).
                     host_candidates.append("127.0.0.1")
 
                 last_exc: Exception | None = None
                 client = None
                 for h in host_candidates:
                     try:
-                        # Broker auth can take 60-90s on first connect from HF.
-                        # RPyC timeout must exceed this — set to 120s.
                         rpc_timeout = int(os.environ.get("MT5_RPC_TIMEOUT_SECONDS", "90"))
                         client = mt5linux_cls(host=h, port=settings.mt5linux_port, timeout=rpc_timeout)
 
-                        # Build credential kwargs.
                         creds: dict = {
                             "login": settings.mt_login,
                             "password": settings.mt_password,
                             "server": settings.mt_server,
                         }
 
-                        # When the terminal is launched in portable mode (/portable),
-                        # MetaTrader5.initialize() must also receive portable=True so it
-                        # computes the IPC pipe name from the exe directory (portable data
-                        # dir) rather than %APPDATA%\MetaQuotes\...  Without this flag,
-                        # the pipe lookup always times out with -10005.
                         context_mode = self._infer_context_mode()
                         portable_flag = context_mode == "portable"
                         if portable_flag:
                             creds["portable"] = True
-                        # ── Build-mismatch fast-fail ──────────────────────
-                        # start.sh writes a sentinel if terminal build ≠ package
-                        # build. When mismatched, initialize() blocks for 60-90s
-                        # then returns -10005 every time. Skip the wait entirely.
+
                         _mismatch_file = os.path.join(
                             os.environ.get("LOGDIR", "/tmp/mt5-logs"),
                             "build_mismatch",
@@ -285,11 +322,6 @@ class MT5Adapter:
                         ok = False
                         last_init_error = "unknown"
 
-                        # Strategy 1: bare attach — no credentials, no path.
-                        # The pre-baked AppData session should let the terminal
-                        # accept IPC without showing an authorization dialog.
-                        # This is tried first because it avoids all dialog
-                        # interactions and is fastest when the session is valid.
                         for init_attempt in range(1, 3):
                             init_kwargs: dict[str, Any] = {"timeout": 30000}
                             if portable_flag:
@@ -297,8 +329,6 @@ class MT5Adapter:
                             try:
                                 ok = client.initialize(**init_kwargs)
                             except TypeError:
-                                # Some mt5linux/meta wrapper signatures may not accept
-                                # portable for bare attach; retry without it.
                                 init_kwargs.pop("portable", None)
                                 ok = client.initialize(**init_kwargs)
                             if ok:
@@ -311,9 +341,6 @@ class MT5Adapter:
                                 continue
                             break
 
-                        # Strategy 2: credentialed (no path= to avoid second
-                        # terminal launch).  Triggers the API auth dialog;
-                        # the dismiss loop presses Return/Allow every 5 s.
                         if not ok:
                             for init_attempt in range(1, 3):
                                 ok = client.initialize(**creds, timeout=60000)
@@ -331,9 +358,6 @@ class MT5Adapter:
                             classified = self._classify_error_text(last_init_error)
                             if classified == "ipc_timeout" and context_mode in {"portable", "data_dir"}:
                                 classified = "context_mismatch_suspected"
-                            # One-time remediation: terminal_not_found (-10003) can be caused
-                            # by path/IPC naming mismatch. Retry once with an explicit
-                            # terminal executable path.
                             if classified == "terminal_not_found":
                                 terminal_windows_path = self._linux_to_windows_path(terminal_exe)
                                 if terminal_windows_path:
@@ -374,7 +398,6 @@ class MT5Adapter:
                         return
                     except Exception as exc:
                         last_exc = exc
-                        # Clean up the failed client so next attempt starts fresh.
                         try:
                             if client is not None:
                                 client.shutdown()
@@ -386,7 +409,6 @@ class MT5Adapter:
                 raise RuntimeError(f"mt5linux init failed (all hosts): {last_exc}")
             except Exception as exc:
                 self.last_error = f"mt5linux init failed: {exc}"
-                # Preserve more specific classification chosen in inner scope.
                 if self.last_error_class not in ("context_mismatch_suspected", "build_mismatch"):
                     self.last_error_class = self._classify_error_text(self.last_error)
 
@@ -395,7 +417,6 @@ class MT5Adapter:
             raise RuntimeError(self.last_error or "MT5 backend not available")
 
     def reset_connection(self) -> None:
-        """Force the adapter to reconnect on the next request (called externally if needed)."""
         self.connected = False
         self._mt = None
         self.last_error_class = None
@@ -403,26 +424,26 @@ class MT5Adapter:
         self._next_connect_at = 0.0
         self._resolved_terminal_exe = None
 
+    # ------------------------------------------------------------------
+    # Public API methods
+    # ------------------------------------------------------------------
+
     def account(self) -> dict[str, Any]:
         self.ensure_connection()
         if self._mt is None or not self.connected:
             raise RuntimeError(
                 f"mt5 not connected [{self.last_error_class or 'unknown'}]: {self.last_error or 'connection unavailable'}"
             )
-
         try:
             info = self._mt.account_info()
         except Exception as exc:
-            # Connection dropped — force reconnect on next call.
             self.connected = False
             self._mt = None
             raise RuntimeError(f"mt5 account_info exception: {exc}") from exc
-
         if info is None:
             self.connected = False
             self._mt = None
             raise RuntimeError(f"mt5 account_info failed: {self._last_error_repr()}")
-
         return {
             "balance": info.balance,
             "equity": info.equity,
@@ -436,33 +457,52 @@ class MT5Adapter:
         self.ensure_connection()
         if self._mt is None or not self.connected:
             return []
-
         try:
             rows = self._mt.positions_get()
         except Exception as exc:
             self.connected = False
             self._mt = None
             raise RuntimeError(f"mt5 positions_get exception: {exc}") from exc
-
         if rows is None:
             return []
         out = []
         for p in rows:
-            out.append(
-                {
-                    "ticket": p.ticket,
-                    "symbol": p.symbol,
-                    "type": "BUY" if p.type == 0 else "SELL",
-                    "volume": p.volume,
-                    "openPrice": p.price_open,
-                    "sl": p.sl,
-                    "tp": p.tp,
-                    "profit": p.profit,
-                }
-            )
+            out.append({
+                "ticket": p.ticket,
+                "symbol": p.symbol,
+                "type": "BUY" if p.type == 0 else "SELL",
+                "volume": p.volume,
+                "openPrice": p.price_open,
+                "sl": p.sl,
+                "tp": p.tp,
+                "profit": p.profit,
+            })
         return out
 
+    def _resolve_symbol_tick(self, symbol: str):
+        """Select symbol in Market Watch and return its tick, trying broker suffix variants."""
+        def _alt(s: str) -> str | None:
+            if s.upper().endswith("M"):
+                return s[:-1]
+            if s.upper() in {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}:
+                return s + "m"
+            return None
+
+        tick = None
+        resolved = symbol
+        for sym in [symbol] + ([_alt(symbol)] if _alt(symbol) else []):
+            try:
+                self._mt.symbol_select(sym, True)
+            except Exception:
+                pass
+            tick = self._mt.symbol_info_tick(sym)
+            if tick is not None:
+                resolved = sym
+                break
+        return tick, resolved
+
     def place_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Place a market order (BUY or SELL)."""
         self.ensure_connection()
         if self._mt is None or not self.connected:
             return {
@@ -475,31 +515,11 @@ class MT5Adapter:
                 "tp": payload["takeProfit"],
                 "warning": self.last_error,
             }
+
         symbol = payload["symbol"]
         side = payload["type"].upper()
 
-        # ── Symbol selection + variant fallback ─────────────────────────────────
-        # symbol_info_tick returns None when the symbol is not in Market Watch.
-        # symbol_select() adds it; then try the broker suffix variant (XAUUSDm).
-        def _alt(s: str) -> str | None:
-            if s.upper().endswith("M"):
-                return s[:-1]
-            if s.upper() in {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}:
-                return s + "m"
-            return None
-
-        tick = None
-        resolved_symbol = symbol
-        for sym in [symbol] + ([_alt(symbol)] if _alt(symbol) else []):
-            try:
-                self._mt.symbol_select(sym, True)
-            except Exception:
-                pass
-            tick = self._mt.symbol_info_tick(sym)
-            if tick is not None:
-                resolved_symbol = sym
-                break
-
+        tick, resolved_symbol = self._resolve_symbol_tick(symbol)
         if tick is None:
             raise RuntimeError(
                 f"symbol tick unavailable for {symbol} (also tried variant). "
@@ -523,35 +543,7 @@ class MT5Adapter:
             "type_filling": self._mt.ORDER_FILLING_IOC,
         }
 
-        _RETCODE_DONE             = self._mt.TRADE_RETCODE_DONE
-        _RETCODE_TOO_MANY_REQUESTS = 10027
-        _MAX_RETRIES = 5
-        result = None
-        for _attempt in range(_MAX_RETRIES):
-            result = self._mt.order_send(request)
-            if result is None:
-                raise RuntimeError(f"order_send returned None: {self._last_error_repr()}")
-            if result.retcode == _RETCODE_DONE:
-                break
-            if result.retcode == _RETCODE_TOO_MANY_REQUESTS:
-                if _attempt < _MAX_RETRIES - 1:
-                    _sleep = 5 * (2 ** _attempt)  # 5s, 10s, 20s, 40s, 80s
-                    logger.warning(
-                        "order_send retcode=10027 (too many requests) — retry %d/%d in %ds",
-                        _attempt + 1, _MAX_RETRIES, _sleep,
-                    )
-                    time.sleep(_sleep)
-                    continue
-                # All retries exhausted on 10027 — raise distinct error so the
-                # bridge endpoint can return HTTP 429 instead of 500.
-                raise TooManyRequestsError(
-                    f"order_send retcode=10027 after {_MAX_RETRIES} attempts — "
-                    f"broker is rate-limiting order requests"
-                )
-            raise RuntimeError(
-                f"order_send failed retcode={result.retcode} "
-                f"(see https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes)"
-            )
+        result = self._order_send_with_ratelimit(request)
         return {
             "ticket": result.order,
             "symbol": resolved_symbol,
@@ -562,7 +554,80 @@ class MT5Adapter:
             "tp": payload["takeProfit"],
         }
 
+    def place_limit_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Place a pending limit/stop order.
+
+        Supported types: BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP.
+        The order sits in the terminal until price reaches `price`, then
+        opens a position automatically.
+        """
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: {self.last_error or 'connection unavailable'}"
+            )
+
+        _TYPE_MAP = {
+            "BUY_LIMIT":  "ORDER_TYPE_BUY_LIMIT",
+            "SELL_LIMIT": "ORDER_TYPE_SELL_LIMIT",
+            "BUY_STOP":   "ORDER_TYPE_BUY_STOP",
+            "SELL_STOP":  "ORDER_TYPE_SELL_STOP",
+        }
+        order_type_str = payload["type"].upper()
+        if order_type_str not in _TYPE_MAP:
+            raise ValueError(f"type must be one of {list(_TYPE_MAP)}")
+
+        mt5_order_type = getattr(self._mt, _TYPE_MAP[order_type_str], None)
+        if mt5_order_type is None:
+            raise RuntimeError(f"MT5 adapter has no attribute {_TYPE_MAP[order_type_str]}")
+
+        symbol = payload["symbol"]
+        # Ensure symbol is in Market Watch
+        _, resolved_symbol = self._resolve_symbol_tick(symbol)
+
+        request: dict[str, Any] = {
+            "action":      self._mt.TRADE_ACTION_PENDING,
+            "symbol":      resolved_symbol,
+            "volume":      payload["volume"],
+            "type":        mt5_order_type,
+            "price":       payload["price"],
+            "sl":          payload.get("stopLoss", 0.0),
+            "tp":          payload.get("takeProfit", 0.0),
+            "deviation":   20,
+            "magic":       26042026,
+            "comment":     payload.get("comment", "adaptive-bot"),
+            "type_time":   self._mt.ORDER_TIME_GTC,
+            "type_filling": self._mt.ORDER_FILLING_IOC,
+        }
+
+        # Optional expiration
+        expiration_str = payload.get("expiration")
+        if expiration_str:
+            from datetime import datetime, timezone
+            try:
+                exp_dt = datetime.fromisoformat(expiration_str)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                request["type_time"] = self._mt.ORDER_TIME_SPECIFIED
+                request["expiration"] = int(exp_dt.timestamp())
+            except Exception as exc:
+                raise ValueError(f"Invalid expiration datetime: {expiration_str!r} — {exc}") from exc
+
+        result = self._order_send_with_ratelimit(request)
+        return {
+            "ticket":     result.order,
+            "symbol":     resolved_symbol,
+            "type":       order_type_str,
+            "volume":     payload["volume"],
+            "price":      payload["price"],
+            "sl":         payload.get("stopLoss", 0.0),
+            "tp":         payload.get("takeProfit", 0.0),
+            "expiration": payload.get("expiration"),
+        }
+
     def close_position(self, ticket: int, volume: float | None) -> dict[str, Any]:
+        """Close a position fully or partially (if volume < position volume)."""
         self.ensure_connection()
         if self._mt is None or not self.connected:
             return {"closed": True, "ticket": ticket, "warning": self.last_error}
@@ -573,9 +638,15 @@ class MT5Adapter:
         pos = positions[0]
         symbol = pos.symbol
 
+        close_volume = volume if volume is not None else pos.volume
+        if close_volume > pos.volume:
+            raise ValueError(
+                f"Requested close volume {close_volume} exceeds position volume {pos.volume}"
+            )
+        partial = close_volume < pos.volume
+
         side_close = self._mt.ORDER_TYPE_SELL if pos.type == self._mt.ORDER_TYPE_BUY else self._mt.ORDER_TYPE_BUY
 
-        # Ensure symbol is in Market Watch before tick lookup
         try:
             self._mt.symbol_select(symbol, True)
         except Exception:
@@ -584,36 +655,94 @@ class MT5Adapter:
         if tick is None:
             raise RuntimeError(f"symbol tick unavailable for {symbol}")
         price = tick.bid if side_close == self._mt.ORDER_TYPE_SELL else tick.ask
+
         req = {
-            "action": self._mt.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": volume or pos.volume,
-            "type": side_close,
-            "position": ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": 26042026,
-            "comment": "adaptive-close",
-            "type_time": self._mt.ORDER_TIME_GTC,
+            "action":       self._mt.TRADE_ACTION_DEAL,
+            "symbol":       symbol,
+            "volume":       close_volume,
+            "type":         side_close,
+            "position":     ticket,
+            "price":        price,
+            "deviation":    20,
+            "magic":        26042026,
+            "comment":      "adaptive-close",
+            "type_time":    self._mt.ORDER_TIME_GTC,
             "type_filling": self._mt.ORDER_FILLING_IOC,
         }
 
-        result = self._mt.order_send(req)
+        result = self._order_send_with_ratelimit(req)
         if result is None:
             raise RuntimeError(f"close order_send returned None: {self._last_error_repr()}")
         ok = result.retcode == self._mt.TRADE_RETCODE_DONE
-        return {"closed": ok, "ticket": ticket, "retcode": result.retcode}
+        return {
+            "closed":        ok,
+            "ticket":        ticket,
+            "retcode":       result.retcode,
+            "closedVolume":  close_volume,
+            "partial":       partial,
+            "remainVolume":  round(pos.volume - close_volume, 8) if ok and partial else 0.0,
+        }
 
-    # ── Timeframe mapping for copy_rates_range ────────────────────────────
+    def modify_position(self, ticket: int, sl: float | None, tp: float | None) -> dict[str, Any]:
+        """
+        Modify the stop loss and/or take profit of an open position.
+
+        Pass None for sl or tp to leave that value unchanged.
+        Pass 0.0 to remove an existing sl/tp.
+        """
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: {self.last_error or 'connection unavailable'}"
+            )
+
+        positions = self._mt.positions_get(ticket=ticket)
+        if not positions:
+            raise ValueError(f"Position {ticket} not found")
+        pos = positions[0]
+
+        new_sl = sl if sl is not None else pos.sl
+        new_tp = tp if tp is not None else pos.tp
+
+        request = {
+            "action":   self._mt.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol":   pos.symbol,
+            "sl":       new_sl,
+            "tp":       new_tp,
+        }
+
+        result = self._mt.order_send(request)
+        if result is None:
+            raise RuntimeError(f"modify order_send returned None: {self._last_error_repr()}")
+        ok = result.retcode == self._mt.TRADE_RETCODE_DONE
+        if not ok:
+            raise RuntimeError(
+                f"modify SL/TP failed retcode={result.retcode} "
+                f"(see https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes)"
+            )
+        return {
+            "modified": True,
+            "ticket":   ticket,
+            "symbol":   pos.symbol,
+            "sl":       new_sl,
+            "tp":       new_tp,
+            "retcode":  result.retcode,
+        }
+
+    # ------------------------------------------------------------------
+    # Historical data
+    # ------------------------------------------------------------------
+
     _TIMEFRAME_MAP: dict[str, str] = {
-        "1m": "TIMEFRAME_M1",
-        "5m": "TIMEFRAME_M5",
+        "1m":  "TIMEFRAME_M1",
+        "5m":  "TIMEFRAME_M5",
         "15m": "TIMEFRAME_M15",
         "30m": "TIMEFRAME_M30",
-        "1h": "TIMEFRAME_H1",
-        "4h": "TIMEFRAME_H4",
-        "1d": "TIMEFRAME_D1",
-        "1w": "TIMEFRAME_W1",
+        "1h":  "TIMEFRAME_H1",
+        "4h":  "TIMEFRAME_H4",
+        "1d":  "TIMEFRAME_D1",
+        "1w":  "TIMEFRAME_W1",
     }
 
     def copy_rates_range(
@@ -623,18 +752,6 @@ class MT5Adapter:
         from_date: str,
         to_date: str,
     ) -> list[dict[str, Any]]:
-        """
-        Fetch historical OHLCV candles using MT5's copy_rates_range.
-
-        Args:
-            symbol: e.g. "XAUUSD", "XAUUSDm"
-            timeframe: e.g. "1h", "4h", "1d"
-            from_date: ISO date string e.g. "2024-01-01"
-            to_date: ISO date string e.g. "2024-12-31"
-
-        Returns:
-            List of dicts with keys: datetime, open, high, low, close, volume
-        """
         from datetime import datetime, timezone
 
         self.ensure_connection()
@@ -644,32 +761,23 @@ class MT5Adapter:
                 f"{self.last_error or 'connection unavailable'}"
             )
 
-        # Resolve the MT5 timeframe constant
         tf_attr = self._TIMEFRAME_MAP.get(timeframe.lower())
         if not tf_attr:
             raise ValueError(f"Unsupported timeframe: {timeframe}. Use one of: {list(self._TIMEFRAME_MAP.keys())}")
-
         mt5_timeframe = getattr(self._mt, tf_attr, None)
         if mt5_timeframe is None:
             raise ValueError(f"MT5 adapter has no attribute {tf_attr}")
 
-        # Parse dates
         dt_from = datetime.strptime(from_date[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
         dt_to = datetime.strptime(to_date[:10], "%Y-%m-%d").replace(
             hour=23, minute=59, second=59, tzinfo=timezone.utc
         )
 
-        # Build a list of symbol names to try in order.
-        # Brokers often register gold/metals with an "m" suffix (XAUUSDm).
-        # We try the exact name supplied first, then the alternate variant.
         def _alt_symbol(s: str) -> str | None:
-            """Return the alternate broker suffix variant, or None if not applicable."""
             if s.upper().endswith("M"):
-                return s[:-1]   # XAUUSDm → XAUUSD
-            # Only add "m" for known commodity/metal pairs where brokers commonly do this
-            _candidates = {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}
-            if s.upper() in _candidates:
-                return s + "m"  # XAUUSD → XAUUSDm
+                return s[:-1]
+            if s.upper() in {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}:
+                return s + "m"
             return None
 
         symbols_to_try = [symbol]
@@ -683,17 +791,14 @@ class MT5Adapter:
 
         for sym in symbols_to_try:
             try:
-                # symbol_select is REQUIRED — copy_rates_range silently returns
-                # None for symbols not currently in the Market Watch.
                 try:
                     self._mt.symbol_select(sym, True)
                 except Exception:
-                    pass  # not fatal — some mt5linux versions don't expose this
-
+                    pass
                 rates = self._mt.copy_rates_range(sym, mt5_timeframe, dt_from, dt_to)
                 if rates is not None and (not hasattr(rates, '__len__') or len(rates) > 0):
                     used_symbol = sym
-                    break  # success
+                    break
                 last_error = f"copy_rates_range returned no data for {sym} {timeframe}"
                 rates = None
             except Exception as exc:
@@ -703,47 +808,27 @@ class MT5Adapter:
 
         if rates is None or (hasattr(rates, '__len__') and len(rates) == 0):
             tried = " / ".join(symbols_to_try)
-            raise RuntimeError(
-                last_error or f"copy_rates_range returned no data for {tried} {timeframe}"
-            )
+            raise RuntimeError(last_error or f"copy_rates_range returned no data for {tried} {timeframe}")
 
         logger.debug("copy_rates_range: using symbol %r (%d bars)", used_symbol, len(rates))
 
         candles: list[dict[str, Any]] = []
         for r in rates:
-            # rates is a numpy structured array with fields:
-            # time, open, high, low, close, tick_volume, spread, real_volume
             try:
                 ts = int(r[0]) if not hasattr(r, 'time') else int(r.time)
                 candles.append({
                     "datetime": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-                    "open": float(r[1]) if not hasattr(r, 'open') else float(r.open),
-                    "high": float(r[2]) if not hasattr(r, 'high') else float(r.high),
-                    "low": float(r[3]) if not hasattr(r, 'low') else float(r.low),
-                    "close": float(r[4]) if not hasattr(r, 'close') else float(r.close),
-                    "volume": float(r[5]) if not hasattr(r, 'tick_volume') else float(r.tick_volume),
+                    "open":     float(r[1]) if not hasattr(r, 'open')       else float(r.open),
+                    "high":     float(r[2]) if not hasattr(r, 'high')       else float(r.high),
+                    "low":      float(r[3]) if not hasattr(r, 'low')        else float(r.low),
+                    "close":    float(r[4]) if not hasattr(r, 'close')      else float(r.close),
+                    "volume":   float(r[5]) if not hasattr(r, 'tick_volume') else float(r.tick_volume),
                 })
             except (IndexError, ValueError, TypeError):
                 continue
-
         return candles
 
-    def history_deals_get(
-        self,
-        ticket: int,
-        lookback_days: int = 7,
-    ) -> list[dict]:
-        """
-        Fetch closed deals for a given position ticket from MT5 deal history.
-
-        Uses history_deals_get(position=ticket) to find the closing deal.
-        Falls back to a date-range search over the last `lookback_days` days
-        if the positional lookup returns nothing.
-
-        Returns a list of dicts with keys:
-            ticket, order, position_id, time, type, entry, symbol,
-            volume, price, profit, swap, commission, comment
-        """
+    def history_deals_get(self, ticket: int, lookback_days: int = 7) -> list[dict]:
         from datetime import datetime, timedelta, timezone
 
         self.ensure_connection()
@@ -753,26 +838,20 @@ class MT5Adapter:
                 f"{self.last_error or 'connection unavailable'}"
             )
 
-        # Primary: look up by position id
         try:
             deals = self._mt.history_deals_get(position=ticket)
         except Exception as exc:
             raise RuntimeError(f"history_deals_get(position={ticket}) failed: {exc}") from exc
 
         if deals is None or (hasattr(deals, '__len__') and len(deals) == 0):
-            # Fallback: date-range search for the past N days
             dt_from = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-            dt_to   = datetime.now(timezone.utc)
+            dt_to = datetime.now(timezone.utc)
             try:
                 deals = self._mt.history_deals_get(dt_from, dt_to)
             except Exception as exc:
                 raise RuntimeError(f"history_deals_get(date_range) failed: {exc}") from exc
-            # Filter to our position ticket
             if deals is not None and hasattr(deals, '__len__'):
-                deals = [
-                    d for d in deals
-                    if getattr(d, 'position_id', None) == ticket
-                ]
+                deals = [d for d in deals if getattr(d, 'position_id', None) == ticket]
             else:
                 deals = []
 
@@ -794,7 +873,7 @@ class MT5Adapter:
                     "price":       float(getattr(d, 'price',     0.0)),
                     "profit":      float(getattr(d, 'profit',    0.0)),
                     "swap":        float(getattr(d, 'swap',      0.0)),
-                    "commission":  float(getattr(d, 'commission',0.0)),
+                    "commission":  float(getattr(d, 'commission', 0.0)),
                     "comment":     str(getattr(d, 'comment',    '')),
                 })
             except Exception:

@@ -10,9 +10,29 @@ class OrderRequest(BaseModel):
     comment: str | None = "adaptive-bot"
 
 
+class LimitOrderRequest(BaseModel):
+    symbol: str
+    type: str = Field(description="BUY_LIMIT, SELL_LIMIT, BUY_STOP, or SELL_STOP")
+    volume: float
+    price: float = Field(description="Pending order trigger price")
+    stopLoss: float = 0.0
+    takeProfit: float = 0.0
+    comment: str | None = "adaptive-bot"
+    expiration: str | None = Field(
+        default=None,
+        description="Optional expiration datetime ISO string e.g. 2024-06-01T12:00:00"
+    )
+
+
 class CloseRequest(BaseModel):
     ticket: int
     volume: float | None = None
+
+
+class ModifyRequest(BaseModel):
+    ticket: int
+    stopLoss: float | None = Field(default=None, description="New stop loss; omit to leave unchanged")
+    takeProfit: float | None = Field(default=None, description="New take profit; omit to leave unchanged")
 
 
 class CandlesRequest(BaseModel):
