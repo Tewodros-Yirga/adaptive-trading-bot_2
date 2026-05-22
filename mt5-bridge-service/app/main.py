@@ -68,7 +68,7 @@ def require_secret(x_bridge_secret: str = Header(default="")) -> None:
     if x_bridge_secret != settings.mt_bridge_secret:
         raise HTTPException(status_code=403, detail="Invalid bridge secret (check X-Bridge-Secret)")
 
-from .position_stream import router as stream_router
+from .bridge_position_stream import router as stream_router
 app.include_router(stream_router, dependencies=[Depends(require_secret)])
 # ---------------------------------------------------------------------------
 # Health / root
