@@ -109,8 +109,15 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(_position_reconciliation_loop()))
     logger.info("Started position reconciliation loop.")
 
+     # ── 11. Start position stream (5-second bridge poll, push WS events) ──────
+    from .services.position_stream import start_position_stream
+    bg_tasks.append(asyncio.create_task(start_position_stream()))
+    logger.info("Started position stream.")
+
     logger.info("Application startup complete.")
     yield
+
+   
 
     # ── Shutdown ──────────────────────────────────────────────────────────
     for task in bg_tasks:
@@ -351,45 +358,55 @@ async def _live_trading_loop():
 
 async def _position_reconciliation_loop():
     """
-    Position reconciliation background loop.
-
-    Every `position_reconciliation_interval_seconds` (default 60s):
-      1. Fetch live MT5 positions via the bridge.
-      2. Compare against MongoDB open trades that have mt5_ticket set.
-      3. For any DB-open trade NOT in MT5 live positions (ghost trade):
-         - Fetch deal history to get close price + PnL.
-         - Mark the trade as WIN/LOSS in MongoDB via crud.close_trade().
-
-    Skips gracefully if the bridge is unreachable — never crashes the loop.
-    Runs in a thread executor because bridge_client uses synchronous httpx.
+    Position reconciliation safety-net loop.
+ 
+    The position_stream service detects and handles real-time close events.
+    This loop is the fallback — it runs every 120 seconds and catches any
+    ghost trades that the stream missed (e.g. during a bridge outage).
+ 
+    Skips polling when the circuit breaker is OPEN so it never contributes
+    to the "read operation timed out" log flood.
     """
-    # Initial delay: let the live trading loop and bridge warm up first.
-    await asyncio.sleep(90)
-
+    # Give the bridge and position_stream time to warm up
+    await asyncio.sleep(120)
+ 
     while True:
-        interval = 60  # default
+        interval = 120  # default — can be overridden via AppSetting
         try:
+            from .services.bridge_client import bridge_client as _bridge_client
+ 
+            # Skip entirely when circuit breaker is open
+            if not _bridge_client.is_available:
+                await asyncio.sleep(interval)
+                continue
+ 
             db = get_database()
             from . import crud as _crud
             interval = float(
-                _crud.get_setting(db, "position_reconciliation_interval_seconds") or 60
+                _crud.get_setting(db, "position_reconciliation_interval_seconds") or 120
             )
-
+ 
             from .services.position_reconciler import reconcile_positions
             loop = asyncio.get_event_loop()
             summary = await loop.run_in_executor(None, reconcile_positions, db)
-
-            if summary.get("ghost_found", 0) > 0:
+ 
+            # Only log when something was found — avoids noisy "0 ghost" lines
+            if summary.get("ghost_found", 0) > 0 or summary.get("errors", 0) > 0:
                 logger.info(
-                    "Reconciliation complete: checked=%d ghost=%d closed=%d no_data=%d errors=%d",
-                    summary["checked"], summary["ghost_found"],
-                    summary["closed"], summary["no_deal_data"], summary["errors"],
+                    "Reconciliation: checked=%d ghost=%d closed=%d "
+                    "no_data=%d ticket_matched=%d errors=%d",
+                    summary["checked"],
+                    summary["ghost_found"],
+                    summary["closed"],
+                    summary["no_deal_data"],
+                    summary.get("ticket_matched", 0),
+                    summary["errors"],
                 )
+ 
         except Exception as exc:
             logger.warning("Position reconciliation loop error: %s", exc)
-
+ 
         await asyncio.sleep(interval)
-
 
 # ── API key guard for webhook (machine-to-machine) ────────────────────────────
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)

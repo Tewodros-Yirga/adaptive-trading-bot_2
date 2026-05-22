@@ -1,36 +1,178 @@
+"""
+services/bridge_client.py — MT5 bridge HTTP client with circuit breaker.
+
+Circuit breaker states
+----------------------
+CLOSED  — normal operation; all requests pass through.
+OPEN    — bridge is down; fast-fail with BridgeUnavailableError for
+          `_cb_timeout_secs` seconds so background loops don't pile up.
+HALF    — after the open window expires, one probe request is allowed;
+          success → CLOSED, failure → OPEN again.
+
+This prevents the log flood of "The read operation timed out" that occurs
+when the HuggingFace Space is sleeping or restarting.
+"""
 import random
+import threading
+import time
+import logging
+
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from ..config import settings
 
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class BridgeUnavailableError(RuntimeError):
+    """Raised by the circuit breaker when the bridge is known to be down."""
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+class _CircuitBreaker:
+    """
+    Thread-safe circuit breaker.
+
+    open_threshold  — consecutive failures before opening the circuit.
+    timeout_secs    — seconds to wait in OPEN state before probing again.
+    """
+
+    _CLOSED = "CLOSED"
+    _OPEN   = "OPEN"
+    _HALF   = "HALF"
+
+    def __init__(self, open_threshold: int = 3, timeout_secs: float = 30.0):
+        self._state = self._CLOSED
+        self._failures = 0
+        self._opened_at: float = 0.0
+        self._threshold = open_threshold
+        self._timeout = timeout_secs
+        self._lock = threading.Lock()
+
+    # Public helpers ---------------------------------------------------
+
+    def allow(self) -> bool:
+        """Return True if the request should be attempted."""
+        with self._lock:
+            if self._state == self._CLOSED:
+                return True
+            if self._state == self._OPEN:
+                if time.monotonic() - self._opened_at >= self._timeout:
+                    self._state = self._HALF
+                    return True          # probe attempt
+                return False
+            # HALF — allow the probe
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            if self._state != self._CLOSED:
+                logger.info("Bridge circuit breaker → CLOSED (recovered)")
+            self._state = self._CLOSED
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._state == self._HALF or self._failures >= self._threshold:
+                if self._state != self._OPEN:
+                    logger.warning(
+                        "Bridge circuit breaker → OPEN (failures=%d); "
+                        "fast-failing for %.0fs",
+                        self._failures, self._timeout,
+                    )
+                self._state  = self._OPEN
+                self._opened_at = time.monotonic()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+
+# ---------------------------------------------------------------------------
+# Retry predicate (only retry on transient network errors, not timeouts)
+# ---------------------------------------------------------------------------
 
 def _is_retryable_error(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (502, 503, 504)
-    return isinstance(exc, (httpx.TimeoutException, httpx.RemoteProtocolError, httpx.ConnectError))
+    # Do NOT retry on ReadTimeout — the circuit breaker handles repeated failures
+    return isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError))
 
+
+# ---------------------------------------------------------------------------
+# Main client
+# ---------------------------------------------------------------------------
 
 class MT5BridgeClient:
     def __init__(self) -> None:
-        headers = {"Content-Type": "application/json", "X-Bridge-Secret": settings.mt_bridge_secret}
+        headers = {
+            "Content-Type": "application/json",
+            "X-Bridge-Secret": settings.mt_bridge_secret,
+        }
         if settings.mt_bridge_hf_token:
             headers["Authorization"] = f"Bearer {settings.mt_bridge_hf_token}"
+
+        # Short timeout for account/positions — these must not block the event loop
         self._client = httpx.Client(
             base_url=settings.mt_bridge_url,
-            timeout=10.0,
+            timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=2.0),
             headers=headers,
         )
+        # Longer timeout for candle fetches (months of 15m data is slow)
         self._candle_client = httpx.Client(
             base_url=settings.mt_bridge_url,
             timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=5.0),
             headers=headers,
         )
 
-    @retry(retry=retry_if_exception(_is_retryable_error), wait=wait_exponential(multiplier=0.5, min=0.5, max=3), stop=stop_after_attempt(3), reraise=True)
+        # Circuit breaker — opens after 3 consecutive failures, probes after 30 s
+        self._cb = _CircuitBreaker(open_threshold=3, timeout_secs=30.0)
+
+        # Last known positions cache (used when circuit is OPEN)
+        self._cached_positions: list[dict] = []
+        self._cached_account: dict = {}
+        self._cache_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Internal request helper (with circuit breaker)
+    # ------------------------------------------------------------------
+
+    @retry(
+        retry=retry_if_exception(_is_retryable_error),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=3),
+        stop=stop_after_attempt(2),   # reduced — CB handles sustained failures
+        reraise=True,
+    )
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        response = self._client.request(method, path, json=payload)
-        response.raise_for_status()
-        return response.json()
+        if not self._cb.allow():
+            raise BridgeUnavailableError(
+                f"Bridge circuit breaker is OPEN — skipping request to {path}"
+            )
+        try:
+            response = self._client.request(method, path, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            self._cb.record_success()
+            return result
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            self._cb.record_failure()
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (502, 503, 504):
+                self._cb.record_failure()
+            raise
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def place_order(self, payload: dict) -> dict:
         if settings.simulation_mode:
@@ -78,21 +220,6 @@ class MT5BridgeClient:
         take_profit: float | None = None,
         expiration: str | None = None,
     ) -> dict:
-        """
-        Place a pending limit or stop order on the broker.
-
-        Args:
-            symbol: Trading symbol (e.g. "XAUUSD").
-            order_type: One of "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP".
-            volume: Lot size for the order.
-            price: Trigger price for the pending order.
-            stop_loss: Optional stop-loss price.
-            take_profit: Optional take-profit price.
-            expiration: Optional ISO datetime string for order expiry.
-
-        Returns:
-            Dict with order details from the bridge (or simulated response).
-        """
         valid_types = {"BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"}
         if order_type not in valid_types:
             raise ValueError(f"order_type must be one of {valid_types}, got {order_type!r}")
@@ -111,12 +238,7 @@ class MT5BridgeClient:
                 "simulated": True,
             }
 
-        body: dict = {
-            "symbol": symbol,
-            "type": order_type,
-            "volume": volume,
-            "price": price,
-        }
+        body: dict = {"symbol": symbol, "type": order_type, "volume": volume, "price": price}
         if stop_loss is not None:
             body["stopLoss"] = stop_loss
         if take_profit is not None:
@@ -138,18 +260,6 @@ class MT5BridgeClient:
         }
 
     def close_position(self, ticket: int, lot_size: float, partial: bool = False) -> dict:
-        """
-        Close (or partially close) a live MT5 position.
-
-        Args:
-            ticket: MT5 position ticket number.
-            lot_size: Volume to close. For a full close this equals the position volume.
-            partial: If True, performs a partial close and the position remains open
-                     for the remaining volume.
-
-        Returns:
-            Dict with keys: closed, ticket, partial, closedVolume, remainVolume, simulated.
-        """
         if settings.simulation_mode:
             return {
                 "closed": True,
@@ -159,7 +269,9 @@ class MT5BridgeClient:
                 "remainVolume": 0.0,
                 "simulated": True,
             }
-        data = self._request("POST", "/close", {"ticket": ticket, "volume": lot_size, "partial": partial})
+        data = self._request(
+            "POST", "/close", {"ticket": ticket, "volume": lot_size, "partial": partial}
+        )
         return {
             "closed": data.get("closed", True),
             "ticket": ticket,
@@ -175,20 +287,6 @@ class MT5BridgeClient:
         stop_loss: float | None = None,
         take_profit: float | None = None,
     ) -> dict:
-        """
-        Modify the stop-loss and/or take-profit of an open MT5 position.
-
-        Pass ``None`` to leave a field unchanged on the broker side.
-        Pass ``0.0`` to explicitly remove SL or TP.
-
-        Args:
-            ticket: MT5 position ticket number.
-            stop_loss: New stop-loss price, or None to leave unchanged.
-            take_profit: New take-profit price, or None to leave unchanged.
-
-        Returns:
-            Dict with modification result from the bridge (or simulated response).
-        """
         if settings.simulation_mode:
             return {"modified": True, "ticket": ticket, "simulated": True}
 
@@ -202,20 +300,39 @@ class MT5BridgeClient:
 
     def get_account(self) -> dict:
         if settings.simulation_mode:
-            return {"balance": 10000, "equity": 10000, "margin": 0, "freeMargin": 10000, "mode": "SIMULATION"}
-        return self._request("GET", "/account")
+            return {
+                "balance": 10000, "equity": 10000,
+                "margin": 0, "freeMargin": 10000, "mode": "SIMULATION",
+            }
+        try:
+            result = self._request("GET", "/account")
+            with self._cache_lock:
+                self._cached_account = result
+            return result
+        except BridgeUnavailableError:
+            with self._cache_lock:
+                if self._cached_account:
+                    logger.debug("Bridge OPEN — returning cached account data")
+                    return {**self._cached_account, "cached": True}
+            raise
 
     def get_positions(self) -> list:
         if settings.simulation_mode:
             return []
-        data = self._request("GET", "/positions")
-        return data.get("positions", data)
+        try:
+            data = self._request("GET", "/positions")
+            positions = data.get("positions", data) if isinstance(data, dict) else data
+            with self._cache_lock:
+                self._cached_positions = positions
+            return positions
+        except BridgeUnavailableError:
+            with self._cache_lock:
+                if self._cached_positions:
+                    logger.debug("Bridge OPEN — returning cached positions")
+                    return self._cached_positions
+            raise
 
     def get_deals(self, ticket: int, lookback_days: int = 14) -> list[dict]:
-        """
-        Fetch historical deal records for a closed MT5 position ticket.
-        Returns empty list on error (non-fatal for reconciliation purposes).
-        """
         if settings.simulation_mode:
             return []
         try:
@@ -232,12 +349,6 @@ class MT5BridgeClient:
         to_date: str,
         max_retries: int = 3,
     ) -> list[dict]:
-        """
-        Fetch OHLCV candle data from the MT5 bridge.
-        Uses a 120-second read timeout (fetching months of 15m bars is slow).
-        Retries up to max_retries times on transient 5xx/connection errors.
-        """
-        import time as _time
         last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
@@ -255,14 +366,22 @@ class MT5BridgeClient:
                 return data.get("candles", data) if isinstance(data, dict) else data
             except (httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
                 last_exc = exc
-                _time.sleep(2 ** attempt)   # 1s, 2s, 4s
+                time.sleep(2 ** attempt)
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in (502, 503, 504):  # 503 = MT5 not connected yet
+                if exc.response.status_code in (502, 503, 504):
                     last_exc = exc
-                    _time.sleep(2 ** attempt)
+                    time.sleep(2 ** attempt)
                 else:
-                    raise  # 4xx errors — don't retry
+                    raise
         raise last_exc or RuntimeError(f"get_candles failed after {max_retries} attempts")
+
+    @property
+    def circuit_state(self) -> str:
+        return self._cb.state
+
+    @property
+    def is_available(self) -> bool:
+        return self._cb.allow()
 
 
 bridge_client = MT5BridgeClient()

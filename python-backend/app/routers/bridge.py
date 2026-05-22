@@ -1,18 +1,97 @@
 """
 Bridge router — MT5 bridge account and position data.
+
+GET /bridge/account   — account balance/equity (cached when bridge is down)
+GET /bridge/positions — live positions (cached when bridge is down)
+GET /bridge/status    — circuit breaker state + last-known position count
 """
-from fastapi import APIRouter
+import logging
 
-from ..services.bridge_client import bridge_client
+from fastapi import APIRouter, HTTPException
+import httpx
 
+from ..services.bridge_client import bridge_client, BridgeUnavailableError
+
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/bridge", tags=["bridge"])
+
+
+def _bridge_error_response(exc: Exception, endpoint: str) -> None:
+    """Convert bridge errors to meaningful HTTP responses instead of 500."""
+    msg = str(exc)
+    if isinstance(exc, BridgeUnavailableError):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "bridge_unavailable",
+                "message": "MT5 bridge is temporarily unreachable (circuit breaker open)",
+                "circuit_state": bridge_client.circuit_state,
+            },
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "bridge_timeout",
+                "message": f"MT5 bridge timed out on {endpoint}",
+            },
+        )
+    raise HTTPException(
+        status_code=502,
+        detail={"error": "bridge_error", "message": msg},
+    )
 
 
 @router.get("/account")
 def get_account():
-    return bridge_client.get_account()
+    try:
+        return bridge_client.get_account()
+    except Exception as exc:
+        _bridge_error_response(exc, "/account")
 
 
 @router.get("/positions")
 def get_positions():
-    return bridge_client.get_positions()
+    try:
+        return bridge_client.get_positions()
+    except Exception as exc:
+        _bridge_error_response(exc, "/positions")
+
+
+@router.get("/status")
+def get_bridge_status():
+    """
+    Returns circuit breaker state and last-known position snapshot.
+    Always succeeds — useful for the frontend to show bridge health.
+    """
+    circuit = bridge_client.circuit_state
+    account: dict = {}
+    positions: list = []
+
+    if bridge_client.is_available:
+        try:
+            account = bridge_client.get_account()
+        except Exception:
+            pass
+        try:
+            positions = bridge_client.get_positions()
+        except Exception:
+            pass
+    else:
+        # Return cached data from the client's internal cache
+        try:
+            account = bridge_client.get_account()   # returns cached on OPEN
+        except Exception:
+            pass
+        try:
+            positions = bridge_client.get_positions()  # returns cached on OPEN
+        except Exception:
+            pass
+
+    return {
+        "circuit_state": circuit,
+        "bridge_available": circuit != "OPEN",
+        "account": account,
+        "open_positions": len(positions),
+        "positions": positions,
+    }
