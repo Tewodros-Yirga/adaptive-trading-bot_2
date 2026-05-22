@@ -1,381 +1,173 @@
 """
-services/position_stream.py — Position Status Streaming Service
+bridge/position_stream.py — Server-Sent Events endpoint for the MT5 bridge.
 
-Polls the MT5 bridge every POLL_INTERVAL seconds and compares against the
-previous snapshot to detect:
+Mount this router on the bridge FastAPI app:
 
-  - NEW positions opened (by MT5 directly or by the bot)
-  - CLOSED positions (TP/SL hit, manual close, margin call)
-  - PARTIAL closes (volume decreased since last snapshot)
-  - MODIFIED positions (SL/TP changed)
+    from .position_stream import router as stream_router
+    app.include_router(stream_router)
 
-On each detected event:
-  1. Broadcasts a WebSocket event to all connected frontend clients.
-  2. For CLOSE / PARTIAL events: auto-reconciles the MongoDB trade record
-     via crud.close_trade() — so trades closed by TP/SL are always reflected
-     in the DB even without the reconciler loop.
+The endpoint GET /stream/positions streams a JSON event every POLL_SECS
+containing the current list of open positions plus a diff summary.
 
-The service is resilient to bridge unavailability: when the circuit breaker
-is OPEN it skips the poll silently and tries again after the next interval.
+Clients (the backend) connect once and receive a continuous stream. If
+the backend disconnects and reconnects the bridge simply resumes from the
+current state — no history is buffered.
 
-Usage (in main.py lifespan):
-    from .services.position_stream import start_position_stream
-    bg_tasks.append(asyncio.create_task(start_position_stream()))
+This eliminates the need for the backend to poll GET /positions every
+second and reduces repeated MT5 adapter calls.
 """
-from __future__ import annotations
-
 import asyncio
+import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import AsyncIterator
+
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
-# How often to poll MT5 bridge for position changes (seconds)
-POLL_INTERVAL: float = 5.0
+# How often to emit a position snapshot (seconds)
+POLL_SECS: float = 5.0
 
-# Minimum volume change fraction to be considered a partial close
-_PARTIAL_CLOSE_THRESHOLD = 0.001
+router = APIRouter(tags=["stream"])
+
+
+def _require_secret(request: Request) -> None:
+    """Reuse the same bridge-secret auth used by other endpoints."""
+    secret = request.headers.get("X-Bridge-Secret", "")
+    from .config import settings
+    if secret != settings.mt_bridge_secret:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="Invalid bridge secret")
 
 
 def _pos_key(pos: dict) -> int:
-    """Unique identifier for a position (MT5 ticket number)."""
-    return int(pos.get("ticket") or pos.get("orderId") or 0)
+    return int(pos.get("ticket") or 0)
 
 
-def _pos_volume(pos: dict) -> float:
-    return float(pos.get("volume") or pos.get("lots") or 0.0)
-
-
-async def _broadcast(event_type: str, data: dict) -> None:
+def _positions_snapshot() -> list[dict]:
+    """Synchronously fetch positions from the MT5 adapter."""
     try:
-        from ..routers.websocket import broadcast
-        await broadcast(event_type, data)
+        from .mt5_adapter import adapter
+        return adapter.positions()
     except Exception as exc:
-        logger.debug("WebSocket broadcast failed: %s", exc)
+        logger.warning("SSE: adapter.positions() failed: %s", exc)
+        return []
 
 
-async def _reconcile_closed_trade(
-    db,
-    ticket: int,
-    pos_snapshot: dict,
-    reason: str,
-) -> None:
+async def _event_generator(request: Request) -> AsyncIterator[str]:
     """
-    Find the MongoDB trade with this mt5_ticket and close it.
-    Fetches deal history from the bridge to get exact PnL + exit price.
+    Async generator yielding SSE-formatted position snapshot events.
+
+    Each event is JSON with:
+      type: "snapshot" | "diff"
+      positions: [ ...current open positions... ]
+      opened:   [ ...tickets newly appeared since last snapshot... ]
+      closed:   [ ...tickets that disappeared since last snapshot... ]
+      modified: [ ...tickets whose volume/sl/tp changed... ]
+      ts: ISO timestamp
     """
-    from .. import crud
-    from ..db import COLL_TRADES
-    from ..services.bridge_client import bridge_client
+    prev: dict[int, dict] = {}
+    loop = asyncio.get_event_loop()
 
-    trade_doc = db[COLL_TRADES].find_one({"mt5_ticket": ticket, "closed_at": {"$exists": False}})
-    if not trade_doc:
-        # Try matching by symbol + direction if no ticket stored (webhook trades)
-        symbol = pos_snapshot.get("symbol", "")
-        direction = (pos_snapshot.get("type") or "").upper()
-        if symbol and direction:
-            trade_doc = db[COLL_TRADES].find_one(
-                {
-                    "symbol": symbol,
-                    "direction": direction,
-                    "closed_at": {"$exists": False},
-                    "result": {"$in": ["OPEN", None]},
-                }
-            )
+    # Send an initial heartbeat immediately so the client knows the connection is live
+    yield "event: connected\ndata: {}\n\n"
 
-    if not trade_doc:
-        logger.debug(
-            "position_stream: no open DB trade found for closed ticket=%d", ticket
-        )
-        return
+    while True:
+        # Respect client disconnect
+        if await request.is_disconnected():
+            logger.info("SSE /stream/positions: client disconnected")
+            return
 
-    trade_id = trade_doc["_id"]
-
-    # Try to get deal history for accurate PnL
-    pnl = 0.0
-    exit_price = float(pos_snapshot.get("openPrice") or pos_snapshot.get("price") or 0.0)
-    result = "LOSS"
-
-    try:
-        deals = bridge_client.get_deals(ticket=ticket, lookback_days=7)
-        # Find the closing deal (entry=1 means DEAL_ENTRY_OUT)
-        closing_deals = [d for d in deals if d.get("entry") == 1]
-        if closing_deals:
-            close_deal = closing_deals[-1]
-            profit = float(close_deal.get("profit") or 0.0)
-            swap = float(close_deal.get("swap") or 0.0)
-            commission = float(close_deal.get("commission") or 0.0)
-            pnl = profit + swap + commission
-            exit_price = float(close_deal.get("price") or exit_price)
-        elif deals:
-            # fallback: last deal
-            last = deals[-1]
-            pnl = float(last.get("profit") or 0.0)
-            exit_price = float(last.get("price") or exit_price)
-    except Exception as exc:
-        logger.warning("position_stream: could not fetch deals for ticket=%d: %s", ticket, exc)
-
-    result = "WIN" if pnl > 0 else "LOSS"
-
-    try:
-        crud.close_trade(
-            db,
-            trade_id=trade_id,
-            exit_price=exit_price,
-            pnl=pnl,
-            result=result,
-        )
-        logger.info(
-            "position_stream: auto-closed trade db_id=%s ticket=%d "
-            "exit=%.5f pnl=%.2f result=%s reason=%s",
-            trade_id, ticket, exit_price, pnl, result, reason,
-        )
-
-        # Trigger picker weight learning
         try:
-            from ..services.strategy_picker import update_picker_weights_from_trade
-            from ..db import COLL_STRATEGY_PICKER_DECISIONS
-            from ..models import StrategyPickerDecision, Trade
-
-            updated_doc = db[COLL_TRADES].find_one({"_id": trade_id})
-            if updated_doc:
-                trade = Trade.from_doc(updated_doc)
-                picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one({"trade_id": trade_id})
-                if picker_doc is None and trade.symbol:
-                    picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one(
-                        {"symbol": trade.symbol}, sort=[("timestamp", -1)]
-                    )
-                if picker_doc:
-                    picker_decision = StrategyPickerDecision.from_doc(picker_doc)
-                    update_picker_weights_from_trade(trade, picker_decision, db)
+            raw: list[dict] = await loop.run_in_executor(None, _positions_snapshot)
         except Exception as exc:
-            logger.debug("position_stream: picker weight update failed: %s", exc)
+            # Don't close the stream on a single poll failure
+            logger.warning("SSE poll error: %s", exc)
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+            await asyncio.sleep(POLL_SECS)
+            continue
 
-    except Exception as exc:
-        logger.error(
-            "position_stream: failed to close trade db_id=%s ticket=%d: %s",
-            trade_id, ticket, exc,
-        )
+        curr: dict[int, dict] = {_pos_key(p): p for p in raw if _pos_key(p)}
+
+        prev_keys = set(prev.keys())
+        curr_keys = set(curr.keys())
+
+        opened   = [curr[k] for k in curr_keys - prev_keys]
+        closed   = [prev[k] for k in prev_keys - curr_keys]
+        modified = []
+
+        for k in prev_keys & curr_keys:
+            old = prev[k]
+            new = curr[k]
+            # Detect volume change (partial close) or SL/TP change
+            old_vol = float(old.get("volume") or 0)
+            new_vol = float(new.get("volume") or 0)
+            if (
+                abs(old_vol - new_vol) > 0.001
+                or old.get("sl") != new.get("sl")
+                or old.get("tp") != new.get("tp")
+            ):
+                modified.append({
+                    "ticket": k,
+                    "old": old,
+                    "new": new,
+                    "volume_delta": round(old_vol - new_vol, 8),
+                })
+
+        event_type = "snapshot" if not (opened or closed or modified) else "diff"
+
+        payload = json.dumps({
+            "type": event_type,
+            "positions": list(curr.values()),
+            "opened": opened,
+            "closed": closed,
+            "modified": modified,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+
+        yield f"event: {event_type}\ndata: {payload}\n\n"
+        prev = curr
+
+        await asyncio.sleep(POLL_SECS)
 
 
-async def _handle_partial_close(
-    db,
-    ticket: int,
-    old_pos: dict,
-    new_pos: dict,
-) -> None:
+@router.get("/stream/positions", dependencies=[Depends(_require_secret)])
+async def stream_positions(request: Request) -> StreamingResponse:
     """
-    Log a partial close event. The position remains open so we just update
-    the lot_size in MongoDB and broadcast the event.
+    Server-Sent Events stream of MT5 position changes.
+
+    Connect with:
+        EventSource('/stream/positions', { headers: { 'X-Bridge-Secret': '...' } })
+
+    Events:
+        connected  — emitted once on connect
+        snapshot   — full position list when nothing changed
+        diff       — position list + opened/closed/modified arrays
+        error      — poll failure (stream stays open)
     """
-    from .. import crud
-    from ..db import COLL_TRADES
-
-    old_vol = _pos_volume(old_pos)
-    new_vol = _pos_volume(new_pos)
-    closed_vol = round(old_vol - new_vol, 8)
-
-    logger.info(
-        "position_stream: PARTIAL CLOSE ticket=%d %s → %s (closed=%.4f)",
-        ticket, old_vol, new_vol, closed_vol,
-    )
-
-    # Update lot_size in MongoDB
-    db[COLL_TRADES].update_one(
-        {"mt5_ticket": ticket, "closed_at": {"$exists": False}},
-        {"$set": {"lot_size": new_vol}},
-    )
-
-    await _broadcast(
-        "position_partial_close",
-        {
-            "ticket": ticket,
-            "symbol": new_pos.get("symbol"),
-            "direction": new_pos.get("type"),
-            "old_volume": old_vol,
-            "new_volume": new_vol,
-            "closed_volume": closed_vol,
-            "current_profit": new_pos.get("profit"),
-            "sl": new_pos.get("sl"),
-            "tp": new_pos.get("tp"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+    return StreamingResponse(
+        _event_generator(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable Nginx buffering
         },
     )
 
 
-async def _process_snapshot_diff(
-    db,
-    prev: dict[int, dict],
-    curr: dict[int, dict],
-) -> None:
+@router.get("/positions/current", dependencies=[Depends(_require_secret)])
+async def get_current_positions() -> dict:
     """
-    Compare previous and current position snapshots and emit events for
-    any changes detected.
+    Synchronous snapshot of current open positions + summary.
+    Convenience endpoint when SSE is not needed (e.g. health checks).
     """
-    prev_tickets = set(prev.keys())
-    curr_tickets = set(curr.keys())
-
-    # ── New positions ───────────────────────────────────────────────────
-    for ticket in curr_tickets - prev_tickets:
-        pos = curr[ticket]
-        logger.info(
-            "position_stream: NEW position ticket=%d %s %s %.4f @ %.5f",
-            ticket,
-            pos.get("type", "?"),
-            pos.get("symbol", "?"),
-            _pos_volume(pos),
-            float(pos.get("openPrice") or 0),
-        )
-        await _broadcast(
-            "position_opened",
-            {
-                "ticket": ticket,
-                "symbol": pos.get("symbol"),
-                "direction": pos.get("type"),
-                "volume": _pos_volume(pos),
-                "open_price": pos.get("openPrice"),
-                "sl": pos.get("sl"),
-                "tp": pos.get("tp"),
-                "profit": pos.get("profit"),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
-    # ── Closed positions ────────────────────────────────────────────────
-    for ticket in prev_tickets - curr_tickets:
-        pos = prev[ticket]
-        logger.info(
-            "position_stream: CLOSED position ticket=%d %s %s",
-            ticket, pos.get("type", "?"), pos.get("symbol", "?"),
-        )
-        # Auto-reconcile the MongoDB trade
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda t=ticket, p=pos: asyncio.run(
-                _async_reconcile_in_thread(db, t, p, "stream_detected_close")
-            )
-        )
-        await _broadcast(
-            "position_closed",
-            {
-                "ticket": ticket,
-                "symbol": pos.get("symbol"),
-                "direction": pos.get("type"),
-                "volume": _pos_volume(pos),
-                "open_price": pos.get("openPrice"),
-                "last_profit": pos.get("profit"),
-                "close_reason": "tp_sl_or_manual",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-
-    # ── Modified / partially closed positions ────────────────────────────
-    for ticket in prev_tickets & curr_tickets:
-        old = prev[ticket]
-        new = curr[ticket]
-
-        old_vol = _pos_volume(old)
-        new_vol = _pos_volume(new)
-
-        if old_vol - new_vol > _PARTIAL_CLOSE_THRESHOLD:
-            # Volume decreased — partial close
-            await _handle_partial_close(db, ticket, old, new)
-
-        elif old.get("sl") != new.get("sl") or old.get("tp") != new.get("tp"):
-            # SL/TP modified
-            await _broadcast(
-                "position_modified",
-                {
-                    "ticket": ticket,
-                    "symbol": new.get("symbol"),
-                    "direction": new.get("type"),
-                    "old_sl": old.get("sl"),
-                    "new_sl": new.get("sl"),
-                    "old_tp": old.get("tp"),
-                    "new_tp": new.get("tp"),
-                    "profit": new.get("profit"),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-
-        # Always broadcast profit updates for open positions (throttle: only on changes)
-        old_profit = old.get("profit") or 0.0
-        new_profit = new.get("profit") or 0.0
-        if abs(new_profit - old_profit) > 0.01:
-            await _broadcast(
-                "position_profit_update",
-                {
-                    "ticket": ticket,
-                    "symbol": new.get("symbol"),
-                    "direction": new.get("type"),
-                    "volume": new_vol,
-                    "profit": new_profit,
-                    "sl": new.get("sl"),
-                    "tp": new.get("tp"),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-
-
-async def _async_reconcile_in_thread(db, ticket: int, pos: dict, reason: str) -> None:
-    """Helper to call the async reconcile from a thread executor context."""
-    await _reconcile_closed_trade(db, ticket, pos, reason)
-
-
-async def start_position_stream() -> None:
-    """
-    Background asyncio task — polls bridge every POLL_INTERVAL seconds
-    and emits position change events.
-
-    Starts after a 30-second delay to let the bridge warm up.
-    """
-    await asyncio.sleep(30)
-    logger.info("position_stream: started (poll_interval=%.0fs)", POLL_INTERVAL)
-
-    from ..db import get_database
-    from ..services.bridge_client import bridge_client, BridgeUnavailableError
-
-    prev_snapshot: dict[int, dict] = {}
-    consecutive_errors = 0
-
-    while True:
-        try:
-            db = get_database()
-
-            if not bridge_client.is_available:
-                # Circuit breaker open — skip silently
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
-            loop = asyncio.get_event_loop()
-            try:
-                raw_positions: list[dict] = await loop.run_in_executor(
-                    None, bridge_client.get_positions
-                )
-            except BridgeUnavailableError:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-            except Exception as exc:
-                consecutive_errors += 1
-                if consecutive_errors <= 3:
-                    logger.warning("position_stream: poll error: %s", exc)
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
-            consecutive_errors = 0
-            curr_snapshot: dict[int, dict] = {
-                _pos_key(p): p for p in raw_positions if _pos_key(p)
-            }
-
-            if curr_snapshot != prev_snapshot:
-                await _process_snapshot_diff(db, prev_snapshot, curr_snapshot)
-
-            prev_snapshot = curr_snapshot
-
-        except asyncio.CancelledError:
-            logger.info("position_stream: cancelled")
-            return
-        except Exception as exc:
-            logger.error("position_stream: unexpected error: %s", exc, exc_info=True)
-
-        await asyncio.sleep(POLL_INTERVAL)
+    loop = asyncio.get_event_loop()
+    positions = await loop.run_in_executor(None, _positions_snapshot)
+    return {
+        "count": len(positions),
+        "positions": positions,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
