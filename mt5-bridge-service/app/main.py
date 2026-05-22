@@ -61,13 +61,15 @@ async def startup_validation() -> None:
     asyncio.create_task(_peer_keepalive_loop())
 
 
+
 def require_secret(x_bridge_secret: str = Header(default="")) -> None:
     if not x_bridge_secret:
         raise HTTPException(status_code=403, detail="Missing X-Bridge-Secret header")
     if x_bridge_secret != settings.mt_bridge_secret:
         raise HTTPException(status_code=403, detail="Invalid bridge secret (check X-Bridge-Secret)")
 
-
+from .position_stream import router as stream_router
+app.include_router(stream_router, dependencies=[Depends(require_secret)])
 # ---------------------------------------------------------------------------
 # Health / root
 # ---------------------------------------------------------------------------
@@ -430,9 +432,48 @@ def reset_connection():
 
 @app.get("/positions", dependencies=[Depends(require_secret)])
 def positions():
-    return {"positions": adapter.positions()}
+    return {"positions": _get_positions_full()}
 
 
+
+def _get_positions_full():
+    """
+    Returns full position data including sl, tp, and current profit.
+    The backend's position_stream service diffs on these fields to detect
+    partial closes and SL/TP modifications.
+    """
+    from .mt5_adapter import adapter
+    try:
+        adapter.ensure_connection()
+        if adapter._mt is None or not adapter.connected:
+            return []
+        rows = adapter._mt.positions_get()
+        if rows is None:
+            return []
+        out = []
+        for p in rows:
+            out.append({
+                "ticket":     p.ticket,
+                "symbol":     p.symbol,
+                "type":       "BUY" if p.type == 0 else "SELL",
+                "volume":     p.volume,
+                "openPrice":  p.price_open,
+                "currentPrice": p.price_current,
+                "sl":         p.sl,
+                "tp":         p.tp,
+                "profit":     p.profit,
+                "swap":       p.swap,
+                "commission": getattr(p, "commission", 0.0),
+                "openTime":   p.time,
+                "magic":      p.magic,
+                "comment":    p.comment,
+            })
+        return out
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("positions_get failed: %s", exc)
+        return []
+ 
 # ---------------------------------------------------------------------------
 # Orders
 # ---------------------------------------------------------------------------
