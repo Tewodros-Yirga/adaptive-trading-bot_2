@@ -465,18 +465,31 @@ class MT5Adapter:
             raise RuntimeError(f"mt5 positions_get exception: {exc}") from exc
         if rows is None:
             return []
+
+        def _s(obj, attr, default=0.0):
+            # RPyC proxy: missing attributes raise AttributeError across the
+            # wire, so we must catch locally rather than use hasattr().
+            try:
+                return getattr(obj, attr)
+            except AttributeError:
+                return default
+
         out = []
         for p in rows:
-            out.append({
-                "ticket": p.ticket,
-                "symbol": p.symbol,
-                "type": "BUY" if p.type == 0 else "SELL",
-                "volume": p.volume,
-                "openPrice": p.price_open,
-                "sl": p.sl,
-                "tp": p.tp,
-                "profit": p.profit,
-            })
+            try:
+                out.append({
+                    "ticket":    _s(p, "ticket",     0),
+                    "symbol":    _s(p, "symbol",     ""),
+                    "type":      "BUY" if _s(p, "type", 0) == 0 else "SELL",
+                    "volume":    _s(p, "volume",     0.0),
+                    "openPrice": _s(p, "price_open", 0.0),
+                    "sl":        _s(p, "sl",         0.0),
+                    "tp":        _s(p, "tp",         0.0),
+                    "profit":    _s(p, "profit",     0.0),
+                })
+            except Exception as row_exc:
+                logger.warning("skipping malformed position row: %s", row_exc)
+                continue
         return out
 
     def _resolve_symbol_tick(self, symbol: str):

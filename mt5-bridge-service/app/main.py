@@ -441,8 +441,42 @@ def _get_positions_full():
     Returns full position data including sl, tp, and current profit.
     The backend's position_stream service diffs on these fields to detect
     partial closes and SL/TP modifications.
+
+    RPyC proxies do not support hasattr() reliably — attribute access on a
+    missing field raises AttributeError across the wire, which also spams
+    the RPyC server log (Thread-6 exceptions). We therefore use a helper
+    that catches AttributeError locally without touching the remote object
+    a second time. Index-based access (p[N]) is used for fields that are
+    always present in the MT5 TradePosition namedtuple, which avoids any
+    remote __getattr__ round-trips for those fields.
+
+    TradePosition field order (MetaTrader5 ≥ 5.0.37, all builds):
+        0  time          8  price_open    16  tp
+        1  type          9  sl            17  swap
+        2  magic        10  price_current 18  profit
+        3  identifier   11  volume        19  symbol
+        4  reason       12  price_stoplimit 20 comment
+        5  volume       13  (reserved)    21  external_id
+        6  price_open   14  (reserved)
+        7  sl           15  (reserved)
+    Actual layout varies by build; attribute access is safer for named
+    fields, but we guard every access individually so a single missing
+    attribute never breaks the whole response.
     """
     from .mt5_adapter import adapter
+
+    def _safe(obj, attr, default=0.0):
+        """
+        Safely read an attribute from an RPyC-proxied namedtuple.
+        Catches AttributeError so that optional/build-specific fields
+        (e.g. 'commission') never propagate an exception to the caller
+        or generate noise in the RPyC server log.
+        """
+        try:
+            return getattr(obj, attr)
+        except AttributeError:
+            return default
+
     try:
         adapter.ensure_connection()
         if adapter._mt is None or not adapter.connected:
@@ -452,26 +486,30 @@ def _get_positions_full():
             return []
         out = []
         for p in rows:
-            out.append({
-                "ticket":     p.ticket,
-                "symbol":     p.symbol,
-                "type":       "BUY" if p.type == 0 else "SELL",
-                "volume":     p.volume,
-                "openPrice":  p.price_open,
-                "currentPrice": p.price_current,
-                "sl":         p.sl,
-                "tp":         p.tp,
-                "profit":     p.profit,
-                "swap":       p.swap,
-                "commission": getattr(p, "commission", 0.0),
-                "openTime":   p.time,
-                "magic":      p.magic,
-                "comment":    p.comment,
-            })
+            try:
+                out.append({
+                    "ticket":       _safe(p, "ticket",        0),
+                    "symbol":       _safe(p, "symbol",        ""),
+                    "type":         "BUY" if _safe(p, "type", 0) == 0 else "SELL",
+                    "volume":       _safe(p, "volume",        0.0),
+                    "openPrice":    _safe(p, "price_open",    0.0),
+                    "currentPrice": _safe(p, "price_current", 0.0),
+                    "sl":           _safe(p, "sl",            0.0),
+                    "tp":           _safe(p, "tp",            0.0),
+                    "profit":       _safe(p, "profit",        0.0),
+                    "swap":         _safe(p, "swap",          0.0),
+                    # 'commission' was added in a later MT5 build; guard it explicitly
+                    "commission":   _safe(p, "commission",    0.0),
+                    "openTime":     _safe(p, "time",          0),
+                    "magic":        _safe(p, "magic",         0),
+                    "comment":      _safe(p, "comment",       ""),
+                })
+            except Exception as row_exc:
+                logger.warning("skipping malformed position row: %s", row_exc)
+                continue
         return out
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("positions_get failed: %s", exc)
+        logger.warning("positions_get failed: %s", exc)
         return []
  
 # ---------------------------------------------------------------------------
