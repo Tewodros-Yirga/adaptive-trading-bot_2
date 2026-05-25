@@ -499,7 +499,7 @@ def _get_positions_full():
                     "profit":       _safe(p, "profit",        0.0),
                     "swap":         _safe(p, "swap",          0.0),
                     # 'commission' was added in a later MT5 build; guard it explicitly
-                    "commission":   _safe(p, "commission",    0.0),
+                    "commission":   0.0,  # not exposed by TradePosition in this MT5 build — fetch from history_deals_get instead
                     "openTime":     _safe(p, "time",          0),
                     "magic":        _safe(p, "magic",         0),
                     "comment":      _safe(p, "comment",       ""),
