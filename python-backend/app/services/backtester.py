@@ -861,16 +861,48 @@ def _resolve_params(db: Database, strategy_name: str, override_params: dict) -> 
     """
     Return the effective params for a strategy in this priority order:
       1. ``override_params`` if non-empty (caller explicitly supplied them)
-      2. ``strategies.params_json`` for the strategy (last promoted params)
-      3. ``parameter_versions`` latest entry for the strategy
-      4. Strategy class ``default_params()``
+      2. Best *qualified* backtest candidate (highest composite_score, promoted=True)
+         written by the backtester microservice — this is the source of truth for
+         what the continuous optimizer found best.
+      3. ``strategies.params_json`` for the strategy (last written value, may lag)
+      4. ``parameter_versions`` latest entry for the strategy
+      5. Strategy class ``default_params()``
 
     This function is **read-only** — it never modifies the database.
     """
     if override_params:
         return override_params
 
-    # 1. Latest promoted params stored in the strategies collection
+    # 1. Best promoted candidate from the backtester microservice
+    try:
+        from ..db import COLL_BACKTEST_CANDIDATES
+        best_candidate = db[COLL_BACKTEST_CANDIDATES].find_one(
+            {"strategy_name": strategy_name, "qualified": True, "promoted": True},
+            sort=[("composite_score", -1)],
+        )
+        if best_candidate:
+            raw = best_candidate.get("params_json")
+            if isinstance(raw, dict) and raw:
+                logger.info(
+                    "Backtest using best promoted candidate params for %s "
+                    "(score=%.4f)",
+                    strategy_name, best_candidate.get("composite_score", 0),
+                )
+                return raw
+            elif isinstance(raw, str):
+                import json as _j
+                parsed = _j.loads(raw)
+                if parsed:
+                    logger.info(
+                        "Backtest using best promoted candidate params for %s "
+                        "(score=%.4f)",
+                        strategy_name, best_candidate.get("composite_score", 0),
+                    )
+                    return parsed
+    except Exception as exc:
+        logger.warning("Could not load best candidate params for %s: %s", strategy_name, exc)
+
+    # 2. Latest promoted params stored in the strategies collection
     try:
         strategy_doc = crud.get_strategy_by_name(db, strategy_name)
         if strategy_doc:
@@ -884,7 +916,7 @@ def _resolve_params(db: Database, strategy_name: str, override_params: dict) -> 
     except Exception as exc:
         logger.warning("Could not load promoted params from strategies for %s: %s", strategy_name, exc)
 
-    # 2. Latest entry in parameter_versions for this strategy
+    # 3. Latest entry in parameter_versions for this strategy
     try:
         pv = crud.get_latest_param_version_for_strategy(db, strategy_name)
         if pv:
@@ -898,7 +930,7 @@ def _resolve_params(db: Database, strategy_name: str, override_params: dict) -> 
     except Exception as exc:
         logger.warning("Could not load parameter_versions for %s: %s", strategy_name, exc)
 
-    # 3. Strategy class defaults
+    # 4. Strategy class defaults
     try:
         strat_cls = get_strategy(strategy_name, {})
         defaults = strat_cls.default_params()
@@ -949,23 +981,59 @@ def run_backtest(
     adapt_every_n = int(crud.get_setting(db, "backtest_adapt_every_n_trades") or "20")
     av_key = crud.get_setting(db, "alphavantage_key") or ""
 
-    # Try cache first
-    cached_doc = db["ohlcv_cache"].find_one({
-        "symbol": symbol, "from_date": from_date, "to_date": to_date,
-    })
-
+    # ── OHLCV data: try per-bar cache first, then live fetch ──────────────
     ohlcv: list[dict] = []
-    data_source = "cache"
+    data_source = "live"
 
-    if cached_doc:
-        ohlcv = json.loads(cached_doc["data_json"])
-    else:
+    # Per-bar cache (written by the backtester microservice via save_ohlcv_to_cache).
+    # Each doc has keys: symbol, timeframe, date, open, high, low, close, volume.
+    try:
+        cached_bars = list(
+            db["ohlcv_cache"].find(
+                {
+                    "symbol": symbol,
+                    "timeframe": "1d",
+                    "date": {"$gte": from_date, "$lte": to_date + "Z"},
+                },
+                {"_id": 0, "symbol": 0, "timeframe": 0},
+                sort=[("date", 1)],
+            )
+        )
+        if cached_bars:
+            ohlcv = cached_bars
+            data_source = "per_bar_cache"
+            logger.info(
+                "Backtest [%s/%s]: loaded %d bars from per-bar cache",
+                strategy_name, symbol, len(ohlcv),
+            )
+    except Exception as exc:
+        logger.debug("Per-bar cache lookup failed for %s: %s", symbol, exc)
+
+    # Legacy chunk-style cache (single doc per symbol+from+to range).
+    if not ohlcv:
+        try:
+            cached_doc = db["ohlcv_cache"].find_one({
+                "symbol": symbol, "from_date": from_date, "to_date": to_date,
+            })
+            if cached_doc and cached_doc.get("data_json"):
+                ohlcv = json.loads(cached_doc["data_json"])
+                data_source = "chunk_cache"
+                logger.info(
+                    "Backtest [%s/%s]: loaded %d bars from legacy chunk cache",
+                    strategy_name, symbol, len(ohlcv),
+                )
+        except Exception as exc:
+            logger.debug("Legacy chunk cache lookup failed for %s: %s", symbol, exc)
+
+    # Live fetch if cache missed
+    if not ohlcv:
         try:
             ohlcv = fetch_ohlcv_sync(symbol, from_date, to_date, "1d", av_key=av_key)
             data_source = "mt5_bridge_or_yfinance"
         except Exception as exc:
             logger.warning("Backtest fetch failed for %s: %s", symbol, exc)
 
+        # Store in legacy chunk cache as fallback for future identical range queries
         if ohlcv:
             try:
                 from ..db import next_id

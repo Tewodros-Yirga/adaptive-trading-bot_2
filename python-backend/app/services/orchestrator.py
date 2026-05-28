@@ -766,6 +766,17 @@ async def process_signal(
         }
     )
 
+    # Extract MT5 ticket from the bridge response so position_stream and
+    # reconciler can match this DB trade to a live MT5 position by ticket.
+    # orderId is always present (real or simulated).
+    mt5_ticket: int | None = None
+    try:
+        raw_ticket = order.get("orderId") or order.get("ticket")
+        if raw_ticket is not None:
+            mt5_ticket = int(raw_ticket)
+    except (ValueError, TypeError):
+        pass
+
     strategy_for_params = selected_strategies[0] if selected_strategies else None
     if strategy_for_params:
         latest_param = crud.get_latest_param_version(db, strategy_for_params)
@@ -773,22 +784,23 @@ async def process_signal(
         latest_param = None
     version = latest_param.version if latest_param else 1
 
-    trade = crud.log_trade(
-        db,
-        {
-            "symbol": symbol,
-            "direction": final_direction,
-            "entry_price": price,
-            "stop_loss": sl,
-            "take_profit": levels.get("tp1"),
-            "lot_size": lot_size,
-            "result": "OPEN",
-            "strategy_name": selected_strategies[0] if selected_strategies else "PICKER",
-            "params_version": version,
-            "opened_at": datetime.utcnow(),
-            **(extra_trade_fields or {}),
-        },
-    )
+    trade_fields: dict = {
+        "symbol": symbol,
+        "direction": final_direction,
+        "entry_price": price,
+        "stop_loss": sl,
+        "take_profit": levels.get("tp1"),
+        "lot_size": lot_size,
+        "result": "OPEN",
+        "strategy_name": selected_strategies[0] if selected_strategies else "PICKER",
+        "params_version": version,
+        "opened_at": datetime.utcnow(),
+        **(extra_trade_fields or {}),
+    }
+    if mt5_ticket is not None:
+        trade_fields["mt5_ticket"] = mt5_ticket
+
+    trade = crud.log_trade(db, trade_fields)
 
     # ── Model 2: notify news intelligence of the new open trade ───────────
     try:

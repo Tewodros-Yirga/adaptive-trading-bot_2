@@ -77,13 +77,21 @@ def close_trade(
         return None
     now = datetime.utcnow()
     opened_at = doc.get("opened_at")
-    duration_mins = ((now - opened_at).total_seconds() / 60.0) if opened_at else None
+    duration_mins: float | None = None
+    if opened_at is not None:
+        try:
+            # Strip tzinfo if present so subtraction works cleanly with naive utcnow()
+            if hasattr(opened_at, "tzinfo") and opened_at.tzinfo is not None:
+                opened_at = opened_at.replace(tzinfo=None)
+            duration_mins = round((now - opened_at).total_seconds() / 60.0, 1)
+        except Exception:
+            duration_mins = None
     update: dict = {
         "exit_price": exit_price,
         "pnl": pnl,
         "result": result,
         "closed_at": now,
-        "duration_mins": round(duration_mins, 1) if duration_mins is not None else None,
+        "duration_mins": duration_mins,
     }
     if mt5_ticket is not None:
         update["mt5_ticket"] = mt5_ticket

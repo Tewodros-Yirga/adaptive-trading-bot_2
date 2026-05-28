@@ -71,17 +71,29 @@ async def _reconcile_closed_trade(
 
     trade_doc = db[COLL_TRADES].find_one({"mt5_ticket": ticket, "closed_at": {"$exists": False}})
     if not trade_doc:
-        # Try matching by symbol + direction if no ticket stored (webhook trades)
-        symbol = pos_snapshot.get("symbol", "")
+        # Fallback: match by symbol+direction for the most recently opened open trade.
+        # Build symbol variants to handle broker suffixes (XAUUSDm ↔ XAUUSD).
+        raw_symbol = (pos_snapshot.get("symbol") or "").upper()
         direction = (pos_snapshot.get("type") or "").upper()
-        if symbol and direction:
+        if raw_symbol and direction:
+            sym_variants = [raw_symbol]
+            if raw_symbol.endswith("M"):
+                sym_variants.append(raw_symbol[:-1])
+            else:
+                sym_variants.append(raw_symbol + "M")
+            if raw_symbol.endswith("m"):
+                sym_variants.append(raw_symbol[:-1])
+            else:
+                sym_variants.append(raw_symbol + "m")
+
             trade_doc = db[COLL_TRADES].find_one(
                 {
-                    "symbol": symbol,
+                    "symbol": {"$in": sym_variants},
                     "direction": direction,
                     "closed_at": {"$exists": False},
                     "result": {"$in": ["OPEN", None]},
-                }
+                },
+                sort=[("opened_at", -1)],  # most recent first
             )
 
     if not trade_doc:
@@ -125,6 +137,7 @@ async def _reconcile_closed_trade(
             exit_price=exit_price,
             pnl=pnl,
             result=result,
+            mt5_ticket=ticket,
         )
         logger.info(
             "position_stream: auto-closed trade db_id=%s ticket=%d "
@@ -227,6 +240,48 @@ async def _process_snapshot_diff(
             _pos_volume(pos),
             float(pos.get("openPrice") or 0),
         )
+        # Backfill mt5_ticket on the most recent ticketless DB trade for this
+        # symbol+direction so reconciler can match by ticket going forward.
+        try:
+            from ..db import COLL_TRADES
+            symbol_up = (pos.get("symbol") or "").upper()
+            direction_up = (pos.get("type") or "").upper()
+            if symbol_up and direction_up:
+                open_time_raw = pos.get("openTime") or pos.get("time")
+                if open_time_raw is not None:
+                    if isinstance(open_time_raw, (int, float)):
+                        from datetime import datetime as _dt
+                        pos_open_dt = _dt.utcfromtimestamp(open_time_raw)
+                    else:
+                        from datetime import datetime as _dt
+                        pos_open_dt = _dt.fromisoformat(
+                            str(open_time_raw).replace("Z", "+00:00")
+                        ).replace(tzinfo=None)
+                    from datetime import timedelta as _td
+                    cutoff = pos_open_dt - _td(minutes=5)
+                    ticketless = db[COLL_TRADES].find_one(
+                        {
+                            "symbol": {"$in": [symbol_up, symbol_up.rstrip("M"), symbol_up + "m",
+                                               symbol_up.rstrip("m"), symbol_up + "M"]},
+                            "direction": direction_up,
+                            "closed_at": {"$exists": False},
+                            "mt5_ticket": {"$exists": False},
+                            "opened_at": {"$gte": cutoff},
+                        },
+                        sort=[("opened_at", -1)],
+                    )
+                    if ticketless:
+                        db[COLL_TRADES].update_one(
+                            {"_id": ticketless["_id"]},
+                            {"$set": {"mt5_ticket": int(ticket)}},
+                        )
+                        logger.info(
+                            "position_stream: backfilled mt5_ticket=%d on trade db_id=%s",
+                            ticket, ticketless["_id"],
+                        )
+        except Exception as _bf_exc:
+            logger.debug("position_stream: mt5_ticket backfill failed for ticket=%d: %s", ticket, _bf_exc)
+
         await _broadcast(
             "position_opened",
             {
@@ -249,12 +304,11 @@ async def _process_snapshot_diff(
             "position_stream: CLOSED position ticket=%d %s %s",
             ticket, pos.get("type", "?"), pos.get("symbol", "?"),
         )
-        # Auto-reconcile the MongoDB trade
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda t=ticket, p=pos: asyncio.run(
-                _async_reconcile_in_thread(db, t, p, "stream_detected_close")
-            )
-        )
+        # Auto-reconcile the MongoDB trade — call directly (already in async context).
+        try:
+            await _reconcile_closed_trade(db, ticket, pos, "stream_detected_close")
+        except Exception as _rec_exc:
+            logger.warning("position_stream: reconcile error for ticket=%d: %s", ticket, _rec_exc)
         await _broadcast(
             "position_closed",
             {

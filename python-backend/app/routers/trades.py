@@ -28,7 +28,7 @@ router = APIRouter(prefix="/trades", tags=["trades"])
 # ---------------------------------------------------------------------------
 
 def _trade_to_dict(t: Trade) -> dict:
-    return {
+    d = {
         "id": t.id,
         "symbol": t.symbol,
         "direction": t.direction,
@@ -43,9 +43,11 @@ def _trade_to_dict(t: Trade) -> dict:
         "atr_at_entry": t.atr_at_entry,
         "strategy_name": t.strategy_name,
         "params_version": t.params_version,
+        "mt5_ticket": t.mt5_ticket,
         "opened_at": t.opened_at,
         "closed_at": t.closed_at,
     }
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -119,21 +121,7 @@ def closed_trades(
 
 
 # ---------------------------------------------------------------------------
-# GET /trades/{trade_id}  — single trade lookup
-# ---------------------------------------------------------------------------
-
-@router.get("/{trade_id}")
-def get_trade(trade_id: int, db: Database = Depends(get_db)):
-    """Return a single trade by its integer _id."""
-    doc = db[COLL_TRADES].find_one({"_id": trade_id})
-    if not doc:
-        raise HTTPException(status_code=404, detail=f"Trade #{trade_id} not found")
-    t = Trade.from_doc(doc)
-    return _trade_to_dict(t)
-
-
-# ---------------------------------------------------------------------------
-# GET /trades/analytics
+# GET /trades/analytics  — MUST be before /{trade_id} to avoid route conflict
 # ---------------------------------------------------------------------------
 
 @router.get("/analytics")
@@ -257,6 +245,20 @@ def trade_analytics(
             "max_loss_streak": max_loss,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /trades/{trade_id}  — single trade lookup
+# ---------------------------------------------------------------------------
+
+@router.get("/{trade_id}")
+def get_trade(trade_id: int, db: Database = Depends(get_db)):
+    """Return a single trade by its integer _id."""
+    doc = db[COLL_TRADES].find_one({"_id": trade_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Trade #{trade_id} not found")
+    t = Trade.from_doc(doc)
+    return _trade_to_dict(t)
 
 
 # ---------------------------------------------------------------------------

@@ -262,9 +262,14 @@ async def _live_trading_loop():
                         open_positions = await loop.run_in_executor(
                             None, _bridge.get_positions
                         )
-                        symbol_variants = {symbol, symbol.rstrip("m"), symbol + "m"}
+                        sym_upper = symbol.upper()
+                        symbol_variants = {
+                            symbol, sym_upper,
+                            sym_upper.rstrip("M"), sym_upper.rstrip("m"),
+                            sym_upper + "m", sym_upper + "M",
+                        }
                         already_open = any(
-                            p.get("symbol", "") in symbol_variants
+                            (p.get("symbol") or "").upper() in symbol_variants
                             for p in (open_positions or [])
                         )
                         if already_open:
@@ -278,7 +283,29 @@ async def _live_trading_loop():
                             "Live loop: could not check open positions for %s: %s",
                             symbol, _pos_exc,
                         )
-                        # Non-fatal — proceed with signal evaluation
+                        # Bridge unavailable — fall back to DB open trades check
+                        # to avoid double-entering while a position is still open.
+                        try:
+                            from .db import COLL_TRADES as _COLL_TRADES
+                            sym_upper_fb = symbol.upper()
+                            sym_variants_fb = [
+                                symbol, sym_upper_fb,
+                                sym_upper_fb.rstrip("M"), sym_upper_fb.rstrip("m"),
+                                sym_upper_fb + "m", sym_upper_fb + "M",
+                            ]
+                            db_open = db[_COLL_TRADES].find_one({
+                                "symbol": {"$in": sym_variants_fb},
+                                "closed_at": {"$exists": False},
+                                "result": {"$in": ["OPEN", None]},
+                            })
+                            if db_open:
+                                logger.debug(
+                                    "Live loop: DB shows open trade for %s — skipping tick",
+                                    symbol,
+                                )
+                                continue
+                        except Exception:
+                            pass  # non-fatal — proceed
 
                     from_dt = (date.today() - timedelta(days=2)).isoformat()
                     to_dt = date.today().isoformat()

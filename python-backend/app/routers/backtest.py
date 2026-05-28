@@ -93,18 +93,69 @@ async def run(
         # NOTE: run_backtest() saves to backtest_results for historical record.
         # It does NOT update strategy parameters — parameter updates only happen
         # when the backtester microservice promotes a candidate.
-        bt_id = run_backtest(
+        # Run in a background task so the HTTP response is returned immediately
+        # (run_backtest is synchronous and may take 5-30s for large date ranges).
+        background_tasks.add_task(
+            _run_single_background,
             db,
-            strategy_name=strategy_name,
-            symbol=symbol,
-            from_date=from_date,
-            to_date=to_date,
-            params=params,
-            initial_balance=initial_balance,
-            leverage=leverage,
-            risk_per_trade_pct=risk_per_trade_pct,
+            strategy_name,
+            symbol,
+            from_date,
+            to_date,
+            params,
+            initial_balance,
+            leverage,
+            risk_per_trade_pct,
         )
-        return {"backtest_id": bt_id, "status": "started"}
+        return {"status": "started", "message": "Backtest queued. Poll /backtest/results for progress."}
+
+
+async def _run_single_background(
+    db,
+    strategy_name: str,
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    params: dict,
+    initial_balance: float,
+    leverage: int,
+    risk_per_trade_pct: float,
+) -> None:
+    """
+    Background wrapper for a single synchronous backtest run.
+
+    Runs ``run_backtest`` in a thread-pool executor so it doesn't block the
+    event loop. The result record is written to MongoDB by ``run_backtest``
+    itself; the caller polls GET /backtest/results to see completion.
+
+    Parameters are resolved from the DB inside ``run_backtest`` via
+    ``_resolve_params`` (best promoted candidate → strategies collection →
+    parameter_versions → strategy defaults). This function never writes
+    strategy params to the database.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: run_backtest(
+                db,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                from_date=from_date,
+                to_date=to_date,
+                params=params,
+                initial_balance=initial_balance,
+                leverage=leverage,
+                risk_per_trade_pct=risk_per_trade_pct,
+            ),
+        )
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).error(
+            "Single backtest background task failed for %s/%s: %s",
+            strategy_name, symbol, exc,
+        )
 
 
 async def _run_batch_background(

@@ -61,6 +61,7 @@ class Trade:
     ema_slow_at_entry: float | None = None
     params_version: int | None = None
     strategy_name: str | None = "DTC"
+    mt5_ticket: int | None = None
     opened_at: datetime = field(default_factory=datetime.utcnow)
     closed_at: datetime | None = None
     id: str = ""
@@ -89,6 +90,7 @@ class Trade:
             ema_slow_at_entry=doc.get("ema_slow_at_entry"),
             params_version=doc.get("params_version"),
             strategy_name=doc.get("strategy_name", "DTC"),
+            mt5_ticket=doc.get("mt5_ticket"),
             opened_at=doc.get("opened_at", datetime.utcnow()),
             closed_at=doc.get("closed_at"),
         )

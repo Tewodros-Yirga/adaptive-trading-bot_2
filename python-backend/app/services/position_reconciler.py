@@ -203,13 +203,28 @@ def reconcile_positions(db: Database) -> dict[str, int]:
             if not trade_symbol or not trade_direction or trade_opened_at is None:
                 continue
 
+            # Normalise trade_opened_at to naive UTC for comparison.
+            if hasattr(trade_opened_at, "tzinfo") and trade_opened_at.tzinfo is not None:
+                trade_opened_at = trade_opened_at.replace(tzinfo=None)
+
+            # Build set of acceptable symbol variants (handles XAUUSDm ↔ XAUUSD etc.)
+            sym_variants: set[str] = {trade_symbol}
+            if trade_symbol.endswith("M"):
+                sym_variants.add(trade_symbol[:-1])
+            else:
+                sym_variants.add(trade_symbol + "M")
+            if trade_symbol.endswith("m"):
+                sym_variants.add(trade_symbol[:-1])
+            else:
+                sym_variants.add(trade_symbol + "m")
+
             # Try to find a matching live MT5 position
             for pos in live_positions:
                 pos_symbol = (pos.get("symbol") or "").upper()
                 pos_type = (pos.get("type") or "").upper()
                 pos_ticket = pos.get("ticket")
 
-                if pos_symbol != trade_symbol or pos_type != trade_direction:
+                if pos_symbol not in sym_variants or pos_type != trade_direction:
                     continue
 
                 # Compare open times within tolerance
@@ -219,10 +234,12 @@ def reconcile_positions(db: Database) -> dict[str, int]:
 
                 try:
                     if isinstance(pos_open_raw, (int, float)):
-                        pos_open_dt = datetime.utcfromtimestamp(pos_open_raw)
+                        pos_open_dt = datetime.utcfromtimestamp(float(pos_open_raw))
                     else:
-                        pos_open_dt = datetime.fromisoformat(str(pos_open_raw).replace("Z", "+00:00"))
-                        if pos_open_dt.tzinfo:
+                        pos_open_dt = datetime.fromisoformat(
+                            str(pos_open_raw).replace("Z", "+00:00")
+                        )
+                        if pos_open_dt.tzinfo is not None:
                             pos_open_dt = pos_open_dt.replace(tzinfo=None)
                 except Exception:
                     continue
