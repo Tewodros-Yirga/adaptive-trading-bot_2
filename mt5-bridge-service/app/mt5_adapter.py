@@ -509,15 +509,30 @@ class MT5Adapter:
 
         tick = None
         resolved = symbol
-        for sym in [symbol] + ([_alt(symbol)] if _alt(symbol) else []):
-            try:
-                self._mt.symbol_select(sym, True)
-            except Exception:
-                pass
-            tick = self._mt.symbol_info_tick(sym)
+        # After a terminal restart the broker data feed takes time to
+        # re-establish.  Retry so we don't immediately reject orders with
+        # "symbol tick unavailable" during the sync window.
+        _TICK_RETRIES    = 3
+        _TICK_RETRY_SLEEP = 3  # seconds
+        for tick_attempt in range(_TICK_RETRIES):
+            for sym in [symbol] + ([_alt(symbol)] if _alt(symbol) else []):
+                try:
+                    self._mt.symbol_select(sym, True)
+                except Exception:
+                    pass
+                tick = self._mt.symbol_info_tick(sym)
+                if tick is not None:
+                    resolved = sym
+                    break
             if tick is not None:
-                resolved = sym
                 break
+            if tick_attempt < _TICK_RETRIES - 1:
+                logger.warning(
+                    "symbol_info_tick returned None for %s (attempt %d/%d) "
+                    "— retrying in %ds (terminal may still be syncing after restart)",
+                    symbol, tick_attempt + 1, _TICK_RETRIES, _TICK_RETRY_SLEEP,
+                )
+                time.sleep(_TICK_RETRY_SLEEP)
         return tick, resolved
 
     def place_order(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -808,22 +823,47 @@ class MT5Adapter:
         used_symbol = symbol
         last_error: str | None = None
 
-        for sym in symbols_to_try:
-            try:
+        # After a terminal self-restart (e.g. LiveUpdate) the broker data
+        # feed takes time to reconnect.  mt5.initialize() passes the IPC
+        # probe before price/history data is available, so copy_rates_range
+        # returns None for a window of ~30s.  Retry to let the terminal sync
+        # rather than immediately returning 502 to every caller.
+        _DATA_RETRIES    = 4
+        _DATA_RETRY_SLEEP = 5  # seconds between retries
+
+        for data_attempt in range(_DATA_RETRIES):
+            for sym in symbols_to_try:
                 try:
-                    self._mt.symbol_select(sym, True)
-                except Exception:
-                    pass
-                rates = self._mt.copy_rates_range(sym, mt5_timeframe, dt_from, dt_to)
-                if rates is not None and (not hasattr(rates, '__len__') or len(rates) > 0):
-                    used_symbol = sym
-                    break
-                last_error = f"copy_rates_range returned no data for {sym} {timeframe}"
-                rates = None
-            except Exception as exc:
-                self.connected = False
-                self._mt = None
-                raise RuntimeError(f"copy_rates_range exception: {exc}") from exc
+                    try:
+                        self._mt.symbol_select(sym, True)
+                    except Exception:
+                        pass
+                    rates = self._mt.copy_rates_range(sym, mt5_timeframe, dt_from, dt_to)
+                    if rates is not None and (not hasattr(rates, '__len__') or len(rates) > 0):
+                        used_symbol = sym
+                        break
+                    last_error = f"copy_rates_range returned no data for {sym} {timeframe}"
+                    rates = None
+                except Exception as exc:
+                    logger.error(
+                        "copy_rates_range exception (attempt %d/%d) for %s %s: %s",
+                        data_attempt + 1, _DATA_RETRIES, sym, timeframe, exc,
+                    )
+                    self.connected = False
+                    self._mt = None
+                    raise RuntimeError(f"copy_rates_range exception: {exc}") from exc
+
+            if rates is not None and (not hasattr(rates, '__len__') or len(rates) > 0):
+                break  # got data
+
+            if data_attempt < _DATA_RETRIES - 1:
+                logger.warning(
+                    "copy_rates_range returned no data for %s %s "
+                    "(attempt %d/%d) — terminal may still be syncing after restart; "
+                    "retrying in %ds",
+                    symbol, timeframe, data_attempt + 1, _DATA_RETRIES, _DATA_RETRY_SLEEP,
+                )
+                time.sleep(_DATA_RETRY_SLEEP)
 
         if rates is None or (hasattr(rates, '__len__') and len(rates) == 0):
             tried = " / ".join(symbols_to_try)
