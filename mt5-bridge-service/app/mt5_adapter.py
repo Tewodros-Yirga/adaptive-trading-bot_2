@@ -170,7 +170,11 @@ class MT5Adapter:
 
         _RETCODE_DONE              = self._mt.TRADE_RETCODE_DONE
         _RETCODE_TOO_MANY_REQUESTS = 10027
-        _MAX_RETRIES               = 5
+        # 3 attempts max: sleeps of 5s, 10s, 20s → worst-case hold ≈35s.
+        # (Previously 5 attempts with sleeps up to 80s totalling 155s, which
+        # exceeded the backend's 8s read timeout and opened the circuit breaker
+        # before MT5 had a chance to recover.)
+        _MAX_RETRIES = 3
 
         with _ORDER_LOCK:
             result = None
@@ -197,7 +201,9 @@ class MT5Adapter:
                     return result
 
                 if result.retcode == _RETCODE_TOO_MANY_REQUESTS:
-                    sleep_s = 5 * (2 ** attempt)   # 5 10 20 40 80
+                    # Cap at 20s so total worst-case wait is 5+10+20=35s,
+                    # safely inside the backend's 60s order-client read timeout.
+                    sleep_s = min(5 * (2 ** attempt), 20)  # 5, 10, 20
                     # Set global cooldown so the NEXT caller also waits
                     _order_cooldown_until = time.monotonic() + sleep_s
                     if attempt < _MAX_RETRIES - 1:
@@ -725,9 +731,9 @@ class MT5Adapter:
             "tp":       new_tp,
         }
 
-        result = self._mt.order_send(request)
-        if result is None:
-            raise RuntimeError(f"modify order_send returned None: {self._last_error_repr()}")
+        # Route through the rate-limit lock so SL/TP modifications cannot
+        # race with in-flight place_order calls and compound 10027 pressure.
+        result = self._order_send_with_ratelimit(request)
         ok = result.retcode == self._mt.TRADE_RETCODE_DONE
         if not ok:
             raise RuntimeError(
