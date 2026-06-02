@@ -102,7 +102,10 @@ class _CircuitBreaker:
 
 def _is_retryable_error(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (502, 503, 504)
+        # 429: broker rate-limit — the bridge is still retrying MT5; wait and
+        # retry from this side too rather than opening the circuit breaker.
+        # 502/503/504: transient gateway / server errors.
+        return exc.response.status_code in (429, 502, 503, 504)
     # Do NOT retry on ReadTimeout — the circuit breaker handles repeated failures
     return isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError))
 
@@ -126,6 +129,14 @@ class MT5BridgeClient:
             timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=2.0),
             headers=headers,
         )
+        # Order client — must survive the full bridge retry window.
+        # The bridge holds _ORDER_LOCK for up to ~35s (3 retries: 5+10+20s);
+        # 60s gives comfortable headroom without hanging the event loop forever.
+        self._order_client = httpx.Client(
+            base_url=settings.mt_bridge_url,
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=2.0),
+            headers=headers,
+        )
         # Longer timeout for candle fetches (months of 15m data is slow)
         self._candle_client = httpx.Client(
             base_url=settings.mt_bridge_url,
@@ -133,8 +144,12 @@ class MT5BridgeClient:
             headers=headers,
         )
 
-        # Circuit breaker — opens after 3 consecutive failures, probes after 30 s
-        self._cb = _CircuitBreaker(open_threshold=3, timeout_secs=30.0)
+        # Circuit breaker:
+        #   open_threshold=5  — tolerate short 10027 bursts before opening.
+        #   timeout_secs=90   — give MT5 enough time to cool down before probing.
+        # (Previously 3 / 30s — too aggressive; 3 consecutive 429s from one
+        # order attempt would open the breaker and block all orders for 30s.)
+        self._cb = _CircuitBreaker(open_threshold=5, timeout_secs=90.0)
 
         # Last known positions cache (used when circuit is OPEN)
         self._cached_positions: list[dict] = []
@@ -166,7 +181,7 @@ class MT5BridgeClient:
             self._cb.record_failure()
             raise
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (502, 503, 504):
+            if exc.response.status_code in (429, 502, 503, 504):
                 self._cb.record_failure()
             raise
 
@@ -187,10 +202,11 @@ class MT5BridgeClient:
                 "takeProfit": payload["take_profit"],
                 "simulated": True,
             }
-        data = self._request(
-            "POST",
+        # Use the long-timeout order client so the request survives the full
+        # MT5 retry window inside the bridge (~35s worst case).
+        response = self._order_client.post(
             "/order",
-            {
+            json={
                 "symbol": payload["symbol"],
                 "type": payload["direction"],
                 "volume": payload["lot_size"],
@@ -199,6 +215,8 @@ class MT5BridgeClient:
                 "comment": "adaptive-bot-python",
             },
         )
+        response.raise_for_status()
+        data = response.json()
         return {
             "orderId": str(data.get("ticket")),
             "symbol": data.get("symbol", payload["symbol"]),
@@ -246,7 +264,11 @@ class MT5BridgeClient:
         if expiration is not None:
             body["expiration"] = expiration
 
-        data = self._request("POST", "/order/limit", body)
+        # Limit/stop orders also go through MT5 order_send — use the long-timeout
+        # order client for the same reason as place_order.
+        response = self._order_client.post("/order/limit", json=body)
+        response.raise_for_status()
+        data = response.json()
         return {
             "orderId": str(data.get("ticket")),
             "symbol": data.get("symbol", symbol),
@@ -269,9 +291,14 @@ class MT5BridgeClient:
                 "remainVolume": 0.0,
                 "simulated": True,
             }
-        data = self._request(
-            "POST", "/close", {"ticket": ticket, "volume": lot_size, "partial": partial}
+        # Use the long-timeout order client — closing a position also goes
+        # through MT5 order_send and may be subject to the same 10027 retries.
+        response = self._order_client.post(
+            "/close",
+            json={"ticket": ticket, "volume": lot_size, "partial": partial},
         )
+        response.raise_for_status()
+        data = response.json()
         return {
             "closed": data.get("closed", True),
             "ticket": ticket,
