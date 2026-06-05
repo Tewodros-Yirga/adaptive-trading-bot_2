@@ -697,8 +697,8 @@ async def process_signal(
         _bias_data     = get_news_bias(db, symbol)
         _nb            = float(_bias_data["bias"])
         _nc            = float(_bias_data["confidence"])
-        _bias_min      = float(crud.get_setting(db, "news_signal_bias_threshold")       or 0.05)
-        _conf_min      = float(crud.get_setting(db, "news_signal_confidence_threshold") or 0.10)
+        _bias_min      = float(crud.get_setting(db, "news_signal_bias_threshold")       or 0.3)
+        _conf_min      = float(crud.get_setting(db, "news_signal_confidence_threshold") or 0.5)
         _news_enabled  = (crud.get_setting(db, "news_signal_trading_enabled") or "true").lower() != "false"
 
         if _news_enabled and abs(_nb) >= _bias_min and _nc >= _conf_min:
