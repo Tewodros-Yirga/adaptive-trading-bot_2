@@ -1,10 +1,14 @@
 from .base import BaseStrategy
 from .alchemist import Alchemist
+from .adx_regime_filter import ADXRegimeFilterStrategy
 from .bollinger_breakout import BollingerBreakoutStrategy
 from .dtc import DTCStrategy
+from .htf_structure import HTFStructureStrategy
 from .macd_momentum import MACDMomentumStrategy
 from .multi_ema_scalper import MultiEMAScalperStrategy
+from .obv_momentum import OBVMomentumStrategy
 from .rsi_reversal import RSIReversalStrategy
+from .stoch_rsi_cross import StochRSICrossStrategy
 from .vwap_reversion import VWAPReversionStrategy
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
@@ -15,6 +19,10 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "Multi_EMA_Scalper": MultiEMAScalperStrategy,
     "VWAP_Reversion": VWAPReversionStrategy,
     "Alchemist": Alchemist,
+    "ADX_Regime": ADXRegimeFilterStrategy,
+    "OBV_Momentum": OBVMomentumStrategy,
+    "StochRSI_Cross": StochRSICrossStrategy,
+    "HTF_Structure": HTFStructureStrategy,
 }
 
 

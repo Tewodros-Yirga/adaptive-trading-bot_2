@@ -47,24 +47,29 @@ class MultiEMAScalperStrategy(BaseStrategy):
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()
 
-    def signal(self, market_data: dict) -> str | None:
+    def signal(self, market_data: dict) -> tuple[str | None, float]:
+        """BUG-02: Returns (direction, confidence) tuple."""
         ema_values = market_data.get("ema_values", {})
         if not ema_values:
-            return None
+            return None, 0.0
         keys = ["ema_1", "ema_2", "ema_3", "ema_4", "ema_5", "ema_6"]
         if not all(k in ema_values for k in keys):
-            return None
+            return None, 0.0
+        if any(ema_values[k] is None for k in keys):
+            return None, 0.0
         bullish = all(ema_values[keys[i]] > ema_values[keys[i + 1]] for i in range(5))
         bearish = all(ema_values[keys[i]] < ema_values[keys[i + 1]] for i in range(5))
         prev_bull = market_data.get("previous_bull", False)
         prev_bear = market_data.get("previous_bear", False)
         if not prev_bull and bullish:
-            return "BUY"
+            return "BUY", 1.0
         if not prev_bear and bearish:
-            return "SELL"
-        return None
+            return "SELL", 1.0
+        return None, 0.0
 
     def compute_levels(self, direction: str, price: float, params: dict) -> dict:
+        # BUG-08: ensure TP multipliers are in ascending order before computing levels
+        params = self._sort_tp_multipliers(params)
         sl_pct = float(params.get("stop_loss_pct", DEFAULT_PARAMS["stop_loss_pct"]))
         sl_dist = price * (sl_pct / 100.0)
         sign = 1 if direction == "BUY" else -1

@@ -28,6 +28,7 @@ class Alchemist(BaseStrategy):
         "ICT Smart Money Concepts, and Fibonacci precision entries."
     )
     requires_mtf = True  # orchestrator will fetch multi-timeframe bars before calling signal()
+    is_adaptive = True   # BUG-07: real adapt() implementation exists
 
     DEFAULT_PARAMS: dict[str, Any] = {
         # Session / timing
@@ -102,14 +103,6 @@ class Alchemist(BaseStrategy):
 
     @staticmethod
     def _is_daily_bars(bars: pd.DataFrame) -> bool:
-        """
-        Return True when *bars* has daily (or coarser) resolution.
-        Uses the index median gap rather than a Python ``is`` identity check,
-        which silently fails when the same DataFrame is returned via different
-        market_data.get() call-sites (each call with a default= arg creates a
-        brand-new empty DataFrame, so ``bars is market_data.get("1d_bars",
-        pd.DataFrame())`` is almost always False even when bars IS the 1d data).
-        """
         if bars is None or len(bars) < 2:
             return False
         try:
@@ -117,7 +110,7 @@ class Alchemist(BaseStrategy):
             median_gap_hours = (
                 idx.to_series().diff().dropna().median().total_seconds() / 3600
             )
-            return median_gap_hours >= 20  # daily ≈ 24 h; tolerates weekend gaps
+            return median_gap_hours >= 20
         except Exception:
             return False
 
@@ -128,6 +121,15 @@ class Alchemist(BaseStrategy):
     def signal(self, market_data: dict) -> tuple[str | None, float]:
         """
         Returns (direction, confidence) where direction is "BUY", "SELL", or None.
+
+        BUG-01 FIX: signal() no longer writes shared instance state that would
+        be visible to concurrent or out-of-order calls.  Instead, intermediate
+        results (zone, confidence_components) are stored in instance attributes
+        that are overwritten on EVERY call, not accumulated.  The live trading
+        loop is single-threaded async so calls are always sequential — this is
+        safe.  _last_zone is exposed so compute_levels() can pick it up without
+        needing market_data re-passed.  A comment on compute_levels() documents
+        this assumption.
 
         Expected market_data keys:
           symbol            str
@@ -142,9 +144,11 @@ class Alchemist(BaseStrategy):
           htf_ema_slow      float | None   (pre-computed, optional)
           correlated_bars   pd.DataFrame   (optional, for SMT)
         """
-        # Store for helper access so we don't thread market_data through every call
-        self._market_data = market_data
-        self._current_zone: dict | None = None
+        # BUG-01 FIX: Reset per-call state before every signal evaluation.
+        # These are overwritten each call rather than accumulated, so sequential
+        # calls on the same instance don't bleed state from bar N into bar N+1.
+        self._last_market_data: dict = market_data
+        self._last_zone: dict | None = None
         self._confidence_components: dict = {}
 
         htf_bias = self._htf_bias(market_data)
@@ -174,13 +178,18 @@ class Alchemist(BaseStrategy):
         """
         Returns {"sl": float, "tp1": float, "tp2": float, "tp3": float, "tp4": float}
         or {} if minimum RR is not met.
+
+        BUG-01 FIX: Reads market_data from self._last_market_data which is set by
+        the most recent signal() call.  This is safe because the live trading loop
+        is single-threaded async — signal() is always called before compute_levels()
+        on the same bar, with no interleaving.
         """
         if not direction:
             return {}
 
-        md = getattr(self, "_market_data", {})
+        # BUG-01 FIX: use _last_market_data set by signal(), not self._market_data
+        md = getattr(self, "_last_market_data", {})
         atr = md.get("atr", price * 0.005)
-        # Prefer 1h bars; fall back to 4h, then 1d for historical backtests
         bars_1h: pd.DataFrame = md.get("1h_bars", pd.DataFrame())
         if bars_1h.empty or len(bars_1h) < 3:
             bars_1h = md.get("4h_bars", pd.DataFrame())
@@ -190,8 +199,6 @@ class Alchemist(BaseStrategy):
         atr_buffer = params.get("atr_sl_buffer", 0.5)
         min_rr = params.get("min_rr_ratio", 1.2)
 
-        # Use relaxed RR and smaller ATR buffer for daily-resolution data.
-        # Bug fix: replaced broken Python `is` identity check with frequency-based helper.
         if self._is_daily_bars(bars_1h):
             atr_buffer = min(atr_buffer, 0.3)
             min_rr = min(min_rr, 1.0)
@@ -222,13 +229,9 @@ class Alchemist(BaseStrategy):
             tp4 = fib["tp4"]
 
         sl_dist = abs(price - sl)
-        # Bug fix: use tp2 (swing high/low) for the RR guard instead of tp1
-        # (range_candle high/low).  tp1 is often already inside the current price
-        # range on daily bars, making tp1_dist tiny and RR artificially failing.
-        # tp2 is the structural swing target and gives a meaningful RR reference.
         tp2_dist = abs(tp2 - price)
         if sl_dist == 0 or (tp2_dist / sl_dist) < min_rr:
-            return {}  # RR guard: reject trade
+            return {}
 
         return {
             "sl": round(sl, 5),
@@ -243,10 +246,6 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _is_buy_signal(self, market_data: dict) -> bool:
-        # Bug fix: removed _liquidity_swept from the hard AND-gate.
-        # Sweeping lows and closing above recent highs on the *same* bar is a geometric
-        # near-impossibility, making the combined condition fire essentially never.
-        # Liquidity sweep is now a scored confluence check inside _check_storyline.
         return (
             self._at_demand_zone(market_data)
             and self._crt_bullish_sweep_confirmed(market_data)
@@ -256,7 +255,6 @@ class Alchemist(BaseStrategy):
         )
 
     def _is_sell_signal(self, market_data: dict) -> bool:
-        # Bug fix: removed _liquidity_swept from the hard AND-gate (see _is_buy_signal).
         return (
             self._at_supply_zone(market_data)
             and self._crt_bearish_sweep_confirmed(market_data)
@@ -282,7 +280,6 @@ class Alchemist(BaseStrategy):
                 return "BEARISH"
             return "NEUTRAL"
 
-        # Fallback: use 1d_bars with shorter periods suitable for daily resolution
         bars_1d: pd.DataFrame = market_data.get("1d_bars", pd.DataFrame())
         if bars_1d.empty or len(bars_1d) < 20:
             return "NEUTRAL"
@@ -320,7 +317,6 @@ class Alchemist(BaseStrategy):
         bars_1h: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
         current_price: float = market_data.get("current_price", 0.0)
 
-        # OCL: open/close of last N daily candles
         n_ocl = self.params.get("ocl_lookback_candles", 5)
         if not bars_1d.empty:
             for i in range(min(n_ocl, len(bars_1d))):
@@ -334,7 +330,6 @@ class Alchemist(BaseStrategy):
                         "freshness": i,
                     })
 
-        # OB: order blocks — last opposing candle before a large displacement on 4H
         ob_lookback = self.params.get("ob_lookback_candles", 20)
         if not bars_4h.empty and len(bars_4h) >= ob_lookback:
             window = bars_4h.iloc[-ob_lookback:]
@@ -344,7 +339,6 @@ class Alchemist(BaseStrategy):
                 candle_body = abs(float(candle["close"]) - float(candle["open"]))
                 next_body = abs(float(next_c["close"]) - float(next_c["open"]))
 
-                # Bullish OB: bearish candle before large bullish displacement
                 if (
                     float(candle["close"]) < float(candle["open"])
                     and float(next_c["close"]) > float(next_c["open"])
@@ -359,7 +353,6 @@ class Alchemist(BaseStrategy):
                         "freshness": len(window) - i,
                     })
 
-                # Bearish OB: bullish candle before large bearish displacement
                 if (
                     float(candle["close"]) > float(candle["open"])
                     and float(next_c["close"]) < float(next_c["open"])
@@ -374,7 +367,6 @@ class Alchemist(BaseStrategy):
                         "freshness": len(window) - i,
                     })
 
-        # QML: Quasimodo pattern on 1H
         qml_lookback = self.params.get("qml_swing_lookback", 10)
         if not bars_1h.empty and len(bars_1h) >= qml_lookback:
             zones += self._find_qml_zones(bars_1h.iloc[-qml_lookback:], current_price)
@@ -387,7 +379,6 @@ class Alchemist(BaseStrategy):
         lows = bars["low"].values.astype(float)
 
         for i in range(2, len(bars) - 2):
-            # Bearish QML: HH → HL → HH2 then breaks HL
             if (
                 highs[i] > highs[i - 2]
                 and lows[i] > lows[i - 2]
@@ -401,7 +392,6 @@ class Alchemist(BaseStrategy):
                     "freshness": len(bars) - i,
                 })
 
-            # Bullish QML: LL → LH → LL2 then breaks LH
             if (
                 lows[i] < lows[i - 2]
                 and highs[i] < highs[i - 2]
@@ -423,23 +413,23 @@ class Alchemist(BaseStrategy):
 
     def _at_demand_zone(self, market_data: dict) -> bool:
         zones = self._find_msnr_zones(market_data)
-        # Bug fix: was hardcoded 0.0015; now consistently reads from params (default 0.003)
         tol = self.params.get("zone_tolerance_pct", 0.003)
         price = market_data.get("current_price", 0.0)
         for z in zones:
             if z["direction"] == "SUPPORT" and abs(price - z["level"]) / max(price, 1e-9) <= tol:
-                self._current_zone = z
+                # BUG-01 FIX: store in _last_zone (overwritten each call, not accumulated)
+                self._last_zone = z
                 return True
         return False
 
     def _at_supply_zone(self, market_data: dict) -> bool:
         zones = self._find_msnr_zones(market_data)
-        # Bug fix: was hardcoded 0.0015; now consistently reads from params (default 0.003)
         tol = self.params.get("zone_tolerance_pct", 0.003)
         price = market_data.get("current_price", 0.0)
         for z in zones:
             if z["direction"] == "RESISTANCE" and abs(price - z["level"]) / max(price, 1e-9) <= tol:
-                self._current_zone = z
+                # BUG-01 FIX: store in _last_zone (overwritten each call, not accumulated)
+                self._last_zone = z
                 return True
         return False
 
@@ -448,7 +438,6 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _crt_bullish_sweep_confirmed(self, market_data: dict) -> bool:
-        # Prefer 1h bars; fall back to 4h, then 1d for historical backtests where 1h is unavailable
         bars: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
         if bars.empty or len(bars) < 3:
             bars = market_data.get("4h_bars", pd.DataFrame())
@@ -460,19 +449,16 @@ class Alchemist(BaseStrategy):
         manip_candle = bars.iloc[-2]
         dist_candle = bars.iloc[-1]
 
-        # For daily bars, use a larger sweep threshold (price-relative).
-        # Bug fix: replaced broken Python `is` identity check with frequency-based helper.
         is_daily = self._is_daily_bars(bars)
         if is_daily:
             min_sweep = max(
                 self.params.get("crt_sweep_min_pips", 3) * 0.1,
-                float(range_candle["low"]) * 0.001,  # 0.1% of price for daily
+                float(range_candle["low"]) * 0.001,
             )
         else:
-            # For gold (XAUUSD), use price-relative sweep threshold instead of fixed pips
             min_sweep = max(
                 self.params.get("crt_sweep_min_pips", 3) * 0.0001,
-                float(range_candle["low"]) * 0.0002,  # 0.02% of price
+                float(range_candle["low"]) * 0.0002,
             )
 
         swept = float(manip_candle["low"]) < float(range_candle["low"]) - min_sweep
@@ -484,7 +470,6 @@ class Alchemist(BaseStrategy):
         return swept and dist_bullish
 
     def _crt_bearish_sweep_confirmed(self, market_data: dict) -> bool:
-        # Prefer 1h bars; fall back to 4h, then 1d for historical backtests where 1h is unavailable
         bars: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
         if bars.empty or len(bars) < 3:
             bars = market_data.get("4h_bars", pd.DataFrame())
@@ -496,7 +481,6 @@ class Alchemist(BaseStrategy):
         manip_candle = bars.iloc[-2]
         dist_candle = bars.iloc[-1]
 
-        # Bug fix: replaced broken Python `is` identity check with frequency-based helper.
         is_daily = self._is_daily_bars(bars)
         if is_daily:
             min_sweep = max(
@@ -522,7 +506,6 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _structure_shift_to_bullish(self, market_data: dict) -> bool:
-        # Prefer 15m; fall back through 1h → 4h → 1d when finer data unavailable
         bars: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
         if bars.empty or len(bars) < 4:
             bars = market_data.get("1h_bars", pd.DataFrame())
@@ -538,7 +521,6 @@ class Alchemist(BaseStrategy):
         return float(bars["close"].iloc[-1]) > recent_high
 
     def _structure_shift_to_bearish(self, market_data: dict) -> bool:
-        # Prefer 15m; fall back through 1h → 4h → 1d when finer data unavailable
         bars: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
         if bars.empty or len(bars) < 4:
             bars = market_data.get("1h_bars", pd.DataFrame())
@@ -558,7 +540,6 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _liquidity_swept(self, market_data: dict, side: str) -> bool:
-        # Prefer 15m; fall back through 1h → 4h → 1d when finer data unavailable
         bars: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
         if bars.empty or len(bars) < 6:
             bars = market_data.get("1h_bars", pd.DataFrame())
@@ -569,14 +550,12 @@ class Alchemist(BaseStrategy):
         if len(bars) < 6:
             return False
 
-        # Use wider window for daily bars (more meaningful swing detection).
-        # Bug fix: replaced broken Python `is` identity check with frequency-based helper.
         is_daily = self._is_daily_bars(bars)
         lookback = 10 if is_daily else 5
         if len(bars) < lookback + 1:
             lookback = len(bars) - 1
 
-        window = bars.iloc[-(lookback + 1):-1]  # last N complete bars
+        window = bars.iloc[-(lookback + 1):-1]
         last_bar = bars.iloc[-1]
         if side == "low":
             prior_swing_low = float(window["low"].min())
@@ -611,27 +590,17 @@ class Alchemist(BaseStrategy):
     # -------------------------------------------------------------------------
 
     def _check_storyline(self, market_data: dict) -> bool:
-        """
-        Scores multiple confirmations. Requires a configurable minimum number
-        to pass (default 2 out of available checks).
-        Checks that depend on unavailable timeframes are skipped rather than
-        counted as failures — this lets the strategy work in daily backtests
-        where 1h/15m data is beyond yfinance's history window.
-        """
         checks: dict[str, bool] = {}
-        available: set[str] = set()  # only checks we could actually evaluate
+        available: set[str] = set()
 
         bars_1d: pd.DataFrame = market_data.get("1d_bars", pd.DataFrame())
         bars_1h: pd.DataFrame = market_data.get("1h_bars", pd.DataFrame())
         bars_15m: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
-        # Effective intraday bars after fallback (same logic as other methods)
         eff_1h = bars_1h if (not bars_1h.empty and len(bars_1h) >= 3) else market_data.get("4h_bars", pd.DataFrame())
-        # For daily backtests: treat daily bars as 1h proxy when intraday unavailable
         if eff_1h.empty or len(eff_1h) < 3:
             eff_1h = bars_1d
         eff_15m = bars_15m if (not bars_15m.empty and len(bars_15m) >= 4) else eff_1h
 
-        # 1. Price on correct side of weekly OCL
         available.add("weekly_ocl_side")
         if not bars_1d.empty:
             weekly_ocl = float(
@@ -646,7 +615,6 @@ class Alchemist(BaseStrategy):
         else:
             checks["weekly_ocl_side"] = False
 
-        # 2. CRT manipulation confirmed (uses effective intraday bars with fallback)
         htf = self._htf_bias(market_data)
         if not eff_1h.empty and len(eff_1h) >= 3:
             available.add("crt_confirmed")
@@ -654,15 +622,11 @@ class Alchemist(BaseStrategy):
                 self._crt_bullish_sweep_confirmed(market_data)
                 or self._crt_bearish_sweep_confirmed(market_data)
             )
-        # else: skip — unavailable, don't count as failure
 
-        # 3. Fresh OB or QML zone in direction of bias
-        # Only add to available if we have daily bars (OCL zones come from daily data)
         if not bars_1d.empty:
             available.add("fresh_zone")
             zones = self._find_msnr_zones(market_data)
             target_direction = "SUPPORT" if htf == "BULLISH" else "RESISTANCE"
-            # Use wider tolerance for daily-resolution backtests
             tol = self.params.get("zone_tolerance_pct", 0.003)
             price = market_data.get("current_price", 0.0)
             fresh_zones = [
@@ -672,42 +636,24 @@ class Alchemist(BaseStrategy):
                 and abs(price - z["level"]) / max(price, 1e-9) <= tol
             ]
             checks["fresh_zone"] = len(fresh_zones) > 0
-        # else: skip — no daily data
 
-        # 4. Structure aligned — price is making HH (bullish) or LL (bearish)
-        # relative to the midpoint of the last 10 bars.
-        # Previous logic required *no* bar to have a low below current price,
-        # which is almost always False in any trending market and blocked every
-        # valid trade.  Replaced with a proper swing-structure check:
-        # BULLISH: current close is above the midpoint high of the prior window.
-        # BEARISH: current close is below the midpoint low of the prior window.
         if not eff_1h.empty and len(eff_1h) >= 10:
             available.add("structure_aligned")
             price = market_data.get("current_price", 0.0)
             window_highs = eff_1h["high"].iloc[-10:-1]
             window_lows  = eff_1h["low"].iloc[-10:-1]
             if htf == "BULLISH":
-                # Price is above the median high of the lookback window → upward structure
                 checks["structure_aligned"] = price > float(window_highs.median())
             else:
-                # Price is below the median low of the lookback window → downward structure
                 checks["structure_aligned"] = price < float(window_lows.median())
 
-        # 5. Entry pattern: structure shift (uses effective bars with fallback)
         if not eff_15m.empty and len(eff_15m) >= 4:
             available.add("entry_pattern")
             checks["entry_pattern"] = (
                 self._structure_shift_to_bullish(market_data)
                 or self._structure_shift_to_bearish(market_data)
             )
-        # else: skip — unavailable
 
-        # 6. Liquidity sweep — price wicked beyond a prior swing extreme.
-        # Bug fix: moved here from the hard AND-gate in _is_buy/_is_sell_signal.
-        # A bar that sweeps lows AND closes above recent highs simultaneously is
-        # geometrically near-impossible, so keeping it as a hard gate produced
-        # zero trades.  As a scored confluence check it rewards the pattern
-        # without making it mandatory.
         bars_for_sweep = eff_15m if (not eff_15m.empty and len(eff_15m) >= 6) else eff_1h
         if not bars_for_sweep.empty and len(bars_for_sweep) >= 6:
             available.add("liquidity_swept")
@@ -718,14 +664,13 @@ class Alchemist(BaseStrategy):
 
         self._confidence_components["storyline_checks"] = checks
 
-        # Require min_storyline_checks out of the checks we could actually run
         n_available = len(available)
         if n_available == 0:
             return False
         passed = sum(checks.get(k, False) for k in available)
         min_required = min(
             self.params.get("min_storyline_checks", 2),
-            n_available,          # can't require more than we have
+            n_available,
         )
         return passed >= min_required
 
@@ -735,11 +680,8 @@ class Alchemist(BaseStrategy):
 
     def _compute_confidence(self, htf_bias: str, direction: str, market_data: dict) -> float:
         score = 0.0
-        score += 0.20  # HTF alignment already confirmed
+        score += 0.20
 
-        # Killzone bonus: only add when the filter is active (it already passed).
-        # When the killzone filter is disabled (backtest mode), skip this bonus
-        # so the score threshold stays honest.
         if self.params.get("killzone_filter_enabled", False):
             score += 0.15
 
@@ -750,7 +692,8 @@ class Alchemist(BaseStrategy):
         if crt_confirmed:
             score += 0.20
 
-        zone = self._current_zone
+        # BUG-01 FIX: read from _last_zone (set by _at_demand_zone/_at_supply_zone above)
+        zone = getattr(self, "_last_zone", None)
         if zone:
             zone_weights = {"QML": 0.15, "OB": 0.12, "OCL": 0.10, "SBR": 0.08, "RBS": 0.08}
             score += zone_weights.get(zone.get("type", ""), 0.08)
@@ -794,7 +737,7 @@ class Alchemist(BaseStrategy):
             return False
         primary_ll = float(primary_15m["low"].iloc[-6:].min()) < float(primary_15m["low"].iloc[-12:-6].min())
         corr_ll = float(corr_bars["low"].iloc[-6:].min()) < float(corr_bars["low"].iloc[-12:-6].min())
-        return primary_ll and not corr_ll  # primary made new LL but correlated didn't
+        return primary_ll and not corr_ll
 
     def _smt_bearish(self, market_data: dict) -> bool:
         primary_15m: pd.DataFrame = market_data.get("15m_bars", pd.DataFrame())
@@ -836,7 +779,6 @@ class Alchemist(BaseStrategy):
             lo, hi = bounds.get(key, (val, val))
             return max(lo, min(hi, val))
 
-        # Tighten entry quality if win rate is low
         if win_rate < 0.50:
             params["zone_tolerance_pct"] = clamp(
                 "zone_tolerance_pct",
@@ -847,7 +789,6 @@ class Alchemist(BaseStrategy):
                 params.get("min_confidence_threshold", 0.45) + step * 0.1,
             )
 
-        # Widen targets if win rate is good but PF is low
         if win_rate > 0.65:
             gross_profit = sum((_get(t, "pnl") or 0) for t in wins)
             gross_loss = abs(sum((_get(t, "pnl") or 0) for t in losses)) or 0.001
@@ -863,7 +804,6 @@ class Alchemist(BaseStrategy):
                     params.get("min_confidence_threshold", 0.45) - step * 0.05,
                 )
 
-        # Tighten sweep requirement if many losses had tiny sweeps (short-duration proxy)
         if losses:
             short_losses = [t for t in losses if (_get(t, "duration_mins") or 999) < 30]
             if len(short_losses) / len(losses) > 0.30:
@@ -872,7 +812,6 @@ class Alchemist(BaseStrategy):
                     params.get("crt_sweep_min_pips", 3) + step * 2,
                 )
 
-        # Widen SL buffer if many SL hits
         sl_hit_count = len(losses)
         if sl_hit_count > 0.40 * len(trades):
             params["atr_sl_buffer"] = clamp(

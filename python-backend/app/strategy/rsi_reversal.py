@@ -37,26 +37,29 @@ class RSIReversalStrategy(BaseStrategy):
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()
 
-    def signal(self, market_data: dict) -> str | None:
+    def signal(self, market_data: dict) -> tuple[str | None, float]:
+        """BUG-02: Returns (direction, confidence) tuple."""
         rsi = market_data.get("rsi")
         if rsi is None:
-            return None
+            return None, 0.0
         oversold = float(self.params.get("oversold_threshold", 30.0))
         overbought = float(self.params.get("overbought_threshold", 70.0))
         prev_rsi = market_data.get("prev_rsi")
         if prev_rsi is not None:
             if prev_rsi <= oversold and rsi > oversold:
-                return "BUY"
+                return "BUY", 1.0
             if prev_rsi >= overbought and rsi < overbought:
-                return "SELL"
+                return "SELL", 1.0
         else:
             if rsi < oversold:
-                return "BUY"
+                return "BUY", 1.0
             if rsi > overbought:
-                return "SELL"
-        return None
+                return "SELL", 1.0
+        return None, 0.0
 
     def compute_levels(self, direction: str, price: float, params: dict) -> dict:
+        # BUG-08: ensure TP multipliers are in ascending order before computing levels
+        params = self._sort_tp_multipliers(params)
         sl_pct = float(params.get("stop_loss_pct", DEFAULT_PARAMS["stop_loss_pct"]))
         sl_dist = price * (sl_pct / 100.0)
         sign = 1 if direction == "BUY" else -1

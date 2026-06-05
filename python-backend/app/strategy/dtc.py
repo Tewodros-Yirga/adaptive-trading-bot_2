@@ -40,22 +40,28 @@ def resolve_params(raw: dict[str, Any] | None) -> DTCParams:
 
 
 def bullish_trend(ema_values: dict[str, float]) -> bool:
+    vals = [ema_values.get(f"ema_{i}") for i in range(1, 7)]
+    if any(v is None for v in vals):
+        return False
     return (
-        ema_values["ema_1"] > ema_values["ema_2"]
-        and ema_values["ema_2"] > ema_values["ema_3"]
-        and ema_values["ema_3"] > ema_values["ema_4"]
-        and ema_values["ema_4"] > ema_values["ema_5"]
-        and ema_values["ema_5"] > ema_values["ema_6"]
+        vals[0] > vals[1]
+        and vals[1] > vals[2]
+        and vals[2] > vals[3]
+        and vals[3] > vals[4]
+        and vals[4] > vals[5]
     )
 
 
 def bearish_trend(ema_values: dict[str, float]) -> bool:
+    vals = [ema_values.get(f"ema_{i}") for i in range(1, 7)]
+    if any(v is None for v in vals):
+        return False
     return (
-        ema_values["ema_1"] < ema_values["ema_2"]
-        and ema_values["ema_2"] < ema_values["ema_3"]
-        and ema_values["ema_3"] < ema_values["ema_4"]
-        and ema_values["ema_4"] < ema_values["ema_5"]
-        and ema_values["ema_5"] < ema_values["ema_6"]
+        vals[0] < vals[1]
+        and vals[1] < vals[2]
+        and vals[2] < vals[3]
+        and vals[3] < vals[4]
+        and vals[4] < vals[5]
     )
 
 
@@ -106,16 +112,20 @@ class DTCStrategy(BaseStrategy):
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()
 
-    def signal(self, market_data: dict) -> str | None:
+    def signal(self, market_data: dict) -> tuple[str | None, float]:
+        """BUG-02: Returns (direction, confidence) tuple."""
         ema_values = market_data.get("ema_values", {})
         if not ema_values:
-            return None
+            return None, 0.0
         previous_bull = market_data.get("previous_bull", False)
         previous_bear = market_data.get("previous_bear", False)
         current_bull = bullish_trend(ema_values)
         current_bear = bearish_trend(ema_values)
-        return trend_shift_signal(previous_bull, previous_bear, current_bull, current_bear)
+        direction = trend_shift_signal(previous_bull, previous_bear, current_bull, current_bear)
+        return (direction, 1.0) if direction else (None, 0.0)
 
     def compute_levels(self, direction: str, price: float, params: dict) -> dict:
+        # BUG-08: ensure TP multipliers are in ascending order before computing levels
+        params = self._sort_tp_multipliers(params)
         p = resolve_params(params)
         return compute_levels(direction, price, p)

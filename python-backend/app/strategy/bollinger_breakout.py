@@ -37,7 +37,8 @@ class BollingerBreakoutStrategy(BaseStrategy):
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()
 
-    def signal(self, market_data: dict) -> str | None:
+    def signal(self, market_data: dict) -> tuple[str | None, float]:
+        """BUG-02: Returns (direction, confidence) tuple."""
         price = market_data.get("price")
         upper_band = market_data.get("bb_upper")
         lower_band = market_data.get("bb_lower")
@@ -45,15 +46,17 @@ class BollingerBreakoutStrategy(BaseStrategy):
         prev_upper = market_data.get("prev_bb_upper")
         prev_lower = market_data.get("prev_bb_lower")
         if None in (price, upper_band, lower_band):
-            return None
+            return None, 0.0
         if prev_price is not None and prev_upper is not None and prev_lower is not None:
             if prev_price <= prev_upper and price > upper_band:
-                return "BUY"
+                return "BUY", 1.0
             if prev_price >= prev_lower and price < lower_band:
-                return "SELL"
-        return None
+                return "SELL", 1.0
+        return None, 0.0
 
     def compute_levels(self, direction: str, price: float, params: dict) -> dict:
+        # BUG-08: ensure TP multipliers are in ascending order before computing levels
+        params = self._sort_tp_multipliers(params)
         atr = params.get("atr", price * 0.003)
         atr_mult = float(params.get("atr_sl_multiplier", DEFAULT_PARAMS["atr_sl_multiplier"]))
         sl_dist = float(atr) * atr_mult

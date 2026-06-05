@@ -387,6 +387,12 @@ def _run_backtest_sync(
             continue
 
         # ── Build market_data for this bar ───────────────────────────────
+        # Sliding OHLCV window — needed by ADX_Regime, OBV_Momentum,
+        # StochRSI_Cross, HTF_Structure. Additive — existing strategies ignore it.
+        _OHLCV_WINDOW_SIZE = 200
+        _window_start = max(0, i - _OHLCV_WINDOW_SIZE + 1)
+        ohlcv_window = ohlcv[_window_start : i + 1]
+
         if is_mtf_strategy and extra_ohlcv_by_tf:
             bars_by_tf = _build_mtf_bars_for_index(i, ohlcv, extra_ohlcv_by_tf)
             from .ohlcv import build_mtf_market_data
@@ -408,8 +414,9 @@ def _run_backtest_sync(
                 bars_by_tf=bars_by_tf,
                 atr=atr_val,
             )
-            market_data_bar["timestamp"] = bar_ts
+            market_data_bar["timestamp"]     = bar_ts
             market_data_bar["current_price"] = price
+            market_data_bar["ohlcv_window"]  = ohlcv_window
 
             raw_sig = strat.signal(market_data_bar)
             if isinstance(raw_sig, tuple):
@@ -441,8 +448,9 @@ def _run_backtest_sync(
                 bars_by_tf=bars_by_tf,
                 atr=atr_val,
             )
-            market_data_bar["timestamp"] = bar_ts
+            market_data_bar["timestamp"]     = bar_ts
             market_data_bar["current_price"] = price
+            market_data_bar["ohlcv_window"]  = ohlcv_window
 
             raw_sig = strat.signal(market_data_bar)
             if isinstance(raw_sig, tuple):
@@ -493,7 +501,25 @@ def _run_backtest_sync(
                 "prev_bb_lower":  bb_lower_series[i - 1],
                 # VWAP (VWAP_Reversion)
                 "vwap":           vwap_series[i],
+                # OHLCV window for ADX_Regime, OBV_Momentum, StochRSI_Cross, HTF_Structure
+                "ohlcv_window":   ohlcv_window,
             }
+
+            # HTF_Structure: inject 4h_bars and 1d_bars DataFrames when available
+            if strategy_name == "HTF_Structure" and extra_ohlcv_by_tf:
+                import pandas as _pd
+                _cutoff = bar_date[:10]
+                for _htf_key, _htf_col in (("4h", "4h_bars"), ("1d", "1d_bars")):
+                    _htf_raw = extra_ohlcv_by_tf.get(_htf_key, [])
+                    _htf_filtered = [r for r in _htf_raw if r.get("date", "")[:10] <= _cutoff]
+                    if _htf_filtered:
+                        _htf_df = _pd.DataFrame(_htf_filtered)
+                        _htf_df["datetime"] = _pd.to_datetime(_htf_df["date"])
+                        _htf_df = _htf_df.set_index("datetime")
+                        for _col in ("open", "high", "low", "close", "volume"):
+                            if _col in _htf_df.columns:
+                                _htf_df[_col] = _pd.to_numeric(_htf_df[_col], errors="coerce")
+                        market_data_bar[_htf_col] = _htf_df.dropna(subset=["close"])
 
             signal = strat.signal(market_data_bar)
             if signal:

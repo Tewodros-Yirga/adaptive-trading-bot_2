@@ -14,6 +14,10 @@ Phase 4 additions:
     Uses `build_mtf_market_data()` + `fetch_ohlcv_with_fallback()` from ohlcv.py.
   - Per-strategy MTF data is fetched once per orchestrator call and reused across
     all active MTF strategies (keyed by symbol).
+  - EnsembleVoter (with optimized backtested weights from WeightManager) replaces
+    the ad-hoc resolve_direction() call inside process_signal().  pick_and_route()
+    is still called for the StrategyPickerDecision audit record and news-veto check,
+    but direction/confidence/weights are overridden by the voter result.
 
 Fix (confidence always 0.0):
   - Non-MTF strategies return a plain string signal, so confidence was being set
@@ -159,6 +163,33 @@ def _enrich_market_data_from_df(df, params: dict) -> dict:
         if not math.isnan(last_vwap):
             enriched["vwap"] = float(last_vwap)
 
+        # ── OBV ───────────────────────────────────────────────────────────────
+        # OBV series needed by OBV_Momentum strategy
+        if "volume" in df.columns:
+            obv = [0.0]
+            for k in range(1, len(df)):
+                if df["close"].iloc[k] > df["close"].iloc[k - 1]:
+                    obv.append(obv[-1] + float(df["volume"].iloc[k]))
+                elif df["close"].iloc[k] < df["close"].iloc[k - 1]:
+                    obv.append(obv[-1] - float(df["volume"].iloc[k]))
+                else:
+                    obv.append(obv[-1])
+            enriched["obv_series"] = obv  # full series; strategies slice from [-N:]
+
+        # ── OHLCV window for ADX_Regime, OBV_Momentum, StochRSI_Cross, HTF_Structure ──
+        # Convert the DataFrame's last min(200, len(df)) rows to a list of dicts.
+        enriched["ohlcv_window"] = [
+            {
+                "date": str(ts),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": float(r.get("volume", 0) or 0),
+            }
+            for ts, r in df.tail(200).iterrows()
+        ]
+
         return enriched
 
     except Exception as exc:
@@ -216,6 +247,10 @@ def resolve_direction(
     weights: dict[str, float],
 ) -> tuple[str | None, float]:
     """
+    DEPRECATED — Direction resolution is now handled by EnsembleVoter.vote()
+    in process_signal(). This function is retained only because strategy_picker.py
+    still calls it for its own weighted-vote fallback path.
+
     Unified weighted-vote direction resolver.
     Returns (resolved_direction, confidence_score).
 
@@ -302,6 +337,49 @@ def resolve_ensemble_levels(
 
 
 # ---------------------------------------------------------------------------
+# EnsembleVoter helpers (Phase 4)
+# ---------------------------------------------------------------------------
+
+def _load_ensemble_voter(db: Database) -> "EnsembleVoter":  # type: ignore[name-defined]
+    """
+    Load current ensemble weights from MongoDB and construct an EnsembleVoter.
+
+    Falls back to equal weights (via WeightManager.get_default_weights()) if
+    no weights have been saved yet by the EnsembleBacktester.
+
+    Import EnsembleVoter and WeightManager lazily (inside the function body)
+    to avoid circular imports and to keep them out of the module-level
+    import block, which the backtester service also imports.
+    """
+    from ..strategy.ensemble.voter import EnsembleVoter
+    from ..strategy.ensemble.weight_manager import WeightManager
+
+    wm = WeightManager()
+    weights = wm.load_weights(db)
+    suspended = wm.get_suspended_strategies(db)
+
+    if weights is None:
+        weights = wm.get_default_weights()
+        logger.debug("EnsembleVoter: no saved weights found — using defaults")
+
+    return EnsembleVoter(
+        weights=weights,
+        threshold=_read_ensemble_threshold(db),
+        suspended_strategies=suspended,
+    )
+
+
+def _read_ensemble_threshold(db: Database) -> float:
+    """Read voting threshold from AppSettings; default 0.60."""
+    raw = crud.get_setting(db, "ensemble_voting_threshold")
+    try:
+        val = float(raw)
+        return max(0.40, min(0.80, val))  # clamp to valid range
+    except (TypeError, ValueError):
+        return 0.60
+
+
+# ---------------------------------------------------------------------------
 # Strategy DB helpers
 # ---------------------------------------------------------------------------
 
@@ -377,16 +455,21 @@ async def process_signal(
     extra_trade_fields: dict | None = None,
 ) -> dict:
     """
-    Main orchestrator entry point (Phase 3 + Phase 4 MTF + Model 2 news learning).
+    Main orchestrator entry point (Phase 3 + Phase 4 MTF + EnsembleVoter + Model 2).
 
     1. Determine which active strategies require MTF data; fetch once.
     2. Gather signals from all active strategies (injecting MTF market_data
        for strategies with requires_mtf=True).
-    3. Delegate selection + direction resolution to strategy_picker.pick_and_route().
-    4. Apply risk check.
-    5. Place order via bridge.
-    6. Log EnsembleDecision and back-fill StrategyPickerDecision.trade_id.
-    7. (Model 2) Call learn_from_trade so news items published before this
+    3. Call strategy_picker.pick_and_route() for the StrategyPickerDecision
+       audit record and news-veto check.
+    4. Override direction/confidence/weights with EnsembleVoter result (uses
+       optimized backtested weights from WeightManager).  Falls back to picker
+       result if EnsembleVoter raises any exception.
+    5. Apply risk check.
+    6. Place order via bridge.
+    7. Log EnsembleDecision (with voter breakdown) and back-fill
+       StrategyPickerDecision.trade_id.
+    8. (Model 2) Call learn_from_trade so news items published before this
        trade are marked as trade_correlation_pending for later learning.
 
     Confidence fix: for non-MTF strategies, signal() returns a plain string.
@@ -525,7 +608,10 @@ async def process_signal(
     except Exception as exc:
         logger.warning("Shadow signal logging failed: %s", exc)
 
-    # ── Strategy Picker: select + resolve ──────────────────────────────────
+    # ── Strategy Picker: audit trail + news-veto check ────────────────────
+    # pick_and_route() is still called to persist the StrategyPickerDecision
+    # record and to apply any news-veto logic.  Its direction/confidence output
+    # is overridden below by the EnsembleVoter result.
     picker_result = await pick_and_route(symbol, signal_dicts, db)
     picker_decision_id: int | None = picker_result.get("picker_decision_id")
 
@@ -536,11 +622,72 @@ async def process_signal(
             "picker_decision_id": picker_decision_id,
         }
 
-    final_direction: str | None = picker_result.get("resolved_direction")
-    resolved_confidence: float = float(picker_result.get("picker_confidence") or 0.0)
-    ensemble_weights: dict[str, float] = picker_result.get("ensemble_weights") or {}
-    levels: dict = picker_result.get("levels") or {}
-    selected_strategies: list[str] = picker_result.get("selected_strategies") or []
+    # ── EnsembleVoter: weighted consensus decision (Phase 4) ──────────────
+    # Load optimized backtested weights from MongoDB and run the voter.
+    # Falls back to picker result on any exception to keep the live loop safe.
+    _vote_result: dict = {}
+    _level_strategy_name: str | None = None
+
+    try:
+        _voter = _load_ensemble_voter(db)
+        _vote_result = _voter.vote(signal_dicts)
+        final_direction: str | None = _vote_result["direction"]
+        resolved_confidence: float = float(_vote_result["confidence"])
+        ensemble_weights: dict[str, float] = _voter.normalized_weights
+        _level_strategy_name = (
+            _voter.get_level_strategy(final_direction, signal_dicts)
+            if final_direction else None
+        )
+        logger.info(
+            "[EnsembleVoter] %s | direction=%s conf=%.3f buy=%.3f sell=%.3f fired=%s "
+            "level_strategy=%s threshold=%.2f",
+            symbol, final_direction, resolved_confidence,
+            _vote_result["buy_score"], _vote_result["sell_score"],
+            _vote_result["fired"], _level_strategy_name,
+            _vote_result["threshold_used"],
+        )
+    except Exception as _voter_exc:
+        # Voter failure: degrade gracefully to picker result
+        logger.warning(
+            "[EnsembleVoter] Failed — falling back to picker result: %s", _voter_exc
+        )
+        final_direction = picker_result.get("resolved_direction")
+        resolved_confidence = float(picker_result.get("picker_confidence") or 0.0)
+        ensemble_weights = picker_result.get("ensemble_weights") or {}
+        _level_strategy_name = None
+
+    # ── Compute levels via the designated level strategy ──────────────────
+    levels: dict = {}
+    if final_direction and _level_strategy_name:
+        try:
+            _level_strat_row = next(
+                (s for s in active_strategies if s.name == _level_strategy_name), None
+            )
+            if _level_strat_row:
+                _level_params = json.loads(_level_strat_row.params_json or "{}")
+                _level_strat_obj = get_strategy(_level_strategy_name, _level_params)
+                _levels_raw = _level_strat_obj.compute_levels(
+                    final_direction, price, _level_params
+                )
+                if _levels_raw:
+                    levels = {"entry": price, **_levels_raw}
+                    logger.debug(
+                        "[Levels] computed by %s: sl=%.5f tp1=%.5f",
+                        _level_strategy_name,
+                        levels.get("sl", 0),
+                        levels.get("tp1", 0),
+                    )
+        except Exception as _lvl_exc:
+            logger.warning(
+                "[Levels] compute_levels failed for %s: %s", _level_strategy_name, _lvl_exc
+            )
+
+    selected_strategies: list[str] = [
+        s["strategy_name"]
+        for s in signal_dicts
+        if s.get("direction") == final_direction
+        and float(s.get("confidence") or 0.0) > 0.0
+    ]
 
     if not final_direction:
         # ── News-driven fallback ───────────────────────────────────────────
@@ -585,8 +732,28 @@ async def process_signal(
             decision = _log_ensemble_decision(
                 db, symbol, signal_dicts, ensemble_weights, None, 0.0,
                 levels={}, news_bias=_nb,
+                voter_breakdown=_vote_result.get("votes_breakdown"),
             )
             signals_summary = {sd["strategy_name"]: sd["direction"] for sd in signal_dicts}
+            # ── Broadcast ensemble_vote (no signal) to dashboard clients ──
+            try:
+                from ..routers.websocket import broadcast_ws_event
+                import asyncio as _asyncio
+                _asyncio.create_task(broadcast_ws_event({
+                    "event": "ensemble_vote",
+                    "symbol": symbol,
+                    "direction": None,
+                    "confidence": 0.0,
+                    "fired": False,
+                    "buy_score": _vote_result.get("buy_score", 0.0),
+                    "sell_score": _vote_result.get("sell_score", 0.0),
+                    "threshold": _vote_result.get("threshold_used", 0.60),
+                    "votes_breakdown": _vote_result.get("votes_breakdown", []),
+                    "level_strategy": None,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }))
+            except Exception:
+                pass
             return {
                 "status": "NO_SIGNAL",
                 "signals": signals_summary,
@@ -630,6 +797,7 @@ async def process_signal(
         decision = _log_ensemble_decision(
             db, symbol, signal_dicts, ensemble_weights, final_direction, resolved_confidence,
             levels=levels, news_bias=news_bias, risk_blocked=True, block_reason=block_reason,
+            voter_breakdown=_vote_result.get("votes_breakdown"),
         )
         trade = crud.log_trade(
             db,
@@ -728,6 +896,7 @@ async def process_signal(
                 final_direction, resolved_confidence,
                 levels=levels, news_bias=news_bias,
                 block_reason="duplicate_blocked: " + "; ".join(reasons_blocked),
+                voter_breakdown=_vote_result.get("votes_breakdown"),
             )
             return {
                 "status":               "BLOCKED_DUPLICATE_POSITION",
@@ -819,7 +988,28 @@ async def process_signal(
     decision = _log_ensemble_decision(
         db, symbol, signal_dicts, ensemble_weights, final_direction, resolved_confidence,
         levels=levels, news_bias=news_bias, trade_id=trade.id,
+        voter_breakdown=_vote_result.get("votes_breakdown"),
     )
+
+    # ── Broadcast ensemble_vote (fired trade) to dashboard clients ────────
+    try:
+        from ..routers.websocket import broadcast_ws_event
+        import asyncio as _asyncio
+        _asyncio.create_task(broadcast_ws_event({
+            "event": "ensemble_vote",
+            "symbol": symbol,
+            "direction": final_direction,
+            "confidence": resolved_confidence,
+            "fired": True,
+            "buy_score": _vote_result.get("buy_score", 0.0),
+            "sell_score": _vote_result.get("sell_score", 0.0),
+            "threshold": _vote_result.get("threshold_used", 0.60),
+            "votes_breakdown": _vote_result.get("votes_breakdown", []),
+            "level_strategy": _level_strategy_name,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }))
+    except Exception as _ws_exc:
+        logger.debug("WebSocket ensemble_vote broadcast failed: %s", _ws_exc)
 
     if picker_decision_id:
         crud.update_picker_decision_trade_id(db, picker_decision_id, trade.id)
@@ -860,31 +1050,44 @@ def _log_ensemble_decision(
     risk_blocked: bool = False,
     block_reason: str | None = None,
     trade_id: int | None = None,
+    voter_breakdown: list[dict] | None = None,  # Phase 4: EnsembleVoter breakdown
 ) -> EnsembleDecision:
-    total_w = sum(weights.values()) or 1.0
-    norm_weights = {k: v / total_w for k, v in weights.items()}
+    """
+    Persist an EnsembleDecision audit record.
 
-    strategy_votes = []
-    for sd in signal_dicts:
-        name = sd["strategy_name"]
-        w = norm_weights.get(name, 0.0)
-        conf = float(sd.get("confidence") or 0.0)
-        direction = sd.get("direction")
-        was_agreeing = direction == resolved_direction if resolved_direction else False
-        strategy_votes.append(
-            {
-                "strategy_name": name,
-                "direction": direction,
-                "confidence": conf,
-                "weight": round(w, 6),
-                "weighted_vote": round(w * conf, 6),
-                "proposed_entry": sd.get("proposed_entry"),
-                "proposed_sl": sd.get("proposed_sl"),
-                "proposed_tp1": sd.get("proposed_tp1"),
-                "was_agreeing": was_agreeing,
-                "contributed_to_levels": was_agreeing and w > 0,
-            }
-        )
+    If `voter_breakdown` is provided (from EnsembleVoter.vote()["votes_breakdown"]),
+    it is stored directly in strategy_votes_json — it is already in the correct
+    per-strategy dict format and includes suspension/contribution flags.
+    If not provided (e.g. voter fell back to picker), the legacy manual construction
+    is used so all existing call sites remain backward-compatible.
+    """
+    if voter_breakdown is not None:
+        strategy_votes = voter_breakdown
+    else:
+        total_w = sum(weights.values()) or 1.0
+        norm_weights = {k: v / total_w for k, v in weights.items()}
+
+        strategy_votes = []
+        for sd in signal_dicts:
+            name = sd["strategy_name"]
+            w = norm_weights.get(name, 0.0)
+            conf = float(sd.get("confidence") or 0.0)
+            direction = sd.get("direction")
+            was_agreeing = direction == resolved_direction if resolved_direction else False
+            strategy_votes.append(
+                {
+                    "strategy_name": name,
+                    "direction": direction,
+                    "confidence": conf,
+                    "weight": round(w, 6),
+                    "weighted_vote": round(w * conf, 6),
+                    "proposed_entry": sd.get("proposed_entry"),
+                    "proposed_sl": sd.get("proposed_sl"),
+                    "proposed_tp1": sd.get("proposed_tp1"),
+                    "was_agreeing": was_agreeing,
+                    "contributed_to_levels": was_agreeing and w > 0,
+                }
+            )
 
     fields = {
         "symbol": symbol,

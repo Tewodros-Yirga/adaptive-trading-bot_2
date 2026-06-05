@@ -67,7 +67,12 @@ def list_all(db: Database = Depends(get_db)):
 # ── Ensemble config — MUST be before /{name} to avoid path conflict ───────
 @router.get("/ensemble/config")
 def get_ens_config(db: Database = Depends(get_db)):
-    return get_ensemble_config(db)
+    config = get_ensemble_config(db)
+    config["_note"] = (
+        "This config is used by strategy_picker for picker-level scoring only. "
+        "Live trade direction is now decided by EnsembleVoter — see GET /ensemble/weights."
+    )
+    return config
 
 
 @router.post("/ensemble/config")
@@ -374,27 +379,6 @@ def get_best_candidate(name: str, db: Database = Depends(get_db)):
     return crud.get_best_backtest_candidate(db, name)
 
 
-# @router.get("/{name}/search-status", response_model=SearchStatusOut)
-# async def search_status(name: str, db: Database = Depends(get_db)):
-#     _ensure_strategies_exist(db)
-#     doc = db[COLL_STRATEGIES].find_one({"name": name})
-#     if not doc:
-#         raise HTTPException(404, f"Strategy {name} not found")
-
-#     from ..config import settings
-#     import httpx
-#     try:
-#         async with httpx.AsyncClient(timeout=settings.backtester_service_timeout) as client:
-#             r = await client.get(f"{settings.backtester_service_url}/status/{name}")
-#             if r.status_code == 200:
-#                 return r.json()
-#     except Exception:
-#         pass
-
-#     from ..services.continuous_backtest import get_search_status
-#     return get_search_status(name)
-
-
 @router.post("/{name}/search-settings")
 def update_search_settings(
     name: str,
@@ -428,28 +412,6 @@ def update_search_settings(
     return {"status": "updated", "settings": updated}
 
 
-# @router.post("/{name}/pause-search")
-# def pause_search(name: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
-#     _ensure_strategies_exist(db)
-#     doc = db[COLL_STRATEGIES].find_one({"name": name})
-#     if not doc:
-#         raise HTTPException(404, f"Strategy {name} not found")
-#     from ..services.continuous_backtest import pause_search as _pause
-#     _pause(name)
-#     return {"status": "paused", "strategy": name}
-
-
-# @router.post("/{name}/resume-search")
-# def resume_search(name: str, db: Database = Depends(get_db), _a=Depends(require_admin)):
-#     _ensure_strategies_exist(db)
-#     doc = db[COLL_STRATEGIES].find_one({"name": name})
-#     if not doc:
-#         raise HTTPException(404, f"Strategy {name} not found")
-#     from ..services.continuous_backtest import resume_search as _resume
-#     _resume(name)
-#     return {"status": "resumed", "strategy": name}
-
-
 # ── Internal helpers ──────────────────────────────────────────────────────
 
 def _get_strategy_stats(db: Database, strategy_name: str) -> dict:
@@ -474,7 +436,6 @@ def _get_strategy_stats(db: Database, strategy_name: str) -> dict:
     }
 
 
-    
 @router.get("/{strategy_name}/search-status")
 def search_status(strategy_name: str, db: Database = Depends(get_db)):
     """

@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
     try:
         db = get_database()
         from .crud import get_current_params, save_params
+        # NOTE: DEFAULT_PARAMS here seeds DTC-specific global params as a one-time
+        # startup default. Each strategy's own params are seeded by _ensure_strategies_exist()
+        # at startup step 4. This block only runs when no ParameterVersion record exists yet.
         from .strategy.dtc import DEFAULT_PARAMS
         if not get_current_params(db):
             save_params(db, DEFAULT_PARAMS.copy(), reason="Initial defaults", trigger="SYSTEM")

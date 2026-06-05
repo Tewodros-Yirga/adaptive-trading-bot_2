@@ -39,25 +39,28 @@ class MACDMomentumStrategy(BaseStrategy):
     def default_params(cls) -> dict:
         return DEFAULT_PARAMS.copy()
 
-    def signal(self, market_data: dict) -> str | None:
+    def signal(self, market_data: dict) -> tuple[str | None, float]:
+        """BUG-02: Returns (direction, confidence) tuple."""
         macd_line = market_data.get("macd_line")
         signal_line = market_data.get("macd_signal")
         histogram = market_data.get("macd_histogram", 0)
         prev_macd = market_data.get("prev_macd_line")
         prev_signal = market_data.get("prev_macd_signal")
         if macd_line is None or signal_line is None:
-            return None
+            return None, 0.0
         hist_thresh = float(self.params.get("histogram_threshold", 0.0))
         if prev_macd is not None and prev_signal is not None:
             crossed_up = prev_macd <= prev_signal and macd_line > signal_line
             crossed_down = prev_macd >= prev_signal and macd_line < signal_line
             if crossed_up and histogram > hist_thresh:
-                return "BUY"
+                return "BUY", 1.0
             if crossed_down and histogram < -hist_thresh:
-                return "SELL"
-        return None
+                return "SELL", 1.0
+        return None, 0.0
 
     def compute_levels(self, direction: str, price: float, params: dict) -> dict:
+        # BUG-08: ensure TP multipliers are in ascending order before computing levels
+        params = self._sort_tp_multipliers(params)
         sl_pct = float(params.get("stop_loss_pct", DEFAULT_PARAMS["stop_loss_pct"]))
         sl_dist = price * (sl_pct / 100.0)
         sign = 1 if direction == "BUY" else -1
