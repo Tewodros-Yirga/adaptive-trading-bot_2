@@ -717,6 +717,19 @@ def seed_default_settings(db: Database) -> None:
         "position_reconciliation_interval_seconds": "60",
     }
 
+    # ── Position stacking / reversal ──────────────────────────────────────
+    position_mgmt_defaults: dict[str, str] = {
+        # Opposite-direction reversal thresholds
+        "reversal_full_close_confidence": "0.80",
+        "reversal_partial_close_confidence": "0.65",
+        "reversal_partial_close_pct": "0.50",
+        # Same-direction stacking — escalating confidence per additional position
+        "duplicate_min_confidence": "0.75",
+        "duplicate_min_price_distance_atr": "1.0",
+        "duplicate_min_strategy_count": "2",
+        "duplicate_confidence_escalation": "0.10",
+    }
+
     per_strategy_defaults: dict[str, str] = {
         "qualify_threshold_win_rate": "55.0",
         "score_weight_win_rate": "0.6",
@@ -760,6 +773,9 @@ def seed_default_settings(db: Database) -> None:
         _maybe_insert(key, value)
 
     for key, value in live_trading_defaults.items():
+        _maybe_insert(key, value)
+
+    for key, value in position_mgmt_defaults.items():
         _maybe_insert(key, value)
 
     for strategy_name in STRATEGY_REGISTRY.keys():

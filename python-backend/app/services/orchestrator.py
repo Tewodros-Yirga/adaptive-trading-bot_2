@@ -842,16 +842,26 @@ async def process_signal(
         logger.warning("Could not fetch live positions for duplicate check: %s", _dup_exc)
 
     if existing_same_dir:
-        dup_min_conf     = float(crud.get_setting(db, "duplicate_min_confidence")         or 0.75)
-        dup_min_atr_dist = float(crud.get_setting(db, "duplicate_min_price_distance_atr") or 1.0)
-        dup_min_strats   = int(  crud.get_setting(db, "duplicate_min_strategy_count")     or 2)
-        _atr             = float(market_data.get("atr") or price * 0.005)
+        dup_min_conf        = float(crud.get_setting(db, "duplicate_min_confidence")         or 0.75)
+        dup_min_atr_dist    = float(crud.get_setting(db, "duplicate_min_price_distance_atr") or 1.0)
+        dup_min_strats      = int(  crud.get_setting(db, "duplicate_min_strategy_count")     or 2)
+        _atr                = float(market_data.get("atr") or price * 0.005)
+
+        # Escalate confidence requirement per additional stacked position
+        position_count      = len(existing_same_dir)
+        escalation_factor   = float(crud.get_setting(db, "duplicate_confidence_escalation") or 0.10)
+        dup_min_conf_escalated = min(
+            dup_min_conf + (position_count - 1) * escalation_factor,
+            0.95,  # hard cap
+        )
 
         reasons_blocked: list[str] = []
 
-        if resolved_confidence < dup_min_conf:
+        if resolved_confidence < dup_min_conf_escalated:
             reasons_blocked.append(
-                f"confidence {resolved_confidence:.3f} < required {dup_min_conf:.3f} for duplicate"
+                f"confidence {resolved_confidence:.3f} < required {dup_min_conf_escalated:.3f} "
+                f"for position #{position_count + 1} (base={dup_min_conf:.3f} + "
+                f"{position_count - 1}×{escalation_factor:.2f} escalation)"
             )
 
         min_price_dist = min(
@@ -903,7 +913,8 @@ async def process_signal(
                 "reason":               "; ".join(reasons_blocked),
                 "existing_positions":   existing_summary,
                 "resolved_confidence":  resolved_confidence,
-                "required_confidence":  dup_min_conf,
+                "required_confidence":  dup_min_conf_escalated,
+                "position_count":       position_count,
                 "price_distance":       round(min_price_dist, 5),
                 "required_distance":    round(required_dist, 5),
                 "agreeing_strategies":  agreeing_count,
@@ -917,11 +928,101 @@ async def process_signal(
             "confidence=%.3f (≥%.3f), price_dist=%.5f (≥%.5f), "
             "agreeing_strategies=%d (≥%d) | existing: %s",
             final_direction, symbol,
-            resolved_confidence, dup_min_conf,
+            resolved_confidence, dup_min_conf_escalated,
             min_price_dist, required_dist,
             agreeing_count, dup_min_strats,
             existing_summary,
         )
+
+    # ── Opposite direction handling ────────────────────────────────────────
+    # When the new signal is counter to existing open positions, decide whether
+    # to fully close, partially close, or just tighten stops — based on
+    # resolved_confidence vs configurable thresholds.
+    _existing_positions_all: list[dict] = market_data.get("_existing_positions", [])
+    if _existing_positions_all:
+        opposite_positions = [
+            p for p in _existing_positions_all
+            if p.get("type", "").upper() != final_direction.upper()
+            and p.get("type", "").upper() in ("BUY", "SELL")
+        ]
+
+        if opposite_positions:
+            close_full_threshold    = float(crud.get_setting(db, "reversal_full_close_confidence")    or 0.80)
+            close_partial_threshold = float(crud.get_setting(db, "reversal_partial_close_confidence") or 0.65)
+            partial_close_pct       = float(crud.get_setting(db, "reversal_partial_close_pct")        or 0.50)
+
+            if resolved_confidence >= close_full_threshold:
+                # FULL REVERSAL — close all opposite positions, then open new
+                for p in opposite_positions:
+                    ticket = p.get("ticket")
+                    volume = float(p.get("volume") or 0)
+                    if ticket and volume > 0 and not p.get("_from_db"):
+                        try:
+                            bridge_client.close_position(int(ticket), volume)
+                            logger.info(
+                                "[Reversal] Full close opposite %s position ticket=%s vol=%.2f",
+                                p.get("type"), ticket, volume,
+                            )
+                        except Exception as _rev_exc:
+                            logger.warning("[Reversal] Failed to close ticket=%s: %s", ticket, _rev_exc)
+                # Fall through to place_order below (new direction)
+
+            elif resolved_confidence >= close_partial_threshold:
+                # PARTIAL CLOSE — close a portion of opposite positions, open smaller new
+                for p in opposite_positions:
+                    ticket = p.get("ticket")
+                    volume = float(p.get("volume") or 0)
+                    close_vol = round(volume * partial_close_pct, 2)
+                    if ticket and close_vol > 0 and not p.get("_from_db"):
+                        try:
+                            bridge_client.close_position(int(ticket), close_vol)
+                            logger.info(
+                                "[Reversal] Partial close opposite ticket=%s vol=%.2f/%.2f",
+                                ticket, close_vol, volume,
+                            )
+                        except Exception as _rev_exc:
+                            logger.warning(
+                                "[Reversal] Partial close failed ticket=%s: %s", ticket, _rev_exc
+                            )
+                lot_size = max(round(lot_size * partial_close_pct, 2), 0.01)
+                # Fall through to place_order below with reduced lot
+
+            else:
+                # LOW CONFIDENCE REVERSAL — tighten stops on existing, skip new trade
+                for p in opposite_positions:
+                    ticket = p.get("ticket")
+                    if ticket and not p.get("_from_db"):
+                        new_sl = levels.get("entry")  # new signal entry as tighter SL
+                        if new_sl:
+                            try:
+                                bridge_client.modify_position(int(ticket), stop_loss=new_sl)
+                                logger.info(
+                                    "[Reversal] Tightened SL on opposite ticket=%s to %.5f",
+                                    ticket, new_sl,
+                                )
+                            except Exception as _rev_exc:
+                                logger.warning(
+                                    "[Reversal] Modify SL failed ticket=%s: %s", ticket, _rev_exc
+                                )
+
+                _rev_decision = _log_ensemble_decision(
+                    db, symbol, signal_dicts, ensemble_weights,
+                    final_direction, resolved_confidence,
+                    levels=levels, news_bias=news_bias,
+                    block_reason=(
+                        f"reversal_confidence_too_low: {resolved_confidence:.3f} < "
+                        f"{close_partial_threshold:.3f}, tightened existing SL instead"
+                    ),
+                    voter_breakdown=_vote_result.get("votes_breakdown"),
+                )
+                return {
+                    "status":              "REVERSAL_MODIFIED_ONLY",
+                    "reason":              "Low confidence reversal — tightened existing stops",
+                    "resolved_confidence": resolved_confidence,
+                    "modified_positions":  len(opposite_positions),
+                    "picker_decision_id":  picker_decision_id,
+                    "ensemble_decision_id": _rev_decision.id,
+                }
 
     # ── Place order ────────────────────────────────────────────────────────
     order = bridge_client.place_order(

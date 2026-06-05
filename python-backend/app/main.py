@@ -256,59 +256,55 @@ async def _live_trading_loop():
 
                     loop = asyncio.get_event_loop()
 
-                    # ── Open position guard ───────────────────────────────────
-                    # Skip signal evaluation entirely if a position for this
-                    # symbol is already open.  This prevents retcode 10027
-                    # (too many requests) caused by sending orders on every
-                    # tick while a trade is already running.
+                    # ── Open position context ─────────────────────────────────
+                    # Gather existing positions so the orchestrator can decide:
+                    # stack (same direction) or close/reverse (opposite direction).
+                    # We no longer hard-block here — the DuplicateGuard and the
+                    # new opposite-direction handler in the orchestrator decide.
+                    existing_positions: list[dict] = []
+                    sym_upper = symbol.upper()
+                    symbol_variants = {
+                        symbol, sym_upper,
+                        sym_upper.rstrip("M"), sym_upper.rstrip("m"),
+                        sym_upper + "m", sym_upper + "M",
+                    }
                     try:
                         open_positions = await loop.run_in_executor(
                             None, _bridge.get_positions
                         )
-                        sym_upper = symbol.upper()
-                        symbol_variants = {
-                            symbol, sym_upper,
-                            sym_upper.rstrip("M"), sym_upper.rstrip("m"),
-                            sym_upper + "m", sym_upper + "M",
-                        }
-                        already_open = any(
-                            (p.get("symbol") or "").upper() in symbol_variants
-                            for p in (open_positions or [])
-                        )
-                        if already_open:
-                            logger.debug(
-                                "Live loop: position already open for %s — skipping tick",
-                                symbol,
-                            )
-                            continue
+                        existing_positions = [
+                            p for p in (open_positions or [])
+                            if (p.get("symbol") or "").upper() in symbol_variants
+                        ]
                     except Exception as _pos_exc:
                         logger.debug(
-                            "Live loop: could not check open positions for %s: %s",
+                            "Live loop: could not fetch positions for %s: %s",
                             symbol, _pos_exc,
                         )
-                        # Bridge unavailable — fall back to DB open trades check
-                        # to avoid double-entering while a position is still open.
+                        # Bridge unavailable — synthesise position list from DB
+                        # so the orchestrator can still make an informed decision.
                         try:
                             from .db import COLL_TRADES as _COLL_TRADES
-                            sym_upper_fb = symbol.upper()
-                            sym_variants_fb = [
-                                symbol, sym_upper_fb,
-                                sym_upper_fb.rstrip("M"), sym_upper_fb.rstrip("m"),
-                                sym_upper_fb + "m", sym_upper_fb + "M",
-                            ]
-                            db_open = db[_COLL_TRADES].find_one({
-                                "symbol": {"$in": sym_variants_fb},
+                            sym_variants_list = list(symbol_variants)
+                            db_open_docs = list(db[_COLL_TRADES].find({
+                                "symbol": {"$in": sym_variants_list},
                                 "closed_at": {"$exists": False},
                                 "result": {"$in": ["OPEN", None]},
-                            })
-                            if db_open:
-                                logger.debug(
-                                    "Live loop: DB shows open trade for %s — skipping tick",
-                                    symbol,
-                                )
-                                continue
+                            }))
+                            existing_positions = [
+                                {
+                                    "symbol": t["symbol"],
+                                    "type": t.get("direction", ""),
+                                    "ticket": t.get("mt5_ticket"),
+                                    "volume": t.get("lot_size", 0),
+                                    "openPrice": t.get("entry_price", 0),
+                                    "profit": t.get("pnl", 0),
+                                    "_from_db": True,
+                                }
+                                for t in db_open_docs
+                            ]
                         except Exception:
-                            pass  # non-fatal — proceed
+                            pass  # non-fatal — orchestrator handles empty list gracefully
 
                     from_dt = (date.today() - timedelta(days=2)).isoformat()
                     to_dt = date.today().isoformat()
@@ -359,6 +355,10 @@ async def _live_trading_loop():
                         # per-strategy indicators (EMA, RSI, MACD, BB, VWAP)
                         # via _enrich_market_data_from_df().  Not serialised.
                         "_df": df,
+                        # Open positions for this symbol (bridge or DB-sourced).
+                        # Used by the DuplicateGuard and opposite-direction
+                        # reversal handler in the orchestrator.
+                        "_existing_positions": existing_positions,
                     }
 
                     # Always run the full pipeline (signals → picker → ensemble)
