@@ -54,7 +54,14 @@ async def websocket_endpoint(
     user = get_current_user_from_token(token, db)
 
     if not user:
-        await websocket.close(code=4001)
+        # The client may already have dropped the connection by the time we
+        # reject it (common with browsers that retry rapidly). Closing an
+        # already-closed socket raises inside Starlette/uvicorn and surfaces
+        # as an "Exception in ASGI application" traceback — swallow it.
+        try:
+            await websocket.close(code=4001)
+        except Exception:
+            pass
         return
 
     _connections.append(websocket)
@@ -64,8 +71,9 @@ async def websocket_endpoint(
             await asyncio.sleep(30)
             await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
-        if websocket in _connections:
-            _connections.remove(websocket)
+        pass
     except Exception:
+        pass
+    finally:
         if websocket in _connections:
             _connections.remove(websocket)

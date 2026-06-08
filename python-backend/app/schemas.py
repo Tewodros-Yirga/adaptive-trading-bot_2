@@ -351,6 +351,7 @@ class PickerSettingsIn(BaseModel):
     picker_weight_signal_confidence: float | None = None
     picker_weight_recency_of_last_win: float | None = None
     picker_weight_parameter_freshness: float | None = None
+    picker_weight_context_fit: float | None = None
 
 
 class PickerStatusOut(BaseModel):

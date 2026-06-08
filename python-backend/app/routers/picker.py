@@ -29,6 +29,7 @@ _FACTOR_NAMES = [
     "signal_confidence",
     "recency_of_last_win",
     "parameter_freshness",
+    "context_fit",
 ]
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
@@ -39,6 +40,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "signal_confidence": 0.10,
     "recency_of_last_win": 0.05,
     "parameter_freshness": 0.05,
+    "context_fit": 0.0,
 }
 
 _SETTING_KEYS = [
@@ -230,6 +232,7 @@ def update_picker_settings(
         "signal_confidence": payload.picker_weight_signal_confidence,
         "recency_of_last_win": payload.picker_weight_recency_of_last_win,
         "parameter_freshness": payload.picker_weight_parameter_freshness,
+        "context_fit": payload.picker_weight_context_fit,
     }
     for factor, new_val in weight_payload_map.items():
         if new_val is not None:

@@ -12,7 +12,6 @@ HALF    — after the open window expires, one probe request is allowed;
 This prevents the log flood of "The read operation timed out" that occurs
 when the HuggingFace Space is sleeping or restarting.
 """
-import random
 import threading
 import time
 import logging
@@ -190,31 +189,21 @@ class MT5BridgeClient:
     # ------------------------------------------------------------------
 
     def place_order(self, payload: dict) -> dict:
-        if settings.simulation_mode:
-            ticket = random.randint(100000, 999999)
-            return {
-                "orderId": str(ticket),
-                "symbol": payload["symbol"],
-                "direction": payload["direction"],
-                "volume": payload["lot_size"],
-                "openPrice": payload["price"],
-                "stopLoss": payload["stop_loss"],
-                "takeProfit": payload["take_profit"],
-                "simulated": True,
-            }
         # Use the long-timeout order client so the request survives the full
         # MT5 retry window inside the bridge (~35s worst case).
-        response = self._order_client.post(
-            "/order",
-            json={
-                "symbol": payload["symbol"],
-                "type": payload["direction"],
-                "volume": payload["lot_size"],
-                "stopLoss": payload["stop_loss"],
-                "takeProfit": payload["take_profit"],
-                "comment": "adaptive-bot-python",
-            },
-        )
+        body = {
+            "symbol": payload["symbol"],
+            "type": payload["direction"],
+            "volume": payload["lot_size"],
+            "stopLoss": payload["stop_loss"],
+            "takeProfit": payload["take_profit"],
+            "comment": "adaptive-bot-python",
+        }
+        # Idempotency key — the bridge can de-duplicate retried POSTs so a
+        # timeout-then-retry never produces two fills.
+        if payload.get("idempotency_key"):
+            body["idempotencyKey"] = payload["idempotency_key"]
+        response = self._order_client.post("/order", json=body)
         response.raise_for_status()
         data = response.json()
         return {
@@ -242,20 +231,6 @@ class MT5BridgeClient:
         if order_type not in valid_types:
             raise ValueError(f"order_type must be one of {valid_types}, got {order_type!r}")
 
-        if settings.simulation_mode:
-            ticket = random.randint(100000, 999999)
-            return {
-                "orderId": str(ticket),
-                "symbol": symbol,
-                "order_type": order_type,
-                "volume": volume,
-                "price": price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "expiration": expiration,
-                "simulated": True,
-            }
-
         body: dict = {"symbol": symbol, "type": order_type, "volume": volume, "price": price}
         if stop_loss is not None:
             body["stopLoss"] = stop_loss
@@ -282,15 +257,6 @@ class MT5BridgeClient:
         }
 
     def close_position(self, ticket: int, lot_size: float, partial: bool = False) -> dict:
-        if settings.simulation_mode:
-            return {
-                "closed": True,
-                "ticket": ticket,
-                "partial": False,
-                "closedVolume": lot_size,
-                "remainVolume": 0.0,
-                "simulated": True,
-            }
         # Use the long-timeout order client — closing a position also goes
         # through MT5 order_send and may be subject to the same 10027 retries.
         response = self._order_client.post(
@@ -314,9 +280,6 @@ class MT5BridgeClient:
         stop_loss: float | None = None,
         take_profit: float | None = None,
     ) -> dict:
-        if settings.simulation_mode:
-            return {"modified": True, "ticket": ticket, "simulated": True}
-
         payload: dict = {"ticket": ticket}
         if stop_loss is not None:
             payload["stopLoss"] = stop_loss
@@ -326,11 +289,6 @@ class MT5BridgeClient:
         return self._request("POST", "/modify", payload)
 
     def get_account(self) -> dict:
-        if settings.simulation_mode:
-            return {
-                "balance": 10000, "equity": 10000,
-                "margin": 0, "freeMargin": 10000, "mode": "SIMULATION",
-            }
         try:
             result = self._request("GET", "/account")
             with self._cache_lock:
@@ -344,8 +302,6 @@ class MT5BridgeClient:
             raise
 
     def get_positions(self) -> list:
-        if settings.simulation_mode:
-            return []
         try:
             data = self._request("GET", "/positions")
             positions = data.get("positions", data) if isinstance(data, dict) else data
@@ -360,11 +316,30 @@ class MT5BridgeClient:
             raise
 
     def get_deals(self, ticket: int, lookback_days: int = 14) -> list[dict]:
-        if settings.simulation_mode:
-            return []
         try:
             data = self._request("GET", f"/deals/{ticket}", payload=None)
             return data.get("deals", [])
+        except Exception:
+            return []
+
+    def cancel_order(self, ticket: int) -> dict:
+        """Cancel a pending (limit/stop) order — item 16."""
+        return self._request("POST", "/order/cancel", {"ticket": ticket})
+
+    def get_tick(self, symbol: str) -> dict:
+        """Current bid/ask/spread for a symbol — item 11 (spread guard source)."""
+        return self._request("GET", f"/tick/{symbol}")
+
+    def get_history(self, from_date: str, to_date: str, symbol: str | None = None) -> list[dict]:
+        """Closed deals within a date range (optionally by symbol) — item 16."""
+        params: dict = {"from_date": from_date, "to_date": to_date}
+        if symbol:
+            params["symbol"] = symbol
+        try:
+            response = self._client.get("/history", params=params)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("deals", []) if isinstance(data, dict) else (data or [])
         except Exception:
             return []
 

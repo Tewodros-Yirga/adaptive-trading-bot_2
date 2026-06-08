@@ -13,7 +13,7 @@ from ..db import (
 )
 from ..models import Strategy, Trade
 from ..schemas import BacktestCandidateOut, SearchStatusOut, SearchSettingsIn
-from ..services.orchestrator import get_ensemble_config, set_ensemble_config, set_strategy_live
+from ..services.orchestrator import set_strategy_live
 from ..strategy.registry import STRATEGY_REGISTRY, list_strategies
 from pymongo import DESCENDING as _DESC
 
@@ -62,22 +62,6 @@ def list_all(db: Database = Depends(get_db)):
             **stats,
         })
     return result
-
-
-# ── Ensemble config — MUST be before /{name} to avoid path conflict ───────
-@router.get("/ensemble/config")
-def get_ens_config(db: Database = Depends(get_db)):
-    config = get_ensemble_config(db)
-    config["_note"] = (
-        "This config is used by strategy_picker for picker-level scoring only. "
-        "Live trade direction is now decided by EnsembleVoter — see GET /ensemble/weights."
-    )
-    return config
-
-
-@router.post("/ensemble/config")
-def update_ens_config(body: dict, db: Database = Depends(get_db), _w=Depends(require_write_access)):
-    return set_ensemble_config(db, body)
 
 
 # ── Single strategy by name ───────────────────────────────────────────────

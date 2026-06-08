@@ -124,19 +124,16 @@ async def run_startup_checks(db) -> list[dict]:
         })
 
     # ── 5. MT5 bridge connectivity ─────────────────────────────────────────
-    # NOTE: The bridge is always checked — it's used for OHLCV candle data
-    # regardless of simulation_mode. Only order placement is gated by simulation_mode.
+    # The bridge is required for both OHLCV candle data and live order placement.
     try:
         from app.services.bridge_client import bridge_client
-        from app.config import settings
 
         account = bridge_client.get_account()
         balance = account.get("balance", "?")
-        mode_note = " (simulation_mode=ON — orders simulated)" if settings.simulation_mode else ""
         checks.append({
             "name": "bridge_connectivity",
             "status": "OK",
-            "message": f"MT5 bridge reachable — balance: {balance}{mode_note}",
+            "message": f"MT5 bridge reachable — balance: {balance}",
         })
     except Exception as e:
         checks.append({

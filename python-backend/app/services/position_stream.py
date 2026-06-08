@@ -376,18 +376,85 @@ async def _async_reconcile_in_thread(db, ticket: int, pos: dict, reason: str) ->
     await _reconcile_closed_trade(db, ticket, pos, reason)
 
 
+def _truthy(v) -> bool:
+    return str(v or "").lower() in ("1", "true", "yes", "on")
+
+
+async def _run_sse_stream(db) -> None:
+    """Consume the bridge's /stream/positions SSE (item 4, opt-in).
+
+    Drives the SAME diff/reconcile/broadcast path as polling, but reacts to
+    bridge pushes instead of a fixed 5s poll. Maintains a local prev-snapshot
+    from each event's `positions` array so all existing logic is reused.
+    Raises on connection loss so the caller can reconnect.
+    """
+    import json as _json
+    import httpx
+    from ..config import settings
+
+    base = settings.mt_bridge_url.rstrip("/")
+    headers = {"X-Bridge-Secret": settings.mt_bridge_secret}
+    if settings.mt_bridge_hf_token:
+        headers["Authorization"] = f"Bearer {settings.mt_bridge_hf_token}"
+    url = f"{base}/stream/positions"
+
+    prev_snapshot: dict[int, dict] = {}
+    # read=None → never time out the long-lived stream
+    timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            logger.info("position_stream: SSE connected to %s", url)
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                try:
+                    payload = _json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                positions = payload.get("positions")
+                if positions is None:
+                    continue
+                curr_snapshot = {_pos_key(p): p for p in positions if _pos_key(p)}
+                if curr_snapshot != prev_snapshot:
+                    await _process_snapshot_diff(db, prev_snapshot, curr_snapshot)
+                prev_snapshot = curr_snapshot
+
+
 async def start_position_stream() -> None:
     """
-    Background asyncio task — polls bridge every POLL_INTERVAL seconds
-    and emits position change events.
+    Background asyncio task — emits position change events.
 
-    Starts after a 30-second delay to let the bridge warm up.
+    Default: polls the bridge every POLL_INTERVAL seconds. When the AppSetting
+    ``use_sse_position_stream`` is truthy, consumes the bridge SSE stream
+    instead (lower latency). Starts after a 30-second delay to let the bridge
+    warm up.
     """
     await asyncio.sleep(30)
-    logger.info("position_stream: started (poll_interval=%.0fs)", POLL_INTERVAL)
 
     from ..db import get_database
     from ..services.bridge_client import bridge_client, BridgeUnavailableError
+    from .. import crud
+
+    # ── Item 4: opt-in SSE mode (default OFF → unchanged polling behaviour) ─
+    try:
+        if _truthy(crud.get_setting(get_database(), "use_sse_position_stream")):
+            logger.info("position_stream: started in SSE mode")
+            while True:
+                try:
+                    await _run_sse_stream(get_database())
+                except asyncio.CancelledError:
+                    logger.info("position_stream: cancelled")
+                    return
+                except Exception as exc:
+                    logger.warning("position_stream: SSE dropped (%s) — reconnecting in 5s", exc)
+                await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning("position_stream: SSE setup failed (%s) — falling back to polling", exc)
+
+    logger.info("position_stream: started (poll_interval=%.0fs)", POLL_INTERVAL)
 
     prev_snapshot: dict[int, dict] = {}
     consecutive_errors = 0

@@ -117,6 +117,16 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(start_position_stream()))
     logger.info("Started position stream.")
 
+    # ── 12. Start trailing-stop / break-even manager (inert unless enabled) ───
+    from .services.trailing_manager import trailing_stop_loop
+    bg_tasks.append(asyncio.create_task(trailing_stop_loop()))
+    logger.info("Started trailing-stop manager (opt-in via trailing_stop_enabled).")
+
+    # ── 13. Start DB-backed job-queue worker (inert unless job_queue_enabled) ──
+    from .services.job_queue import start_job_worker
+    bg_tasks.append(asyncio.create_task(start_job_worker()))
+    logger.info("Started job-queue worker (opt-in via job_queue_enabled).")
+
     logger.info("Application startup complete.")
     yield
 
@@ -226,10 +236,9 @@ async def _live_trading_loop():
     Autonomous live trading loop.
 
     Every 60 seconds (configurable via ``live_trading_interval_seconds`` AppSetting):
-      1. Skip if simulation_mode is True.
-      2. Fetch the latest price from the MT5 bridge for each configured symbol.
-      3. Pass price + minimal market_data to process_signal().
-      4. The orchestrator + picker handle signal gathering, strategy selection,
+      1. Fetch the latest price from the MT5 bridge for each configured symbol.
+      2. Pass price + minimal market_data to process_signal().
+      3. The orchestrator + picker handle signal gathering, strategy selection,
          risk checks, and order placement.
     """
     await asyncio.sleep(30)  # brief initial delay so the bridge has time to connect
@@ -361,17 +370,13 @@ async def _live_trading_loop():
                         "_existing_positions": existing_positions,
                     }
 
-                    # Always run the full pipeline (signals → picker → ensemble)
-                    # so picker decisions are recorded even in simulation mode.
-                    # Order placement is gated inside bridge_client by simulation_mode.
-                    sim = _settings.simulation_mode
+                    # Run the full pipeline (signals → picker → ensemble → order).
                     result = await process_signal(db, market_data, symbol, price)
                     status = result.get("status", "?")
 
                     if status == "OK":
                         logger.info(
-                            "Live trade %s: %s %s @ %.5f (trade_id=%s)",
-                            "SIMULATED" if sim else "PLACED",
+                            "Live trade PLACED: %s %s @ %.5f (trade_id=%s)",
                             result.get("signal"), symbol, price, result.get("trade_id")
                         )
                     elif status not in ("NO_SIGNAL", "NO_ACTIVE_STRATEGIES"):

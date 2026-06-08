@@ -26,6 +26,7 @@ FACTOR_NAMES = [
     "signal_confidence",
     "recency_of_last_win",
     "parameter_freshness",
+    "context_fit",
 ]
 
 DEFAULT_WEIGHTS = {
@@ -36,6 +37,9 @@ DEFAULT_WEIGHTS = {
     "signal_confidence": 0.10,
     "recency_of_last_win": 0.05,
     "parameter_freshness": 0.05,
+    # Opt-in regime/timezone suitability (item 23). Default 0.0 → ZERO effect on
+    # live selection until an operator raises it. Tune via picker_weight_context_fit.
+    "context_fit": 0.0,
 }
 
 
@@ -68,12 +72,16 @@ def compute_factor_scores(
     strategy_name: str,
     signal_confidence: float,
     db: Database,
+    market_context: dict | None = None,
 ) -> dict[str, float]:
     """
-    Returns raw factor scores (0.0–1.0) for each of the 7 factors.
+    Returns raw factor scores (0.0–1.0) for each factor.
     Falls back to backtest composite score when live trade history is thin,
     but uses strategy-specific factors (freshness, signal_confidence) even then.
     """
+    from .market_context import strategy_context_fit
+    context_fit = strategy_context_fit(strategy_name, market_context)
+
     lookback = int(crud.get_setting(db, "picker_lookback_trades") or 20)
     min_live_trades = int(crud.get_setting(db, "picker_min_trades_for_scoring") or 5)
 
@@ -104,6 +112,7 @@ def compute_factor_scores(
             "signal_confidence": float(signal_confidence),
             "recency_of_last_win": 0.0, # no wins yet
             "parameter_freshness": freshness,
+            "context_fit": context_fit,
         }
 
     wins = [t for t in recent_trades if t.result == "WIN"]
@@ -154,6 +163,7 @@ def compute_factor_scores(
         "signal_confidence": float(signal_confidence),
         "recency_of_last_win": recency_score,
         "parameter_freshness": freshness_score,
+        "context_fit": context_fit,
     }
 
 
@@ -238,9 +248,20 @@ def apply_news_adjustments(
     news_bias = bias_data["bias"]
     news_confidence = bias_data["confidence"]
 
+    # Opt-in (item 24): scale the bonus/penalty by the credibility-weighted news
+    # confidence so low-confidence / low-credibility news nudges scores less and
+    # high-confidence news more. Default OFF → identical to the previous fixed
+    # ±bonus/penalty behaviour, so live selection is unchanged unless enabled.
+    cred_scaling = str(crud.get_setting(db, "picker_news_credibility_scaling") or "0").lower() in (
+        "1", "true", "yes", "on",
+    )
+    eff_bonus = bonus * news_confidence if cred_scaling else bonus
+    eff_penalty = penalty * news_confidence if cred_scaling else penalty
+
     news_influence: dict[str, Any] = {
         "news_bias": news_bias,
         "news_confidence": news_confidence,
+        "credibility_scaling": cred_scaling,
         "adjustments": {},
     }
 
@@ -250,11 +271,11 @@ def apply_news_adjustments(
         for name, score in scores.items():
             signal_dir = strategy_signals.get(name)
             if signal_dir == bias_direction:
-                adjusted[name] = score * (1 + bonus)
-                news_influence["adjustments"][name] = f"+{bonus * 100:.0f}%"
+                adjusted[name] = score * (1 + eff_bonus)
+                news_influence["adjustments"][name] = f"+{eff_bonus * 100:.0f}%"
             elif signal_dir and signal_dir != bias_direction:
-                adjusted[name] = score * (1 - penalty)
-                news_influence["adjustments"][name] = f"-{penalty * 100:.0f}%"
+                adjusted[name] = score * (1 - eff_penalty)
+                news_influence["adjustments"][name] = f"-{eff_penalty * 100:.0f}%"
 
     # Veto check — only fires when news confidence is very high (>= veto_threshold)
     # AND at least one currently-signaling strategy is going against the bias.
@@ -377,6 +398,7 @@ async def pick_and_route(
     symbol: str,
     raw_signals: list[dict],
     db: Database,
+    market_data: dict | None = None,
 ) -> dict:
     """
     Main entry point called by the orchestrator.
@@ -410,6 +432,10 @@ async def pick_and_route(
     weights = _load_factor_weights(db)
     strategy_signals = {s["strategy_name"]: s.get("direction") for s in raw_signals}
 
+    # Market-context vector (regime/session) for the opt-in context_fit factor.
+    from .market_context import compute_market_context
+    market_context = compute_market_context(market_data)
+
     # ── Compute per-strategy factor + total scores ─────────────────────────
     # IMPORTANT: score using the actual signal confidence (1.0 when direction
     # is present, 0.0 when not) so the picker favours strategies that are
@@ -421,7 +447,7 @@ async def pick_and_route(
     for sig in raw_signals:
         # Use the real confidence from the signal, not a default of 0.
         actual_confidence = float(sig.get("confidence") or 0.0)
-        factors = compute_factor_scores(sig["strategy_name"], actual_confidence, db)
+        factors = compute_factor_scores(sig["strategy_name"], actual_confidence, db, market_context)
         all_factor_scores[sig["strategy_name"]] = factors
         scores[sig["strategy_name"]] = compute_total_score(factors, weights)
 

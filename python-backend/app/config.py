@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     webhook_secret: str = "changeme"
     symbol: str = "XAUUSDm"
     adaptation_interval: int = 20
-    simulation_mode: bool = False
 
     # Auth — set these in HuggingFace secrets
     admin_username: str = Field(default="admin", validation_alias="ADMIN_USERNAME")

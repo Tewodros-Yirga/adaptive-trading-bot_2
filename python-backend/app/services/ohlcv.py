@@ -415,7 +415,6 @@ async def fetch_mt5_bridge(
 ) -> pd.DataFrame:
     """
     Fetch OHLCV from the MT5 bridge service (async wrapper around the sync client).
-    NOTE: simulation_mode does NOT block this call — it only prevents order placement.
     """
     from .bridge_client import bridge_client
 

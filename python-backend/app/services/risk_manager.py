@@ -30,6 +30,15 @@ RISK_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _alert(db: Database, level: str, event: str, message: str, context: dict | None = None) -> None:
+    """Best-effort alert dispatch — never raises into risk logic."""
+    try:
+        from .alerts import dispatch_alert
+        dispatch_alert(db, level, event, message, context)
+    except Exception:
+        pass
+
+
 def get_risk_settings(db: Database) -> dict:
     stored = crud.get_settings(db, RISK_KEYS)
     result: dict[str, Any] = {}
@@ -130,6 +139,43 @@ def check_and_compute_lot_size(
     if settings["trading_halt"]:
         return 0.0, "Trading halt is active"
 
+    # ── Bridge-outage kill-switch (item 1) ────────────────────────────────
+    # Don't open new entries while the MT5 bridge is known-down (circuit
+    # breaker OPEN). Orders would fail anyway; this fails safe with a clear
+    # reason instead of a thrown bridge error. No-op during normal operation
+    # (breaker CLOSED). Disable by setting block_entries_on_bridge_outage=false.
+    _block_on_outage = str(
+        crud.get_setting(db, "block_entries_on_bridge_outage") or "true"
+    ).lower() in ("true", "1", "yes", "on")
+    if _block_on_outage:
+        try:
+            from .bridge_client import bridge_client
+            if bridge_client.circuit_state == "OPEN":
+                _alert(db, "warning", "bridge_outage",
+                       "MT5 bridge circuit breaker OPEN — new entries paused", {"symbol": symbol})
+                return 0.0, "Bridge unavailable (circuit breaker OPEN) — new entries paused"
+        except Exception:
+            pass
+
+    # ── Spread guard (item 11, opt-in) ────────────────────────────────────
+    # When max_spread_pips > 0, reject entries while the live bid/ask spread is
+    # wider than the limit (news spikes, illiquid sessions). Default 0 = OFF, so
+    # no extra bridge call and no behaviour change unless you enable it.
+    _max_spread_pips = float(crud.get_setting(db, "max_spread_pips") or 0)
+    if _max_spread_pips > 0:
+        try:
+            from .bridge_client import bridge_client
+            tick = bridge_client.get_tick(symbol)
+            pv = pip_value(symbol) or 0.0001
+            spread_pips = abs(float(tick.get("spread") or 0.0)) / pv
+            if spread_pips > _max_spread_pips:
+                _alert(db, "warning", "spread_too_wide",
+                       f"Spread {spread_pips:.1f}p > limit {_max_spread_pips:.1f}p for {symbol} — entry skipped",
+                       {"symbol": symbol, "spread_pips": round(spread_pips, 2)})
+                return 0.0, f"Spread too wide ({spread_pips:.1f} pips > {_max_spread_pips:.1f})"
+        except Exception:
+            pass  # tick unavailable — never block on a guard failure
+
     open_trades = crud.get_recent_trades(db, 1000)
     open_count = sum(1 for t in open_trades if t.result == "OPEN")
     if open_count >= settings["max_open_trades"]:
@@ -152,10 +198,16 @@ def check_and_compute_lot_size(
     if balance > 0:
         daily_loss_pct = (-today_pnl / balance) * 100
         if daily_loss_pct >= settings["max_daily_loss_pct"]:
+            _alert(db, "critical", "daily_loss_limit",
+                   f"Daily loss limit reached ({daily_loss_pct:.1f}%) — entries blocked",
+                   {"daily_loss_pct": round(daily_loss_pct, 2)})
             return 0.0, f"Daily loss limit reached ({daily_loss_pct:.1f}%)"
 
     stats = crud.get_stats(db)
     if balance > 0 and stats.get("max_drawdown", 0) / balance * 100 >= settings["max_drawdown_pct"]:
+        _alert(db, "critical", "drawdown_limit",
+               "Max drawdown limit reached — entries blocked",
+               {"max_drawdown": stats.get("max_drawdown", 0)})
         return 0.0, "Max drawdown limit reached"
 
     mode = settings["lot_size_mode"]

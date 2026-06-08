@@ -536,7 +536,16 @@ def learn_from_trade(db: Database, trade: dict) -> int:
             accuracy = 0.5 + alignment_bonus
 
         old_weight = float(doc.get("impact_learning_weight") or 1.0)
-        new_weight = round(0.8 * old_weight + 0.2 * accuracy, 4)
+        # Confidence/evidence-weighted online update (item 24): stronger evidence
+        # — a larger realised move AND higher AI confidence — moves the learning
+        # weight more; a near-flat trade barely nudges it. A small floor keeps
+        # learning from fully stalling. Reduces to the old fixed 0.2 EMA when
+        # evidence is moderate and base_alpha is left at its default.
+        ai_conf = float(doc.get("ai_confidence") or 0.5)
+        evidence = min(1.0, abs(impact_actual) / 0.3) * ai_conf      # 0..1
+        base_alpha = float(crud.get_setting(db, "news_learning_base_alpha") or 0.2)
+        alpha = base_alpha * (0.25 + 0.75 * evidence)
+        new_weight = round((1.0 - alpha) * old_weight + alpha * accuracy, 4)
 
         update_fields: dict = {
             "market_impact_actual": impact_actual,
@@ -592,8 +601,14 @@ def update_source_credibility(db: Database, symbol: str | None = None) -> dict:
                 filtered.append(doc)
         docs = filtered
 
-    # Group by source
-    source_buckets: dict[str, list[float]] = {}
+    # Group by source with time-decay weighting (item 24): recent evidence
+    # counts more, so a source that was accurate long ago but has drifted loses
+    # credibility as fresh outcomes accumulate.
+    now = datetime.now(timezone.utc)
+    half_life_days = float(crud.get_setting(db, "news_credibility_halflife_days") or 14.0)
+    decay_lambda = math.log(2) / max(half_life_days, 0.1)
+
+    source_buckets: dict[str, list[tuple[float, float]]] = {}  # src -> [(accuracy, weight)]
     for doc in docs:
         src = doc.get("source") or "unknown"
         predicted = doc.get("market_impact_predicted")
@@ -601,11 +616,26 @@ def update_source_credibility(db: Database, symbol: str | None = None) -> dict:
         if predicted is None or actual is None:
             continue
         accuracy = 1.0 - abs(float(predicted) - float(actual)) / 2.0
-        source_buckets.setdefault(src, []).append(accuracy)
+
+        ref = doc.get("last_learned_from_trade_at") or doc.get("published_at")
+        if isinstance(ref, datetime):
+            ref_tz = ref.replace(tzinfo=timezone.utc) if ref.tzinfo is None else ref
+            age_days = max(0.0, (now - ref_tz).total_seconds() / 86400.0)
+        else:
+            age_days = 0.0
+        w = math.exp(-decay_lambda * age_days)
+        source_buckets.setdefault(src, []).append((accuracy, w))
 
     credibility: dict[str, float] = {}
-    for src, accuracies in source_buckets.items():
-        credibility[src] = round(sum(accuracies) / len(accuracies), 4)
+    for src, pairs in source_buckets.items():
+        tw = sum(w for _, w in pairs) or 1.0
+        wavg = sum(a * w for a, w in pairs) / tw
+        # Small-sample shrinkage toward the neutral 1.0 default (same value used
+        # for unknown sources in get_news_bias) so thin evidence can't swing a
+        # source's multiplier hard in either direction.
+        n = len(pairs)
+        shrink = n / (n + 3.0)
+        credibility[src] = round(shrink * wavg + (1.0 - shrink) * 1.0, 4)
 
     crud.set_setting(db, "news_source_credibility", json.dumps(credibility))
     return credibility

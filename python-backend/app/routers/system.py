@@ -62,3 +62,67 @@ async def health(
         "startup_checks": startup_checks,
         "live": live,
     }
+
+
+@router.get("/services")
+async def services_health(
+    db: Database = Depends(get_db),
+    _user=Depends(get_current_user),
+):
+    """Aggregated reachability of every dependency (item 7).
+
+    Each probe is isolated so one failing service never breaks the response.
+    Returns a per-service {ok, detail} map plus an overall flag the frontend
+    can render as a single health tile.
+    """
+    services: dict[str, dict] = {}
+
+    # ── MongoDB ───────────────────────────────────────────────────────────
+    try:
+        db.command("ping")
+        services["mongodb"] = {"ok": True, "detail": "ping ok"}
+    except Exception as exc:
+        services["mongodb"] = {"ok": False, "detail": str(exc)}
+
+    # ── MT5 bridge (circuit-breaker state + cached account) ───────────────
+    try:
+        from ..services.bridge_client import bridge_client
+        state = bridge_client.circuit_state
+        try:
+            acct = bridge_client.get_account()
+        except Exception:
+            acct = None
+        services["mt5_bridge"] = {
+            "ok": state != "OPEN",
+            "circuit_state": state,
+            "detail": "circuit OPEN — bridge unreachable" if state == "OPEN" else "reachable",
+            "balance": (acct or {}).get("balance"),
+        }
+    except Exception as exc:
+        services["mt5_bridge"] = {"ok": False, "detail": str(exc)}
+
+    # ── Backtester service ────────────────────────────────────────────────
+    try:
+        from ..services.backtester_client import BacktesterClient, BacktesterUnavailable
+        client = BacktesterClient()
+        if not client.is_configured:
+            services["backtester"] = {"ok": None, "detail": "not configured"}
+        else:
+            try:
+                pong = await client.ping()
+                services["backtester"] = {"ok": True, "detail": "ping ok",
+                                          "uptime_seconds": (pong or {}).get("uptime_seconds")}
+            except BacktesterUnavailable as exc:
+                services["backtester"] = {"ok": None, "detail": str(exc)}
+            except Exception as exc:
+                services["backtester"] = {"ok": False, "detail": str(exc)}
+    except Exception as exc:
+        services["backtester"] = {"ok": False, "detail": str(exc)}
+
+    # overall: True only if no service is explicitly down (None = n/a is tolerated)
+    overall_ok = all(s.get("ok") is not False for s in services.values())
+    return {
+        "overall_ok": overall_ok,
+        "services": services,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+    }

@@ -7,7 +7,6 @@ from pymongo.database import Database
 from ..auth_deps import get_current_user, require_write_access
 from ..db import get_db
 from .. import crud
-from ..services.orchestrator import get_ensemble_config, set_ensemble_config
 
 router = APIRouter(prefix="/ensemble", tags=["ensemble"])
 
@@ -84,20 +83,6 @@ def get_decision(decision_id: int, db: Database = Depends(get_db)):
         "risk_blocked": d.risk_blocked,
         "block_reason": d.block_reason,
     }
-
-
-@router.get("/config")
-def get_config(db: Database = Depends(get_db)):
-    return get_ensemble_config(db)
-
-
-@router.post("/config")
-def update_config(
-    body: dict,
-    db: Database = Depends(get_db),
-    _w=Depends(require_write_access),
-):
-    return set_ensemble_config(db, body)
 
 
 # ---------------------------------------------------------------------------

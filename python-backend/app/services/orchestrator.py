@@ -201,43 +201,6 @@ def _enrich_market_data_from_df(df, params: dict) -> dict:
 # Ensemble configuration helpers
 # ---------------------------------------------------------------------------
 
-def get_ensemble_config(db: Database) -> dict:
-    raw = crud.get_setting(db, "ensemble_config")
-    if raw:
-        try:
-            config = json.loads(raw)
-            return _migrate_dominant_to_weighted_vote(config)
-        except Exception:
-            pass
-    return {
-        "mode": "WEIGHTED_VOTE",
-        "weights": {},
-        "min_vote_threshold": 0.0,
-    }
-
-
-def set_ensemble_config(db: Database, config: dict) -> dict:
-    migrated = _migrate_dominant_to_weighted_vote(config)
-    crud.set_setting(db, "ensemble_config", json.dumps(migrated))
-    return migrated
-
-
-def _migrate_dominant_to_weighted_vote(config: dict) -> dict:
-    if config.get("mode") != "DOMINANT":
-        return config
-    dominant = config.get("dominant_strategy", "")
-    existing_weights: dict[str, float] = config.get("weights", {})
-    new_weights = dict(existing_weights)
-    if dominant:
-        new_weights[dominant] = 1.0
-    return {
-        "mode": "WEIGHTED_VOTE",
-        "weights": new_weights,
-        "min_vote_threshold": 0.0,
-        "_migrated_from_dominant": dominant,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Core ensemble resolution (exported for pair analysis and tests)
 # ---------------------------------------------------------------------------
@@ -612,7 +575,7 @@ async def process_signal(
     # pick_and_route() is still called to persist the StrategyPickerDecision
     # record and to apply any news-veto logic.  Its direction/confidence output
     # is overridden below by the EnsembleVoter result.
-    picker_result = await pick_and_route(symbol, signal_dicts, db)
+    picker_result = await pick_and_route(symbol, signal_dicts, db, market_data)
     picker_decision_id: int | None = picker_result.get("picker_decision_id")
 
     if picker_result.get("veto"):
