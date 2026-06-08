@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .config import settings, validate_required_settings
 from .mt5_adapter import TooManyRequestsError, adapter
-from .schemas import CandlesRequest, CloseRequest, LimitOrderRequest, ModifyRequest, OrderRequest
+from .schemas import CancelRequest, CandlesRequest, CloseRequest, LimitOrderRequest, ModifyRequest, OrderRequest
 
 app = FastAPI(title="Adaptive MT5 Bridge")
 logger = logging.getLogger(__name__)
@@ -659,6 +659,59 @@ def deals(ticket: int, lookback_days: int = Query(default=14, ge=1, le=90)):
     try:
         deals_list = adapter.history_deals_get(ticket=ticket, lookback_days=lookback_days)
         return {"deals": deals_list, "count": len(deals_list), "ticket": ticket}
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=f"MT5 not connected: {err_msg}")
+        raise HTTPException(status_code=502, detail=err_msg)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Item 16 — cancel pending order + closed-deal history range
+# ---------------------------------------------------------------------------
+
+@app.post("/order/cancel", dependencies=[Depends(require_secret)])
+def cancel_order(payload: CancelRequest):
+    """Cancel a pending (limit/stop) order by ticket."""
+    try:
+        return adapter.cancel_order(payload.ticket)
+    except TooManyRequestsError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
+
+
+@app.get("/history", dependencies=[Depends(require_secret)])
+def history(
+    from_date: str = Query(description="ISO date e.g. 2024-01-01"),
+    to_date: str = Query(description="ISO date e.g. 2024-12-31"),
+    symbol: str | None = Query(default=None),
+):
+    """All closed deals within a date range (optionally filtered by symbol)."""
+    try:
+        deals_list = adapter.history_deals_range(from_date, to_date, symbol)
+        return {"deals": deals_list, "count": len(deals_list)}
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=f"MT5 not connected: {err_msg}")
+        raise HTTPException(status_code=502, detail=err_msg)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get("/tick/{symbol}", dependencies=[Depends(require_secret)])
+def tick(symbol: str):
+    """Current bid/ask/spread for a symbol (item 11 — spread guard source)."""
+    try:
+        return adapter.get_tick(symbol)
     except RuntimeError as exc:
         err_msg = str(exc)
         if "not connected" in err_msg or "ipc not ready" in err_msg:

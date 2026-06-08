@@ -939,6 +939,107 @@ class MT5Adapter:
                 continue
         return result
 
+    # ------------------------------------------------------------------
+    # Item 16 — cancel pending order + deal-range history
+    # ------------------------------------------------------------------
+
+    def cancel_order(self, ticket: int) -> dict[str, Any]:
+        """Cancel a pending order (BUY_LIMIT / SELL_LIMIT / BUY_STOP / SELL_STOP)."""
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: "
+                f"{self.last_error or 'connection unavailable'}"
+            )
+        request = {
+            "action": self._mt.TRADE_ACTION_REMOVE,
+            "order": ticket,
+            "comment": "adaptive-cancel",
+        }
+        result = self._order_send_with_ratelimit(request)
+        if result is None:
+            raise RuntimeError(f"cancel order_send returned None: {self._last_error_repr()}")
+        ok = result.retcode == self._mt.TRADE_RETCODE_DONE
+        if not ok:
+            raise RuntimeError(
+                f"cancel order failed retcode={result.retcode} "
+                f"(see MT5 enum_trade_return_codes)"
+            )
+        return {"cancelled": True, "ticket": ticket, "retcode": result.retcode}
+
+    def history_deals_range(
+        self, from_date: str, to_date: str, symbol: str | None = None
+    ) -> list[dict]:
+        """All closed deals within a date range, optionally filtered by symbol."""
+        from datetime import datetime, timezone
+
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: "
+                f"{self.last_error or 'connection unavailable'}"
+            )
+        dt_from = datetime.strptime(from_date[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        dt_to = datetime.strptime(to_date[:10], "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
+        try:
+            deals = self._mt.history_deals_get(dt_from, dt_to)
+        except Exception as exc:
+            raise RuntimeError(f"history_deals_get(date_range) failed: {exc}") from exc
+        if deals is None:
+            return []
+
+        result: list[dict] = []
+        for d in deals:
+            try:
+                sym = str(getattr(d, "symbol", ""))
+                if symbol and sym.upper() != symbol.upper():
+                    continue
+                result.append({
+                    "ticket":      int(getattr(d, "ticket",      0)),
+                    "order":       int(getattr(d, "order",       0)),
+                    "position_id": int(getattr(d, "position_id", 0)),
+                    "time":        int(getattr(d, "time",        0)),
+                    "type":        int(getattr(d, "type",        0)),
+                    "entry":       int(getattr(d, "entry",       0)),
+                    "symbol":      sym,
+                    "volume":      float(getattr(d, "volume",    0.0)),
+                    "price":       float(getattr(d, "price",     0.0)),
+                    "profit":      float(getattr(d, "profit",    0.0)),
+                    "swap":        float(getattr(d, "swap",      0.0)),
+                    "commission":  float(getattr(d, "commission", 0.0)),
+                    "comment":     str(getattr(d, "comment",    "")),
+                })
+            except Exception:
+                continue
+        return result
+
+    # ------------------------------------------------------------------
+    # Item 11 — current bid/ask/spread
+    # ------------------------------------------------------------------
+
+    def get_tick(self, symbol: str) -> dict[str, Any]:
+        """Return current bid/ask and spread for a symbol."""
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            raise RuntimeError(
+                f"mt5 not connected [{self.last_error_class or 'unknown'}]: "
+                f"{self.last_error or 'connection unavailable'}"
+            )
+        tick, resolved = self._resolve_symbol_tick(symbol)
+        if tick is None:
+            raise RuntimeError(f"symbol tick unavailable for {symbol}")
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        return {
+            "symbol": resolved,
+            "bid": bid,
+            "ask": ask,
+            "spread": round(ask - bid, 8),
+            "time": int(getattr(tick, "time", 0) or 0),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Custom exception so the bridge endpoint can return HTTP 429

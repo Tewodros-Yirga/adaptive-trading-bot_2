@@ -35,6 +35,10 @@ class ModifyRequest(BaseModel):
     takeProfit: float | None = Field(default=None, description="New take profit; omit to leave unchanged")
 
 
+class CancelRequest(BaseModel):
+    ticket: int = Field(description="Ticket of the pending order to cancel")
+
+
 class CandlesRequest(BaseModel):
     symbol: str
     timeframe: str = Field(default="1h", description="e.g. 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w")
