@@ -127,6 +127,21 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(start_job_worker()))
     logger.info("Started job-queue worker (opt-in via job_queue_enabled).")
 
+    # ── 14. Startup banner via alerts (Telegram/webhook if configured) ────────
+    # Force-sent (bypasses min_level/throttle) so you can confirm the channel
+    # works. No-op when no channel is configured.
+    try:
+        from .services.alerts import send_direct
+        db = get_database()
+        send_direct(
+            db,
+            "service_started",
+            "Adaptive Trading backend started and ready.",
+            level="info",
+        )
+    except Exception as e:
+        logger.debug("startup alert failed: %s", e)
+
     logger.info("Application startup complete.")
     yield
 

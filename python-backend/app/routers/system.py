@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Request
 from pymongo.database import Database
 
 from ..db import get_db, COLL_TRADES
-from ..auth_deps import get_current_user
+from ..auth_deps import get_current_user, require_write_access
 
 logger = logging.getLogger(__name__)
 
@@ -126,3 +126,20 @@ async def services_health(
         "services": services,
         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
     }
+
+
+@router.post("/alerts/test")
+def send_test_alert(db: Database = Depends(get_db), _w=Depends(require_write_access)):
+    """Force-send a test alert to the configured channels (Telegram/webhook).
+
+    Returns whether a channel was configured and which ones were hit, so the
+    Settings UI can confirm the Telegram bot is wired correctly.
+    """
+    from ..services.alerts import send_direct
+    result = send_direct(
+        db,
+        "test_alert",
+        "Test alert from the Adaptive Trading backend — your channel is working.",
+        level="info",
+    )
+    return result

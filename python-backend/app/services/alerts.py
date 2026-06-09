@@ -16,6 +16,9 @@ Settings (all optional, AppSettings keys):
   alerts_throttle_seconds  per-event forward cooldown   (default 300)
   alerts_telegram_bot_token / alerts_telegram_chat_id   (Telegram channel)
   alerts_webhook_url        generic JSON POST target
+  alerts_enabled_events     comma-separated allow-list of event names to forward;
+                            empty/"all" = forward everything that passes min_level.
+                            e.g. "service_started,bridge_outage,daily_loss_limit"
 """
 from __future__ import annotations
 
@@ -74,6 +77,28 @@ def _forward(channel: str, cfg: dict, level: str, event: str, message: str, cont
         logger.debug("Alert forward via %s failed: %s", channel, exc)
 
 
+def send_direct(
+    db: Database,
+    event: str,
+    message: str,
+    level: str = "info",
+    context: dict[str, Any] | None = None,
+) -> dict:
+    """Force-send to all configured channels, bypassing min_level / allow-list /
+    throttle. Used for startup banners and the explicit 'send test message'
+    button. Returns a small status dict so the API can report what happened.
+    """
+    logger.info("EVENT(direct) %s | %s | %s", event, message, level)
+    channels = _enabled_channels(db)
+    if not channels:
+        return {"sent": False, "reason": "no channels configured", "channels": []}
+    sent = []
+    for channel, cfg in channels:
+        _forward(channel, cfg, level, event, message, context)
+        sent.append(channel)
+    return {"sent": True, "channels": sent}
+
+
 def dispatch_alert(
     db: Database,
     level: str,
@@ -102,6 +127,13 @@ def dispatch_alert(
         min_level = str(crud.get_setting(db, "alerts_min_level") or "warning").lower()
         if _LEVELS[level] < _LEVELS.get(min_level, 20):
             return
+
+        # Optional per-event allow-list. Empty or "all" → forward everything.
+        allow_raw = str(crud.get_setting(db, "alerts_enabled_events") or "").strip().lower()
+        if allow_raw and allow_raw != "all":
+            allowed = {e.strip() for e in allow_raw.split(",") if e.strip()}
+            if event.lower() not in allowed:
+                return
 
         channels = _enabled_channels(db)
         if not channels:
