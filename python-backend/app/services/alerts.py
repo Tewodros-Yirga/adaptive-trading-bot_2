@@ -39,31 +39,80 @@ _LEVELS = {"info": 10, "warning": 20, "critical": 30}
 _last_forwarded: dict[str, float] = {}
 
 
+# Canonical AppSettings keys (written by the Settings UI), plus a few common
+# aliases so a token/chat-id saved manually under a slightly different key name
+# is still picked up. Everything is read from the app_settings collection — no
+# env vars are ever consulted for Telegram.
+_TG_TOKEN_KEYS = (
+    "alerts_telegram_bot_token",
+    "telegram_bot_token",
+    "telegram_token",
+)
+_TG_CHAT_KEYS = (
+    "alerts_telegram_chat_id",
+    "telegram_chat_id",
+    "telegram_user_id",
+    "alerts_telegram_user_id",
+)
+
+
+def _first_setting(db: Database, keys: tuple[str, ...]) -> str | None:
+    """Return the first non-empty AppSetting among ``keys`` (DB-only lookup).
+
+    Values are stripped of surrounding whitespace/newlines — a trailing space or
+    newline pasted into the token/chat-id field would otherwise corrupt the
+    Telegram URL/payload and make the API silently reject the message even though
+    the same value works from a clean curl.
+    """
+    for k in keys:
+        val = crud.get_setting(db, k)
+        if val and val.strip():
+            return val.strip()
+    return None
+
+
 def _enabled_channels(db: Database) -> list[tuple[str, dict]]:
     channels: list[tuple[str, dict]] = []
-    tg_token = crud.get_setting(db, "alerts_telegram_bot_token")
-    tg_chat = crud.get_setting(db, "alerts_telegram_chat_id")
+    tg_token = _first_setting(db, _TG_TOKEN_KEYS)
+    tg_chat = _first_setting(db, _TG_CHAT_KEYS)
     if tg_token and tg_chat:
+        # Tolerate a token saved with a leading "bot" prefix or full API path.
+        tg_token = tg_token.removeprefix("bot").strip()
         channels.append(("telegram", {"token": tg_token, "chat_id": tg_chat}))
     hook = crud.get_setting(db, "alerts_webhook_url")
-    if hook:
-        channels.append(("webhook", {"url": hook}))
+    if hook and hook.strip():
+        channels.append(("webhook", {"url": hook.strip()}))
     return channels
 
 
-def _forward(channel: str, cfg: dict, level: str, event: str, message: str, context: dict | None) -> None:
+def _forward(channel: str, cfg: dict, level: str, event: str, message: str, context: dict | None) -> dict:
+    """Best-effort forward to one channel. Returns {"ok": bool, "detail": str}
+    describing the actual delivery result (e.g. Telegram's API response) so the
+    'send test message' button can report real success/failure. Never raises."""
     import httpx
 
     text = f"[{level.upper()}] {event}: {message}"
     try:
         if channel == "telegram":
-            httpx.post(
+            resp = httpx.post(
                 f"https://api.telegram.org/bot{cfg['token']}/sendMessage",
                 json={"chat_id": cfg["chat_id"], "text": text},
                 timeout=5.0,
             )
+            # Telegram replies 200 with {"ok": true, ...} on success, or a 4xx
+            # with {"ok": false, "description": "..."} on bad token/chat_id.
+            body = {}
+            try:
+                body = resp.json()
+            except Exception:
+                pass
+            if resp.status_code == 200 and body.get("ok"):
+                return {"ok": True, "detail": "delivered"}
+            detail = body.get("description") or f"HTTP {resp.status_code}"
+            logger.warning("Telegram send failed: %s", detail)
+            return {"ok": False, "detail": detail}
         elif channel == "webhook":
-            httpx.post(
+            resp = httpx.post(
                 cfg["url"],
                 json={
                     "level": level,
@@ -73,8 +122,12 @@ def _forward(channel: str, cfg: dict, level: str, event: str, message: str, cont
                 },
                 timeout=5.0,
             )
+            ok = resp.status_code < 400
+            return {"ok": ok, "detail": "delivered" if ok else f"HTTP {resp.status_code}"}
     except Exception as exc:  # never let alerting break the caller
         logger.debug("Alert forward via %s failed: %s", channel, exc)
+        return {"ok": False, "detail": str(exc)}
+    return {"ok": False, "detail": "unknown channel"}
 
 
 def send_direct(
@@ -91,12 +144,29 @@ def send_direct(
     logger.info("EVENT(direct) %s | %s | %s", event, message, level)
     channels = _enabled_channels(db)
     if not channels:
-        return {"sent": False, "reason": "no channels configured", "channels": []}
-    sent = []
+        return {
+            "sent": False,
+            "reason": "No channels configured. Save a Telegram bot token + chat ID "
+                      "(or a webhook URL) in Settings first.",
+            "channels": [],
+        }
+    results: list[dict] = []
+    delivered: list[str] = []
     for channel, cfg in channels:
-        _forward(channel, cfg, level, event, message, context)
-        sent.append(channel)
-    return {"sent": True, "channels": sent}
+        res = _forward(channel, cfg, level, event, message, context)
+        results.append({"channel": channel, **res})
+        if res.get("ok"):
+            delivered.append(channel)
+    any_ok = bool(delivered)
+    return {
+        "sent": any_ok,
+        "channels": delivered,
+        "results": results,
+        # Surface the first failure reason so the UI can show why nothing arrived.
+        "reason": None if any_ok else "; ".join(
+            f"{r['channel']}: {r['detail']}" for r in results if not r.get("ok")
+        ),
+    }
 
 
 def dispatch_alert(
