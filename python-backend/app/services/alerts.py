@@ -85,19 +85,36 @@ def _enabled_channels(db: Database) -> list[tuple[str, dict]]:
     return channels
 
 
+def _http_post(url: str, json_body: dict, timeout: float = 15.0):
+    """POST helper that forces IPv4 and uses a generous timeout.
+
+    Container hosts (Render, etc.) often advertise IPv6 (AAAA) routes that
+    black-hole outbound traffic, so an httpx call to api.telegram.org picks the
+    IPv6 address and the TLS handshake hangs until timeout
+    (``_ssl.c:999: handshake operation timed out``) — even though IPv4 works
+    fine and a local curl succeeds. Binding the socket to an IPv4 source address
+    (``local_address="0.0.0.0"``) forces IPv4 and avoids the dead IPv6 path.
+    """
+    import httpx
+
+    transport = httpx.HTTPTransport(local_address="0.0.0.0", retries=1)
+    with httpx.Client(
+        transport=transport,
+        timeout=httpx.Timeout(timeout, connect=timeout),
+    ) as client:
+        return client.post(url, json=json_body)
+
+
 def _forward(channel: str, cfg: dict, level: str, event: str, message: str, context: dict | None) -> dict:
     """Best-effort forward to one channel. Returns {"ok": bool, "detail": str}
     describing the actual delivery result (e.g. Telegram's API response) so the
     'send test message' button can report real success/failure. Never raises."""
-    import httpx
-
     text = f"[{level.upper()}] {event}: {message}"
     try:
         if channel == "telegram":
-            resp = httpx.post(
+            resp = _http_post(
                 f"https://api.telegram.org/bot{cfg['token']}/sendMessage",
-                json={"chat_id": cfg["chat_id"], "text": text},
-                timeout=5.0,
+                {"chat_id": cfg["chat_id"], "text": text},
             )
             # Telegram replies 200 with {"ok": true, ...} on success, or a 4xx
             # with {"ok": false, "description": "..."} on bad token/chat_id.
@@ -112,20 +129,19 @@ def _forward(channel: str, cfg: dict, level: str, event: str, message: str, cont
             logger.warning("Telegram send failed: %s", detail)
             return {"ok": False, "detail": detail}
         elif channel == "webhook":
-            resp = httpx.post(
+            resp = _http_post(
                 cfg["url"],
-                json={
+                {
                     "level": level,
                     "event": event,
                     "message": message,
                     "context": context or {},
                 },
-                timeout=5.0,
             )
             ok = resp.status_code < 400
             return {"ok": ok, "detail": "delivered" if ok else f"HTTP {resp.status_code}"}
     except Exception as exc:  # never let alerting break the caller
-        logger.debug("Alert forward via %s failed: %s", channel, exc)
+        logger.warning("Alert forward via %s failed: %s", channel, exc)
         return {"ok": False, "detail": str(exc)}
     return {"ok": False, "detail": "unknown channel"}
 
