@@ -19,8 +19,72 @@ from pymongo import DESCENDING as _DESC
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
-# Collection written exclusively by the backtester microservice
+# Collections written exclusively by the backtester microservice
 COLL_BACKTESTER_RUNS = "backtester_runs"
+COLL_ENSEMBLE_BACKTEST_RUNS = "ensemble_backtest_runs"
+COLL_ENSEMBLE_WEIGHTS = "ensemble_weights"
+COLL_SEARCH_ENGINE_STATE = "search_engine_state"
+
+# The ensemble optimization loop persists its engine state under this name.
+ENSEMBLE_STATE_NAME = "__ensemble__"
+# Names the frontend / API may use to refer to the ensemble pseudo-strategy.
+_ENSEMBLE_ALIASES = {"ensemble", "__ensemble__"}
+
+
+def _is_ensemble(strategy_name: str) -> bool:
+    return strategy_name in _ENSEMBLE_ALIASES
+
+
+def _ensemble_search_status(db: Database) -> dict:
+    """
+    Build a search-status payload for the ensemble optimization loop, matching
+    the per-strategy shape consumed by normalizeStatus() in Backtesting.tsx.
+
+    Reads from the ensemble-only collections:
+      • ensemble_backtest_runs  — per-iteration audit log (latest = current)
+      • search_engine_state      — full engine state (best score / params)
+      • ensemble_weights         — active promoted weights + metadata
+    """
+    latest_run = db[COLL_ENSEMBLE_BACKTEST_RUNS].find_one(sort=[("timestamp", _DESC)])
+    state_doc = db[COLL_SEARCH_ENGINE_STATE].find_one({"strategy_name": ENSEMBLE_STATE_NAME})
+    state = (state_doc or {}).get("state", {}) if state_doc else {}
+    active_weights = db[COLL_ENSEMBLE_WEIGHTS].find_one(
+        {"is_active": True}, sort=[("saved_at", _DESC)]
+    )
+
+    total_iters = db[COLL_ENSEMBLE_BACKTEST_RUNS].count_documents({})
+    best_score = float(state.get("current_best_score") or 0.0)
+    best_params = state.get("current_best_params") or (
+        active_weights.get("weights", {}) if active_weights else {}
+    )
+
+    is_running = False
+    last_run_at = None
+    if latest_run:
+        last_run_at = latest_run.get("timestamp")
+        if last_run_at:
+            now_utc = datetime.now(timezone.utc)
+            ts = last_run_at if last_run_at.tzinfo else last_run_at.replace(tzinfo=timezone.utc)
+            interval_sec = float(crud.get_setting(db, "ensemble_backtest_interval_seconds") or "600")
+            is_running = (now_utc - ts).total_seconds() < interval_sec * 2.5
+
+    return {
+        "strategy_name": "ensemble",
+        "phase":        0,
+        "iteration":    latest_run.get("iteration", total_iters) if latest_run else int(state.get("iteration") or total_iters),
+        "best_score":   best_score,
+        "best_params":  best_params,
+        "is_running":   is_running,
+        "is_paused":    False,
+        "last_win_rate":        latest_run.get("win_rate")       if latest_run else None,
+        "last_profit_factor":   latest_run.get("profit_factor")  if latest_run else None,
+        "last_total_trades":    latest_run.get("total_trades")   if latest_run else None,
+        "last_composite_score": latest_run.get("ensemble_composite_score") if latest_run else best_score,
+        "last_qualified":       latest_run.get("qualified")      if latest_run else None,
+        "last_promoted":        latest_run.get("promoted")       if latest_run else None,
+        "last_run_at":          last_run_at,
+        "total_iterations":     total_iters,
+    }
 
 
 def _ensure_strategies_exist(db: Database):
@@ -431,6 +495,9 @@ def search_status(strategy_name: str, db: Database = Depends(get_db)):
 
     No HTTP proxy — works even when the backtester is between iterations or restarting.
     """
+    if _is_ensemble(strategy_name):
+        return _ensemble_search_status(db)
+
     _ensure_strategies_exist(db)
     strategy_doc = db[COLL_STRATEGIES].find_one({"name": strategy_name})
     if not strategy_doc:
@@ -503,10 +570,16 @@ def search_runs(
     Return recent backtester_runs audit log entries for a strategy.
     The backtester writes one document per iteration.
     """
-    _ensure_strategies_exist(db)
+    if _is_ensemble(strategy_name):
+        coll = COLL_ENSEMBLE_BACKTEST_RUNS
+        query: dict = {}
+    else:
+        _ensure_strategies_exist(db)
+        coll = COLL_BACKTESTER_RUNS
+        query = {"strategy_name": strategy_name}
     docs = list(
-        db[COLL_BACKTESTER_RUNS]
-        .find({"strategy_name": strategy_name})
+        db[coll]
+        .find(query)
         .sort("timestamp", _DESC)
         .limit(limit)
     )
@@ -521,7 +594,86 @@ def search_runs(
     return result
 
 
-# NOTE: pause / resume / trigger are intentionally NOT exposed here.
-# The backtester microservice manages its own run loop internally.
-# Control it by setting backtest_interval_seconds via /settings/bulk,
-# or by restarting the backtester Space on HuggingFace.
+# ---------------------------------------------------------------------------
+# Search loop control — proxied to the backtester microservice.
+# Works for per-strategy loops and the ensemble pseudo-strategy ("ensemble").
+# ---------------------------------------------------------------------------
+
+async def _proxy_control(strategy_name: str, action: str) -> dict:
+    """
+    Forward a pause/resume/trigger to the backtester service. Returns a uniform
+    payload and degrades gracefully when the backtester URL isn't configured or
+    the service is unreachable (so the UI shows a soft error, not a 500).
+    """
+    from ..services.backtester_client import BacktesterClient, BacktesterUnavailable
+
+    client = BacktesterClient()
+    is_ens = _is_ensemble(strategy_name)
+    try:
+        if is_ens:
+            fn = {
+                "pause":   client.pause_ensemble,
+                "resume":  client.resume_ensemble,
+                "trigger": client.trigger_ensemble,
+            }[action]
+            await fn()
+        else:
+            fn = {"pause": client.pause, "resume": client.resume, "trigger": client.trigger}[action]
+            await fn(strategy_name)
+        return {"ok": True, "strategy_name": strategy_name, "action": action}
+    except BacktesterUnavailable as exc:
+        return {"ok": False, "strategy_name": strategy_name, "action": action, "error": str(exc)}
+    except Exception as exc:  # httpx errors, etc.
+        raise HTTPException(502, f"Backtester control '{action}' failed: {exc}")
+
+
+@router.post("/{strategy_name}/pause-search")
+async def pause_search(strategy_name: str, _w=Depends(require_write_access)):
+    return await _proxy_control(strategy_name, "pause")
+
+
+@router.post("/{strategy_name}/resume-search")
+async def resume_search(strategy_name: str, _w=Depends(require_write_access)):
+    return await _proxy_control(strategy_name, "resume")
+
+
+@router.post("/{strategy_name}/trigger-search")
+async def trigger_search(strategy_name: str, _w=Depends(require_write_access)):
+    return await _proxy_control(strategy_name, "trigger")
+
+
+@router.get("/ensemble/config")
+def ensemble_config(db: Database = Depends(get_db)):
+    """
+    Return the ensemble optimizer's configuration: search settings (interval,
+    horizons, qualify thresholds, horizon weights) plus the active promoted
+    weights and live voting threshold. Lets the UI inspect/monitor the ensemble
+    without touching any per-strategy parameters.
+    """
+    setting_keys = [
+        "ensemble_backtest_interval_seconds",
+        "ensemble_param_step_size",
+        "ensemble_qualify_win_rate",
+        "ensemble_qualify_profit_factor",
+        "ensemble_backtest_timeframe",
+        "ensemble_horizon_short_months",
+        "ensemble_horizon_medium_months",
+        "ensemble_horizon_wide_months",
+        "ensemble_weight_short",
+        "ensemble_weight_medium",
+        "ensemble_weight_wide",
+        "ensemble_voting_threshold",
+    ]
+    settings = {k: crud.get_setting(db, k) for k in setting_keys}
+
+    active = db[COLL_ENSEMBLE_WEIGHTS].find_one({"is_active": True}, sort=[("saved_at", _DESC)])
+    weights = active.get("weights", {}) if active else {}
+    metadata = active.get("metadata", {}) if active else {}
+    saved_at = active.get("saved_at") if active else None
+
+    return {
+        "settings": settings,
+        "active_weights": weights,
+        "metadata": metadata,
+        "saved_at": saved_at,
+    }

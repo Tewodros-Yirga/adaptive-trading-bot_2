@@ -56,7 +56,13 @@ class BacktesterClient:
     """
 
     def __init__(self) -> None:
-        self._base_url = _resolve_setting("backtester_url", "BACKTESTER_URL").rstrip("/")
+        # Accept either env/setting name — deployments variously set
+        # BACKTESTER_URL or BACKTESTER_SERVICE_URL (config.backtester_service_url).
+        base = (
+            _resolve_setting("backtester_url", "BACKTESTER_URL")
+            or _resolve_setting("backtester_service_url", "BACKTESTER_SERVICE_URL")
+        )
+        self._base_url = base.rstrip("/")
         self._hf_token = _resolve_setting("backtester_hf_token", "BACKTESTER_HF_TOKEN")
         self._timeout = 20.0
 
@@ -122,6 +128,26 @@ class BacktesterClient:
     async def trigger(self, strategy_name: str) -> dict:
         """POST /trigger/{strategy_name} — skip current sleep, run immediately."""
         return await self._post(f"/trigger/{strategy_name}")
+
+    # ------------------------------------------------------------------
+    # Ensemble optimization loop control (separate from per-strategy loops)
+    # ------------------------------------------------------------------
+
+    async def ensemble_status(self) -> dict:
+        """GET /ensemble-status — current ensemble optimization status."""
+        return await self._get("/ensemble-status")
+
+    async def pause_ensemble(self) -> dict:
+        """POST /ensemble/pause"""
+        return await self._post("/ensemble/pause")
+
+    async def resume_ensemble(self) -> dict:
+        """POST /ensemble/resume"""
+        return await self._post("/ensemble/resume")
+
+    async def trigger_ensemble(self) -> dict:
+        """POST /ensemble/trigger — run an ensemble iteration immediately."""
+        return await self._post("/ensemble/trigger")
 
     @property
     def is_configured(self) -> bool:
