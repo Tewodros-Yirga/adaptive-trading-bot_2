@@ -719,8 +719,8 @@ def seed_default_settings(db: Database) -> None:
 
     # ── Risk management ───────────────────────────────────────────────────
     risk_defaults: dict[str, str] = {
-        "account_balance": "10000.0",
-        "leverage": "100",
+        "account_balance": "10.0",
+        "leverage": "2000",
         "risk_per_trade_pct": "1.0",
         "max_open_trades": "5",
         "max_daily_loss_pct": "5.0",

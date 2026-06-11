@@ -512,7 +512,9 @@ def learn_from_trade(db: Database, trade: dict) -> int:
         return updated
 
     # Trade closed — compute actual impact and update learning weights
-    account_balance = float(crud.get_setting(db, "account_balance") or 10000.0)
+    # Account balance from the MT5 account (live), not the stored setting.
+    from .risk_manager import get_effective_balance
+    account_balance = get_effective_balance(db) or 10.0
     impact_actual = max(-1.0, min(1.0, (pnl or 0.0) * 10.0 / account_balance))
 
     now_utc = datetime.now(timezone.utc)

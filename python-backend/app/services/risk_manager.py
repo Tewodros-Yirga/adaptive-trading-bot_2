@@ -18,7 +18,7 @@ RISK_KEYS = [
 ]
 
 RISK_DEFAULTS: dict[str, Any] = {
-    "account_balance": 10000.0,
+    "account_balance": 10.0,
     "leverage": 100,
     "risk_per_trade_pct": 1.0,
     "max_open_trades": 5,
@@ -37,6 +37,40 @@ def _alert(db: Database, level: str, event: str, message: str, context: dict | N
         dispatch_alert(db, level, event, message, context)
     except Exception:
         pass
+
+
+def get_live_balance() -> tuple[float | None, float | None]:
+    """
+    Fetch (balance, equity) from the MT5 account via the bridge.
+    Returns (None, None) when the bridge is unavailable so callers can fall
+    back to the stored setting. Never raises.
+    """
+    try:
+        from .bridge_client import bridge_client
+        acct = bridge_client.get_account()
+        if acct and acct.get("balance") is not None:
+            balance = float(acct["balance"])
+            equity = float(acct.get("equity", balance))
+            return balance, equity
+    except Exception:
+        pass
+    return None, None
+
+
+def get_effective_balance(db: Database, settings: dict | None = None) -> float:
+    """
+    The account balance to use for all risk/sizing math.
+
+    The MT5 account is the source of truth — always prefer the live balance
+    from the bridge. The stored ``account_balance`` setting is only a fallback
+    for when the bridge is unreachable (it is NOT a user-authoritative value).
+    """
+    live, _ = get_live_balance()
+    if live is not None:
+        return live
+    if settings is None:
+        settings = get_risk_settings(db)
+    return float(settings["account_balance"])
 
 
 def get_risk_settings(db: Database) -> dict:
@@ -194,7 +228,7 @@ def check_and_compute_lot_size(
         (t.pnl or 0) for t in closed_trades
         if t.closed_at and (t.closed_at if t.closed_at.tzinfo else t.closed_at.replace(tzinfo=timezone.utc)) >= today_start
     )
-    balance = settings["account_balance"]
+    balance = get_effective_balance(db, settings)
     if balance > 0:
         daily_loss_pct = (-today_pnl / balance) * 100
         if daily_loss_pct >= settings["max_daily_loss_pct"]:
@@ -238,20 +272,11 @@ def get_risk_status(db: Database) -> dict:
         if t.closed_at and (t.closed_at if t.closed_at.tzinfo else t.closed_at.replace(tzinfo=timezone.utc)) >= today_start
     )
     stats = crud.get_stats(db)
-    balance = settings["account_balance"]
 
-    # ── Live balance from MT5 bridge (preferred source) ───────────────────
-    live_balance: float | None = None
-    live_equity: float | None = None
-    try:
-        from .bridge_client import bridge_client
-        acct = bridge_client.get_account()
-        if acct and acct.get("balance") is not None:
-            live_balance = float(acct["balance"])
-            live_equity = float(acct.get("equity", acct["balance"]))
-            balance = live_balance  # use live value for risk calculations
-    except Exception:
-        pass  # bridge unavailable — fall back to stored setting
+    # ── Live balance from MT5 bridge (the authoritative source) ───────────
+    # Fall back to the stored setting only when the bridge is unreachable.
+    live_balance, live_equity = get_live_balance()
+    balance = live_balance if live_balance is not None else settings["account_balance"]
 
     return {
         "account_balance": live_balance if live_balance is not None else settings["account_balance"],

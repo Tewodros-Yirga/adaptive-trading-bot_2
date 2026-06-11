@@ -69,35 +69,47 @@ Settings follow the pattern `{strategy_name}_{suffix}`, where `{strategy_name}` 
 
 ---
 
-## Strategy Picker
+## News Veto
+
+> **The strategy picker has been removed.** The `EnsembleVoter` is now the sole authority
+> on trade direction (see `strategy/ensemble/voter.py`). The only surviving piece of the
+> old picker is the news veto below. All former `picker_*` keys — `picker_min_score`,
+> `picker_max_simultaneous_strategies`, `picker_secondary_threshold`, `picker_lookback_trades`,
+> `picker_min_trades_for_scoring`, `picker_learning_rate`, `picker_recency_lambda`,
+> `picker_news_bonus`, `picker_news_penalty`, and the eight `picker_weight_*` factor
+> weights — are **obsolete and ignored**. If present in `app_settings`, they are dead rows.
+
+The news veto runs **before** the ensemble vote and can block a trade outright. It only
+fires when the news signal is both strong and highly credible **and** opposes *every*
+strategy that is signalling on the current bar (`services/news_veto.py`). There is no
+score adjustment — it is a clean block/allow.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `picker_max_simultaneous_strategies` | int | `1` | Maximum number of strategies selected per signal evaluation cycle. When set to 1, only the highest-scoring qualifying strategy trades. Set to 2+ for multi-strategy ensemble mode. |
-| `picker_min_score` | float | `0.3` | Minimum picker score (0.0–1.0) a strategy must achieve to be selected for trading. Strategies scoring below this threshold are skipped even if they are the top scorer. |
-| `picker_secondary_threshold` | float | `0.85` | When `picker_max_simultaneous_strategies > 1`, a secondary strategy is only selected if its score is at least this fraction of the top strategy's score. Prevents weak strategies from piggy-backing on a strong one. |
-| `picker_lookback_trades` | int | `20` | Number of most recent closed trades per strategy used when computing the live performance scoring factors. |
-| `picker_min_trades_for_scoring` | int | `5` | Minimum number of closed trades required before a strategy is eligible for live performance scoring. Below this, the strategy uses its backtest composite score only. |
-| `picker_learning_rate` | float | `0.05` | Online learning rate for weight updates after each closed trade. A WIN nudges weights toward the selecting strategy; a LOSS nudges away. |
-| `picker_recency_lambda` | float | `0.1` | Exponential decay constant for the `recency_of_last_win` scoring factor. Higher values penalise strategies that haven't won recently more aggressively. |
-| `picker_news_bias_threshold` | float | `0.5` | Minimum absolute news sentiment score required to apply a news bonus or penalty to picker strategy scores. |
-| `picker_news_bonus` | float | `0.15` | Score bonus applied to a strategy when its direction aligns with the current news sentiment and `|sentiment| ≥ picker_news_bias_threshold`. |
-| `picker_news_penalty` | float | `0.15` | Score penalty applied to a strategy when its direction conflicts with the current news sentiment. |
-| `picker_news_veto_threshold` | float | `0.85` | If `|news_sentiment| ≥ this value`, strategies signalling against the sentiment direction are hard-vetoed (score set to 0), regardless of other factors. |
+| `news_veto_bias_threshold` | float | `0.5` | Minimum absolute news sentiment magnitude before a veto is even considered. |
+| `news_veto_threshold` | float | `0.85` | Minimum news confidence. When `|sentiment| ≥ news_veto_bias_threshold` **and** confidence `≥ this value`, a trade is vetoed if every signalling strategy points against the news direction. Raise → fewer vetoes. |
 
-### Picker Factor Weights
+---
 
-These seven weights determine how the overall picker score is computed. They are normalised to sum to 1.0 at read time, so they do not need to be exact.
+## Live Score Feedback
 
-| Key | Type | Default | Scoring factor |
-|-----|------|---------|----------------|
-| `picker_weight_recent_win_rate` | float | `0.25` | Win rate over the last `picker_lookback_trades` closed trades for this strategy. |
-| `picker_weight_profit_factor` | float | `0.20` | Profit factor (gross profit ÷ gross loss) over recent closed trades. Capped at 5.0 before normalisation. |
-| `picker_weight_backtest_composite_score` | float | `0.20` | Latest promoted candidate composite score from the continuous backtest engine. Falls back to 0.5 if no qualified candidate exists. |
-| `picker_weight_drawdown` | float | `0.15` | Inverse of the recent maximum drawdown. A strategy with low drawdown scores higher. |
-| `picker_weight_signal_confidence` | float | `0.10` | Strategy's own confidence value from the most recent signal for this symbol. |
-| `picker_weight_recency_of_last_win` | float | `0.05` | Exponentially decayed time since the strategy's last winning trade. Recent wins score higher. |
-| `picker_weight_parameter_freshness` | float | `0.05` | How recently the strategy's parameters were updated by the continuous backtest engine. Fresh parameters score higher. |
+On every closed trade, each strategy that voted is given a `live_score` update — an EWMA
+of the trade's realised **R-multiple** (reward earned per unit of risk), signed by whether
+the strategy voted *with* or *against* the trade direction. The `EnsembleVoter` then scales
+each backtest-derived weight by `(1 + score_feedback_weight_gain × live_score)`, floored at
+`score_feedback_weight_floor`. This tilts the ensemble toward strategies that are profitable
+*right now* without touching the backtest `composite_score`. See `services/score_feedback.py`.
+
+`live_score` is stored per-strategy and **resets to 0 when a new parameter set is promoted**
+for that strategy (the old R-multiples were earned by parameters that are no longer live).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `score_feedback_enabled` | bool | `true` | Master on/off. When `false`, the voter uses raw backtest weights with no live tilt. |
+| `score_feedback_alpha` | float | `0.2` | EWMA smoothing factor applied per closed trade. Higher reacts faster to recent trades (noisier); lower is smoother/slower. |
+| `score_feedback_score_bound` | float | `3.0` | Symmetric clamp on the accumulated `live_score` (`[-bound, +bound]`) so a single streak can't dominate. |
+| `score_feedback_weight_gain` | float | `0.25` | How hard `live_score` tilts the vote weight. At gain `0.25`, `live_score = +2` ≈ ×1.5 weight, `−2` ≈ ×0.5. |
+| `score_feedback_weight_floor` | float | `0.1` | Minimum weight multiplier — a struggling strategy is dampened, never fully zeroed (the `WeightManager` suspension handles full removal). |
 
 ---
 
@@ -138,14 +150,10 @@ backtest_adapt_every_n_trades
 {strategy}_param_step_size, {strategy}_range_expansion_months,
 {strategy}_max_history_months
 
-# Picker
-picker_max_simultaneous_strategies, picker_min_score,
-picker_secondary_threshold, picker_lookback_trades,
-picker_min_trades_for_scoring, picker_learning_rate,
-picker_recency_lambda, picker_news_bias_threshold, picker_news_bonus,
-picker_news_penalty, picker_news_veto_threshold,
-picker_weight_recent_win_rate, picker_weight_profit_factor,
-picker_weight_backtest_composite_score, picker_weight_drawdown,
-picker_weight_signal_confidence, picker_weight_recency_of_last_win,
-picker_weight_parameter_freshness
+# News veto (the only surviving piece of the old strategy picker)
+news_veto_bias_threshold, news_veto_threshold
+
+# Live score feedback
+score_feedback_enabled, score_feedback_alpha, score_feedback_score_bound,
+score_feedback_weight_gain, score_feedback_weight_floor
 ```

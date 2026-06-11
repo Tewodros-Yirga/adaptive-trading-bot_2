@@ -55,7 +55,7 @@ def lot_size_preview(
 
     fixed_lot = settings.get("fixed_lot_size", 0.01)
 
-    balance = status.get("account_balance") or 10000.0
+    balance = status.get("account_balance") or 10.0
     risk_pct = settings.get("risk_per_trade_pct", 1.0)
     pip_value = settings.get("pip_value_per_lot", 10.0)
 

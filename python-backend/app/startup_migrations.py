@@ -11,12 +11,68 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 
 logger = logging.getLogger(__name__)
 
+# How long decision audit records live before MongoDB's TTL monitor deletes
+# them. Decisions are only useful for short-term debugging / score feedback;
+# keeping them forever bloats the DB. Default ≈ 2 days ("a day or so" + buffer).
+# Override with DECISION_TTL_SECONDS (e.g. 86400 for exactly one day).
+DECISION_TTL_SECONDS = int(os.environ.get("DECISION_TTL_SECONDS", 7 * 24 * 60 * 60))
+
 
 def _get_client() -> MongoClient:
     uri = os.environ.get("MONGODB_URI", "")
     if not uri:
         raise RuntimeError("MONGODB_URI environment variable is not set")
     return MongoClient(uri, maxPoolSize=10, serverSelectionTimeoutMS=5000)
+
+
+def _ensure_ttl_index(db, coll_name: str, field: str, seconds: int, name: str) -> None:
+    """
+    Ensure a single-field TTL index exists on ``field`` expiring after
+    ``seconds``. Idempotent and self-healing:
+
+      • If a non-TTL index already exists on ``field`` (e.g. an older
+        descending sort index), it is dropped and recreated as a TTL index.
+      • If a TTL index exists but with a different expiry, expireAfterSeconds
+        is updated in-place via collMod (no rebuild).
+
+    A TTL index is also a normal index, so it still serves sort/range queries
+    on ``field`` — no separate query index is needed.
+    """
+    coll = db[coll_name]
+    try:
+        existing = coll.index_information()
+    except Exception as exc:  # collection may not exist yet — create fresh
+        existing = {}
+        logger.debug("index_information failed for %s: %s", coll_name, exc)
+
+    for idx_name, spec in existing.items():
+        keys = spec.get("key", [])
+        if len(keys) == 1 and keys[0][0] == field:
+            current_ttl = spec.get("expireAfterSeconds")
+            if current_ttl is None:
+                # Plain index on this field — drop so we can recreate as TTL.
+                coll.drop_index(idx_name)
+                logger.info("Dropped non-TTL index %s on %s.%s to convert to TTL",
+                            idx_name, coll_name, field)
+            elif current_ttl != seconds:
+                # TTL exists but wrong duration — adjust without a rebuild.
+                db.command("collMod", coll_name,
+                           index={"name": idx_name, "expireAfterSeconds": seconds})
+                logger.info("Updated TTL on %s.%s: %ss -> %ss",
+                            coll_name, field, current_ttl, seconds)
+                return
+            else:
+                return  # already correct
+            break
+
+    coll.create_index(
+        [(field, ASCENDING)],
+        expireAfterSeconds=seconds,
+        background=True,
+        name=name,
+    )
+    logger.info("Created TTL index %s on %s.%s (expire after %ss)",
+                name, coll_name, field, seconds)
 
 
 def run_startup_migrations() -> None:
@@ -94,18 +150,19 @@ def run_startup_migrations() -> None:
         )
 
         # ── ensemble_decisions ────────────────────────────────────────────
-        db["ensemble_decisions"].create_index([("timestamp", DESCENDING)], background=True)
+        # TTL on timestamp auto-deletes stale decisions (also serves the
+        # `.sort("timestamp", -1)` queries, so no extra index needed).
         db["ensemble_decisions"].create_index([("symbol", ASCENDING)], background=True)
+        _ensure_ttl_index(db, "ensemble_decisions", "timestamp",
+                          DECISION_TTL_SECONDS, "ix_ensemble_decisions_timestamp_ttl")
 
         # ── news_veto_decisions ───────────────────────────────────────────
         db["news_veto_decisions"].create_index(
             [("symbol", ASCENDING)], background=True,
             name="ix_news_veto_decisions_symbol",
         )
-        db["news_veto_decisions"].create_index(
-            [("timestamp", DESCENDING)], background=True,
-            name="ix_news_veto_decisions_timestamp",
-        )
+        _ensure_ttl_index(db, "news_veto_decisions", "timestamp",
+                          DECISION_TTL_SECONDS, "ix_news_veto_decisions_timestamp_ttl")
 
         # ── Retired strategy-picker collections (REMOVED) ─────────────────
         # The strategy picker was reduced to a news-veto and online picker-weight
