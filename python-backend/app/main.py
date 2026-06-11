@@ -131,9 +131,9 @@ async def lifespan(app: FastAPI):
     # Force-sent (bypasses min_level/throttle) so you can confirm the channel
     # works. No-op when no channel is configured.
     try:
-        from .services.alerts import send_direct
+        from .services.alerts import send_async
         db = get_database()
-        send_direct(
+        send_async(
             db,
             "service_started",
             "Adaptive Trading backend started and ready.",

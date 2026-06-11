@@ -19,13 +19,28 @@ Settings (all optional, AppSettings keys):
   alerts_enabled_events     comma-separated allow-list of event names to forward;
                             empty/"all" = forward everything that passes min_level.
                             e.g. "service_started,bridge_outage,daily_loss_limit"
+  alerts_proxy_url          optional HTTP CONNECT proxy for outbound delivery,
+                            e.g. "http://user:pass@host:port". Needed on hosts
+                            (Hugging Face Spaces, some corporate nets) that
+                            black-hole direct TLS to api.telegram.org. Falls back
+                            to the HTTPS_PROXY / ALL_PROXY env vars if unset.
+
+Delivery is non-blocking: dispatch_alert() and send_async() enqueue to an
+in-process worker thread that retries transient failures with capped
+exponential backoff. send_direct() stays synchronous so the 'send test message'
+button can report a real, immediate result.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
+import os
+import queue
+import random
 import socket
 import ssl
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -85,17 +100,43 @@ def _first_setting(db: Database, keys: tuple[str, ...]) -> str | None:
     return None
 
 
+# Optional outbound proxy. Some hosts (Hugging Face Spaces, locked-down
+# corporate networks) black-hole direct TLS to api.telegram.org — TCP connects
+# but the handshake is dropped (``_ssl.c:999: handshake operation timed out``).
+# Routing through an HTTPS/CONNECT proxy egresses from a different path and
+# restores delivery. Configured via an AppSetting or a standard proxy env var.
+_PROXY_KEYS = (
+    "alerts_proxy_url",
+    "telegram_proxy_url",
+    "alerts_https_proxy",
+)
+_PROXY_ENV = ("ALERTS_PROXY_URL", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+
+
+def _proxy_url(db: Database) -> str | None:
+    """Resolve an outbound proxy URL from settings first, then env vars."""
+    val = _first_setting(db, _PROXY_KEYS)
+    if val:
+        return val
+    for env in _PROXY_ENV:
+        v = os.environ.get(env)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
 def _enabled_channels(db: Database) -> list[tuple[str, dict]]:
     channels: list[tuple[str, dict]] = []
+    proxy = _proxy_url(db)
     tg_token = _first_setting(db, _TG_TOKEN_KEYS)
     tg_chat = _first_setting(db, _TG_CHAT_KEYS)
     if tg_token and tg_chat:
         # Tolerate a token saved with a leading "bot" prefix or full API path.
         tg_token = tg_token.removeprefix("bot").strip()
-        channels.append(("telegram", {"token": tg_token, "chat_id": tg_chat}))
+        channels.append(("telegram", {"token": tg_token, "chat_id": tg_chat, "proxy": proxy}))
     hook = crud.get_setting(db, "alerts_webhook_url")
     if hook and hook.strip():
-        channels.append(("webhook", {"url": hook.strip()}))
+        channels.append(("webhook", {"url": hook.strip(), "proxy": proxy}))
     return channels
 
 
@@ -133,14 +174,62 @@ def _ipv4_addresses(host: str) -> list[str]:
     return seen
 
 
-def _send_once(host: str, ip: str, request: bytes, timeout: float) -> _Resp:
-    """Open one IPv4 TLS connection to ``ip`` (SNI/cert validated against
-    ``host``), send a pre-built HTTP/1.0 request, and parse the response.
+def _read_http_head(sock) -> bytes:
+    """Read bytes from ``sock`` until the end of the HTTP header block."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        buf = sock.recv(65536)
+        if not buf:
+            break
+        data += buf
+    return data
+
+
+def _open_via_proxy(host: str, proxy: str, timeout: float):
+    """Open a raw TCP tunnel to ``host``:443 through an HTTP CONNECT proxy.
+
+    Returns the connected (still-plaintext) socket positioned to start a TLS
+    handshake with the origin. Raises on any non-2xx CONNECT response.
+    """
+    p = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    pport = p.port or (443 if p.scheme == "https" else 8080)
+    raw = socket.create_connection((p.hostname, pport), timeout=timeout)
+    raw.settimeout(timeout)
+    try:
+        lines = [f"CONNECT {host}:443 HTTP/1.1", f"Host: {host}:443"]
+        if p.username:
+            import base64
+            cred = f"{p.username}:{p.password or ''}".encode()
+            lines.append("Proxy-Authorization: Basic " + base64.b64encode(cred).decode())
+        lines.append("Proxy-Connection: keep-alive")
+        raw.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        head = _read_http_head(raw)
+        status_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        code = status_line.split(" ", 2)[1] if len(status_line.split(" ", 2)) >= 2 else ""
+        if not code.startswith("2"):
+            raise OSError(f"proxy CONNECT failed: {status_line.strip()}")
+        return raw
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        raise
+
+
+def _send_once(host: str, route: str, request: bytes, timeout: float) -> _Resp:
+    """Open one TLS connection to ``host`` over ``route`` (an IPv4 edge IP, or
+    ``"proxy:<url>"``), send a pre-built HTTP/1.0 request, and parse the reply.
 
     HTTP/1.0 with ``Connection: close`` keeps parsing trivial (read to EOF) and
     sidesteps keep-alive/chunked edge cases — alerts are tiny one-shot POSTs.
+    SNI and certificate validation always use the real ``host``, even when the
+    TCP connection targets a bare IP or a proxy.
     """
-    raw = socket.create_connection((ip, 443), timeout=timeout)
+    if route.startswith("proxy:"):
+        raw = _open_via_proxy(host, route[len("proxy:"):], timeout)
+    else:
+        raw = socket.create_connection((route, 443), timeout=timeout)
     try:
         raw.settimeout(timeout)
         with _TLS_CTX.wrap_socket(raw, server_hostname=host) as tls:
@@ -165,15 +254,19 @@ def _send_once(host: str, ip: str, request: bytes, timeout: float) -> _Resp:
     return _Resp(status_code, body)
 
 
-def _http_post(url: str, json_body: dict, timeout: float = 10.0):
-    """Robust IPv4-only JSON POST for tiny alert payloads.
+def _http_post(url: str, json_body: dict, timeout: float = 10.0, proxy: str | None = None):
+    """Robust JSON POST for tiny alert payloads, resilient to host-level egress
+    blocks.
 
-    Resolves the host to its IPv4 edge IPs and tries each one (last-known-good
-    first) with a short per-attempt timeout, so a single black-holed Telegram
-    edge IP — the usual cause of ``_ssl.c:999: handshake operation timed out`` —
-    no longer fails the whole send. The first IP to complete a TLS handshake is
-    cached for subsequent calls. Uses only the stdlib (socket + ssl) so it does
-    not depend on httpx's connection/retry behaviour.
+    Builds an ordered list of routes and tries each (last-known-good first) with
+    a short per-attempt timeout:
+      - a configured proxy (tried first when present, since hosts that block
+        Telegram block it consistently — no point burning a 10s timeout on the
+        direct path every send);
+      - then each IPv4 edge IP of the host (IPv6 excluded to dodge AAAA
+        black-holes), so a single dead Telegram edge can't fail the send.
+    The first route to complete a TLS handshake is cached for subsequent calls.
+    Stdlib-only (socket + ssl); no dependency on httpx connection behaviour.
     """
     split = urlsplit(url)
     host = split.hostname or ""
@@ -192,41 +285,53 @@ def _http_post(url: str, json_body: dict, timeout: float = 10.0):
         f"\r\n"
     ).encode("utf-8") + payload
 
-    ips = _ipv4_addresses(host)
-    if not ips:
+    routes: list[str] = []
+    if proxy:
+        routes.append(f"proxy:{proxy}")
+    routes.extend(_ipv4_addresses(host))
+    if not routes:
         raise OSError(f"could not resolve any IPv4 address for {host}")
 
-    # Try the last known-good IP first, then the rest, without duplicates.
+    # Try the last known-good route first, then the rest, without duplicates.
     cached = _last_good_ip.get(host)
-    ordered = ([cached] if cached in ips else []) + [ip for ip in ips if ip != cached]
+    ordered = ([cached] if cached in routes else []) + [r for r in routes if r != cached]
 
     last_exc: Exception | None = None
-    for attempt, ip in enumerate(ordered):
+    for attempt, route in enumerate(ordered):
         try:
-            resp = _send_once(host, ip, request, timeout)
-            _last_good_ip[host] = ip
+            resp = _send_once(host, route, request, timeout)
+            _last_good_ip[host] = route
             return resp
         except Exception as exc:
             last_exc = exc
             _last_good_ip.pop(host, None)
-            logger.debug("alert POST to %s via %s failed: %s", host, ip, exc)
-            # brief backoff between edge IPs; keeps total time bounded
+            logger.debug("alert POST to %s via %s failed: %s", host, route, exc)
+            # brief backoff between routes; keeps total time bounded
             if attempt + 1 < len(ordered):
                 time.sleep(0.25)
 
-    raise last_exc or OSError(f"all {len(ordered)} IPv4 routes to {host} failed")
+    raise last_exc or OSError(f"all {len(ordered)} routes to {host} failed")
 
 
 def _forward(channel: str, cfg: dict, level: str, event: str, message: str, context: dict | None) -> dict:
-    """Best-effort forward to one channel. Returns {"ok": bool, "detail": str}
-    describing the actual delivery result (e.g. Telegram's API response) so the
-    'send test message' button can report real success/failure. Never raises."""
+    """Best-effort forward to one channel. Returns
+    ``{"ok": bool, "detail": str, "retryable": bool}`` describing the actual
+    delivery result (e.g. Telegram's API response) so the 'send test message'
+    button can report real success/failure and the background worker knows
+    whether re-attempting is worthwhile. Never raises.
+
+    A 4xx (bad token/chat-id, malformed request) is permanent — retrying is
+    pointless and would spam. A transport error (TLS timeout, connection
+    refused) or a 429/5xx is transient — worth retrying with backoff.
+    """
     text = f"[{level.upper()}] {event}: {message}"
+    proxy = cfg.get("proxy")
     try:
         if channel == "telegram":
             resp = _http_post(
                 f"https://api.telegram.org/bot{cfg['token']}/sendMessage",
                 {"chat_id": cfg["chat_id"], "text": text},
+                proxy=proxy,
             )
             # Telegram replies 200 with {"ok": true, ...} on success, or a 4xx
             # with {"ok": false, "description": "..."} on bad token/chat_id.
@@ -236,10 +341,11 @@ def _forward(channel: str, cfg: dict, level: str, event: str, message: str, cont
             except Exception:
                 pass
             if resp.status_code == 200 and body.get("ok"):
-                return {"ok": True, "detail": "delivered"}
+                return {"ok": True, "detail": "delivered", "retryable": False}
             detail = body.get("description") or f"HTTP {resp.status_code}"
+            retryable = resp.status_code == 429 or resp.status_code >= 500 or resp.status_code == 0
             logger.warning("Telegram send failed: %s", detail)
-            return {"ok": False, "detail": detail}
+            return {"ok": False, "detail": detail, "retryable": retryable}
         elif channel == "webhook":
             resp = _http_post(
                 cfg["url"],
@@ -249,13 +355,125 @@ def _forward(channel: str, cfg: dict, level: str, event: str, message: str, cont
                     "message": message,
                     "context": context or {},
                 },
+                proxy=proxy,
             )
             ok = resp.status_code < 400
-            return {"ok": ok, "detail": "delivered" if ok else f"HTTP {resp.status_code}"}
-    except Exception as exc:  # never let alerting break the caller
+            retryable = resp.status_code == 429 or resp.status_code >= 500 or resp.status_code == 0
+            return {
+                "ok": ok,
+                "detail": "delivered" if ok else f"HTTP {resp.status_code}",
+                "retryable": retryable,
+            }
+    except Exception as exc:  # transport-level failure — never break the caller
         logger.warning("Alert forward via %s failed: %s", channel, exc)
-        return {"ok": False, "detail": str(exc)}
-    return {"ok": False, "detail": "unknown channel"}
+        return {"ok": False, "detail": str(exc), "retryable": True}
+    return {"ok": False, "detail": "unknown channel", "retryable": False}
+
+
+# ---------------------------------------------------------------------------
+# Background delivery — non-blocking, self-healing retries.
+#
+# Direct delivery (send_direct) blocks the caller and gives one shot. On hosts
+# whose egress to Telegram is flaky or temporarily blocked, that means lost
+# alerts and a stalled startup/request. The worker decouples generation from
+# delivery: callers enqueue instantly, a daemon thread delivers with capped
+# exponential backoff + jitter, and only transient failures are retried (a bad
+# token is dropped immediately instead of spamming). The channel config is
+# snapshotted at enqueue time, so the worker needs no DB handle.
+# ---------------------------------------------------------------------------
+_MAX_ATTEMPTS = 8           # ~ up to a few minutes of retries per alert
+_MAX_AGE = 1800.0           # stop retrying an alert older than 30 min
+_QUEUE_MAX = 1000
+
+_alert_q: "queue.PriorityQueue[tuple[float, int, dict]]" = queue.PriorityQueue(maxsize=_QUEUE_MAX)
+_seq_counter = itertools.count()
+_worker: threading.Thread | None = None
+_worker_lock = threading.Lock()
+
+
+def _worker_loop() -> None:
+    while True:
+        due, _, job = _alert_q.get()
+        try:
+            wait = due - time.monotonic()
+            if wait > 0:
+                # Not due yet — nap (bounded) and requeue so earlier jobs win.
+                time.sleep(min(wait, 5.0))
+                if time.monotonic() < due:
+                    _alert_q.put((due, next(_seq_counter), job))
+                    continue
+
+            res = _forward(
+                job["channel"], job["cfg"], job["level"],
+                job["event"], job["message"], job.get("context"),
+            )
+            if res.get("ok"):
+                continue
+
+            job["attempts"] += 1
+            age = time.monotonic() - job["created"]
+            if res.get("retryable") and job["attempts"] < _MAX_ATTEMPTS and age < _MAX_AGE:
+                delay = min(300.0, 2.0 ** job["attempts"]) + random.uniform(0.0, 1.0)
+                logger.info(
+                    "Alert %s/%s retry %d/%d in %.0fs (%s)",
+                    job["channel"], job["event"], job["attempts"], _MAX_ATTEMPTS,
+                    delay, res.get("detail"),
+                )
+                _alert_q.put((time.monotonic() + delay, next(_seq_counter), job))
+            else:
+                logger.warning(
+                    "Alert %s/%s permanently undelivered after %d attempt(s): %s",
+                    job["channel"], job["event"], job["attempts"], res.get("detail"),
+                )
+        except Exception as exc:
+            logger.debug("alert worker iteration failed: %s", exc)
+        finally:
+            _alert_q.task_done()
+
+
+def _ensure_worker() -> None:
+    global _worker
+    if _worker is not None and _worker.is_alive():
+        return
+    with _worker_lock:
+        if _worker is not None and _worker.is_alive():
+            return
+        _worker = threading.Thread(target=_worker_loop, name="alerts-delivery", daemon=True)
+        _worker.start()
+
+
+def _enqueue_delivery(channel: str, cfg: dict, level: str, event: str,
+                      message: str, context: dict | None) -> bool:
+    _ensure_worker()
+    job = {
+        "channel": channel, "cfg": cfg, "level": level, "event": event,
+        "message": message, "context": context,
+        "attempts": 0, "created": time.monotonic(),
+    }
+    try:
+        _alert_q.put_nowait((time.monotonic(), next(_seq_counter), job))
+        return True
+    except queue.Full:
+        logger.warning("alert queue full; dropping %s/%s", channel, event)
+        return False
+
+
+def send_async(
+    db: Database,
+    event: str,
+    message: str,
+    level: str = "info",
+    context: dict[str, Any] | None = None,
+) -> dict:
+    """Non-blocking force-send: snapshot configured channels now and deliver in
+    the background with retries/backoff. Returns immediately — use for startup
+    banners and any hot path that must not block on network I/O."""
+    logger.info("EVENT(async) %s | %s | %s", event, message, level)
+    channels = _enabled_channels(db)
+    if not channels:
+        return {"queued": False, "reason": "No channels configured.", "channels": []}
+    queued = [c for c, cfg in channels if _enqueue_delivery(c, cfg, level, event, message, context)]
+    return {"queued": bool(queued), "channels": queued}
 
 
 def send_direct(
@@ -344,7 +562,9 @@ def dispatch_alert(
             return
         _last_forwarded[event] = now
 
+        # Hand off to the background worker so a slow/blocked egress never
+        # stalls the caller and transient failures are retried automatically.
         for channel, cfg in channels:
-            _forward(channel, cfg, level, event, message, context)
+            _enqueue_delivery(channel, cfg, level, event, message, context)
     except Exception as exc:
         logger.debug("dispatch_alert failed: %s", exc)
