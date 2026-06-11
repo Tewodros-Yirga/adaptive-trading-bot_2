@@ -83,6 +83,20 @@ _TG_CHAT_KEYS = (
     "telegram_user_id",
     "alerts_telegram_user_id",
 )
+# Telegram API base URL. Override to point at a relay (e.g. a Cloudflare Worker
+# that reverse-proxies api.telegram.org) on hosts whose egress to Telegram's IP
+# range is blocked. The relay should sit behind a secret path so it is not an
+# open proxy, e.g. "https://my-relay.workers.dev/<secret>".
+_TG_API_BASE_KEYS = (
+    "alerts_telegram_api_base",
+    "telegram_api_base",
+)
+_TG_API_DEFAULT = "https://api.telegram.org"
+
+
+def _telegram_api_base(db: Database) -> str:
+    base = _first_setting(db, _TG_API_BASE_KEYS) or _TG_API_DEFAULT
+    return base.rstrip("/")
 
 
 def _first_setting(db: Database, keys: tuple[str, ...]) -> str | None:
@@ -151,7 +165,7 @@ def _mask_proxy(url: str) -> str:
 
 # Marker so the diagnostics endpoint can confirm the proxy-capable build is the
 # one actually running. Bump when the delivery path changes materially.
-ALERTS_BUILD = "proxy-support-v2"
+ALERTS_BUILD = "relay-support-v3"
 
 
 def diagnose(db: Database, timeout: float = 8.0) -> dict:
@@ -163,13 +177,20 @@ def diagnose(db: Database, timeout: float = 8.0) -> dict:
     Makes a real (harmless) GET to api.telegram.org over each route. No alert is
     sent. Credentials are never returned.
     """
-    host = "api.telegram.org"
     proxy = _proxy_url(db)
     tg_token = _first_setting(db, _TG_TOKEN_KEYS)
     tg_chat = _first_setting(db, _TG_CHAT_KEYS)
 
+    # Probe the exact base the sender uses — the relay/Worker if configured, so
+    # diagnostics test the real delivery path rather than always hitting
+    # api.telegram.org direct.
+    base = _telegram_api_base(db)
+    bsplit = urlsplit(base)
+    host = bsplit.hostname or "api.telegram.org"
+    base_path = bsplit.path or ""
+
     token = (tg_token or "").removeprefix("bot").strip()
-    path = f"/bot{token}/getMe" if token else "/"
+    path = f"{base_path}/bot{token}/getMe" if token else (base_path or "/")
     request = (
         f"GET {path} HTTP/1.0\r\n"
         f"Host: {host}\r\n"
@@ -201,6 +222,8 @@ def diagnose(db: Database, timeout: float = 8.0) -> dict:
     return {
         "build": ALERTS_BUILD,
         "telegram_configured": bool(tg_token and tg_chat),
+        "telegram_api_base": base,
+        "probe_host": host,
         "proxy_configured": bool(proxy),
         "proxy_source": _proxy_source(db),
         "proxy": _mask_proxy(proxy) if proxy else None,
@@ -219,7 +242,10 @@ def _enabled_channels(db: Database) -> list[tuple[str, dict]]:
     if tg_token and tg_chat:
         # Tolerate a token saved with a leading "bot" prefix or full API path.
         tg_token = tg_token.removeprefix("bot").strip()
-        channels.append(("telegram", {"token": tg_token, "chat_id": tg_chat, "proxy": proxy}))
+        channels.append(("telegram", {
+            "token": tg_token, "chat_id": tg_chat, "proxy": proxy,
+            "api_base": _telegram_api_base(db),
+        }))
     hook = crud.get_setting(db, "alerts_webhook_url")
     if hook and hook.strip():
         channels.append(("webhook", {"url": hook.strip(), "proxy": proxy}))
@@ -414,8 +440,9 @@ def _forward(channel: str, cfg: dict, level: str, event: str, message: str, cont
     proxy = cfg.get("proxy")
     try:
         if channel == "telegram":
+            api_base = cfg.get("api_base") or _TG_API_DEFAULT
             resp = _http_post(
-                f"https://api.telegram.org/bot{cfg['token']}/sendMessage",
+                f"{api_base}/bot{cfg['token']}/sendMessage",
                 {"chat_id": cfg["chat_id"], "text": text},
                 proxy=proxy,
             )
