@@ -279,97 +279,32 @@ class EnsembleDecisionOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Strategy Picker schemas
+# News-veto schemas (all that remains of the retired strategy picker)
 # ---------------------------------------------------------------------------
 
-class PickerScoreComponentsOut(BaseModel):
-    """Per-factor breakdown for a single strategy in a picker decision."""
-    recent_win_rate: float = 0.0
-    profit_factor: float = 0.0
-    backtest_composite_score: float = 0.0
-    drawdown: float = 0.0
-    signal_confidence: float = 0.0
-    recency_of_last_win: float = 0.0
-    parameter_freshness: float = 0.0
-
-
-class PickerStrategyScoreOut(BaseModel):
-    """One strategy's full score entry inside a StrategyPickerDecisionOut."""
-    strategy_name: str
-    total_score: float
-    score_components: PickerScoreComponentsOut
-    selected: bool = False
-
-
-class StrategyPickerDecisionOut(BaseModel):
+class NewsVetoDecisionOut(BaseModel):
     id: int
     symbol: str
     timestamp: datetime
-    strategy_scores_json: list[dict[str, Any]] | None = None
-    selected_strategies_json: list[str] | None = None
-    ensemble_weights_used_json: dict[str, Any] | None = None
     trade_id: int | None = None
+    veto: bool = False
+    veto_reason: str | None = None
     news_influence_json: dict[str, Any] | None = None
-    picker_confidence: float | None = None
-    reasoning: str | None = None
 
     class Config:
         from_attributes = True
 
 
-class PickerWeightHistoryOut(BaseModel):
-    id: int
-    trade_id: int
-    weights_before_json: dict[str, Any] | None = None
-    weights_after_json: dict[str, Any] | None = None
-    weight_deltas_json: dict[str, Any] | None = None
-    trade_result: str
-    updated_at: datetime | None = None
-
-    class Config:
-        from_attributes = True
-
-
-class PickerSettingsIn(BaseModel):
-    """Payload for POST /picker/settings — all fields optional."""
-    picker_max_simultaneous_strategies: int | None = None
-    picker_min_score: float | None = None
-    picker_secondary_threshold: float | None = None
-    picker_lookback_trades: int | None = None
-    picker_min_trades_for_scoring: int | None = None
-    picker_learning_rate: float | None = None
-    picker_recency_lambda: float | None = None
-    picker_news_bias_threshold: float | None = None
-    picker_news_bonus: float | None = None
-    picker_news_penalty: float | None = None
-    picker_news_veto_threshold: float | None = None
-    # Factor weights — normalised server-side before persisting
-    picker_weight_recent_win_rate: float | None = None
-    picker_weight_profit_factor: float | None = None
-    picker_weight_backtest_composite_score: float | None = None
-    picker_weight_drawdown: float | None = None
-    picker_weight_signal_confidence: float | None = None
-    picker_weight_recency_of_last_win: float | None = None
-    picker_weight_parameter_freshness: float | None = None
-    picker_weight_context_fit: float | None = None
-
-
-class PickerStatusOut(BaseModel):
-    """Current picker configuration and rolling 7-day selection stats."""
-    active_weights: dict[str, float]
-    settings: dict[str, Any]
-    stats_7d: dict[str, Any]
-
-
-class PickerPerformanceOut(BaseModel):
-    """Aggregate meta-performance of the picker over a rolling window."""
-    total_decisions: int
-    decisions_with_trades: int
-    total_wins: int
-    total_losses: int
-    win_rate_pct: float
-    avg_picker_confidence: float
-    weight_update_count: int
+class NewsVetoSettingsIn(BaseModel):
+    """Payload for POST /news-veto/settings — all fields optional."""
+    news_veto_bias_threshold: float | None = None
+    news_veto_threshold: float | None = None
+    # Live score feedback (R-multiple live_score blended into vote weights)
+    score_feedback_enabled: bool | None = None
+    score_feedback_alpha: float | None = None
+    score_feedback_score_bound: float | None = None
+    score_feedback_weight_gain: float | None = None
+    score_feedback_weight_floor: float | None = None
 
 
 # ---------------------------------------------------------------------------

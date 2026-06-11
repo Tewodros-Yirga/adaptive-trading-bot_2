@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not seed strategies: {e}")
 
-    # ── 5. Seed default AppSettings for continuous backtest + picker ───────
+    # ── 5. Seed default AppSettings (backtest, news-veto, score feedback) ──
     try:
         db = get_database()
         from .crud import seed_default_settings
@@ -253,7 +253,7 @@ async def _live_trading_loop():
     Every 60 seconds (configurable via ``live_trading_interval_seconds`` AppSetting):
       1. Fetch the latest price from the MT5 bridge for each configured symbol.
       2. Pass price + minimal market_data to process_signal().
-      3. The orchestrator + picker handle signal gathering, strategy selection,
+      3. The orchestrator handles signal gathering, news-veto, ensemble voting,
          risk checks, and order placement.
     """
     await asyncio.sleep(30)  # brief initial delay so the bridge has time to connect
@@ -385,7 +385,7 @@ async def _live_trading_loop():
                         "_existing_positions": existing_positions,
                     }
 
-                    # Run the full pipeline (signals → picker → ensemble → order).
+                    # Run the full pipeline (signals → news-veto → ensemble → order).
                     result = await process_signal(db, market_data, symbol, price)
                     status = result.get("status", "?")
 
@@ -500,7 +500,7 @@ def create_app() -> FastAPI:
     from .routers.bridge import router as bridge_router
     from .routers.shadow_signals import router as shadow_router
     from .routers.ensemble import router as ensemble_router
-    from .routers.picker import router as picker_router
+    from .routers.news_veto import router as news_veto_router
     from .routers.system import router as system_router
     from .routers.health import router as health_router
 
@@ -525,7 +525,7 @@ def create_app() -> FastAPI:
     app.include_router(bridge_router, dependencies=jwt_deps)
     app.include_router(shadow_router, dependencies=jwt_deps)
     app.include_router(ensemble_router, dependencies=jwt_deps)
-    app.include_router(picker_router, dependencies=jwt_deps)
+    app.include_router(news_veto_router, dependencies=jwt_deps)
     app.include_router(system_router, dependencies=jwt_deps)
     # /health/db is public — no jwt_deps
     app.include_router(health_router)

@@ -145,25 +145,17 @@ async def _reconcile_closed_trade(
             trade_id, ticket, exit_price, pnl, result, reason,
         )
 
-        # Trigger picker weight learning
+        # Trade-close learning: strategy score feedback + news intelligence.
         try:
-            from ..services.strategy_picker import update_picker_weights_from_trade
-            from ..db import COLL_STRATEGY_PICKER_DECISIONS
-            from ..models import StrategyPickerDecision, Trade
+            from ..services.score_feedback import run_trade_close_hooks
+            from ..models import Trade
 
             updated_doc = db[COLL_TRADES].find_one({"_id": trade_id})
             if updated_doc:
                 trade = Trade.from_doc(updated_doc)
-                picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one({"trade_id": trade_id})
-                if picker_doc is None and trade.symbol:
-                    picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one(
-                        {"symbol": trade.symbol}, sort=[("timestamp", -1)]
-                    )
-                if picker_doc:
-                    picker_decision = StrategyPickerDecision.from_doc(picker_doc)
-                    update_picker_weights_from_trade(trade, picker_decision, db)
+                run_trade_close_hooks(db, trade)
         except Exception as exc:
-            logger.debug("position_stream: picker weight update failed: %s", exc)
+            logger.debug("position_stream: trade-close hooks failed: %s", exc)
 
     except Exception as exc:
         logger.error(

@@ -97,21 +97,29 @@ def run_startup_migrations() -> None:
         db["ensemble_decisions"].create_index([("timestamp", DESCENDING)], background=True)
         db["ensemble_decisions"].create_index([("symbol", ASCENDING)], background=True)
 
-        # ── strategy_picker_decisions ─────────────────────────────────────
-        db["strategy_picker_decisions"].create_index(
+        # ── news_veto_decisions ───────────────────────────────────────────
+        db["news_veto_decisions"].create_index(
             [("symbol", ASCENDING)], background=True,
-            name="ix_strategy_picker_decisions_symbol",
+            name="ix_news_veto_decisions_symbol",
         )
-        db["strategy_picker_decisions"].create_index(
+        db["news_veto_decisions"].create_index(
             [("timestamp", DESCENDING)], background=True,
-            name="ix_strategy_picker_decisions_timestamp",
+            name="ix_news_veto_decisions_timestamp",
         )
 
-        # ── picker_weight_history ─────────────────────────────────────────
-        db["picker_weight_history"].create_index(
-            [("trade_id", ASCENDING)], background=True,
-            name="ix_picker_weight_history_trade_id",
-        )
+        # ── Retired strategy-picker collections (REMOVED) ─────────────────
+        # The strategy picker was reduced to a news-veto and online picker-weight
+        # learning was retired when the EnsembleVoter became the sole direction
+        # authority. Strategy feedback is now a direct composite_score nudge at
+        # trade close (see app/services/score_feedback.py). Drop the dead
+        # collections; news-veto audit now lives in news_veto_decisions.
+        for _obsolete in ("picker_weight_history", "strategy_picker_decisions"):
+            try:
+                if _obsolete in db.list_collection_names():
+                    db[_obsolete].drop()
+                    logger.info("Dropped obsolete collection %s", _obsolete)
+            except Exception as exc:
+                logger.warning("Could not drop %s: %s", _obsolete, exc)
 
         # ── backtest_batches ──────────────────────────────────────────────
         db["backtest_batches"].create_index(

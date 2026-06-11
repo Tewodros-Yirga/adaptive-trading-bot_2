@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pymongo.database import Database
 
 from ..config import settings
-from ..db import get_db, COLL_STRATEGY_PICKER_DECISIONS
+from ..db import get_db
 from ..schemas import WebhookPayload
 from ..crud import log_trade, get_current_params, close_trade as crud_close_trade
 
@@ -135,25 +135,11 @@ def close_trade_webhook(payload: dict, db: Database = Depends(get_db)):
     if not trade:
         raise HTTPException(status_code=404, detail=f"Trade #{trade_id} not found")
 
-    # Trigger online picker weight learning
+    # Trade-close learning: strategy score feedback + news intelligence.
     try:
-        from ..services.strategy_picker import update_picker_weights_from_trade
-
-        picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one({"trade_id": trade_id})
-        if picker_doc is None and trade.symbol:
-            picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one(
-                {"symbol": trade.symbol},
-                sort=[("timestamp", -1)],
-            )
-
-        if picker_doc:
-            from ..models import StrategyPickerDecision
-            picker_decision = StrategyPickerDecision.from_doc(picker_doc)
-            update_picker_weights_from_trade(trade, picker_decision, db)
-            logger.info(f"Picker weights updated from trade #{trade_id} result={result}")
-        else:
-            logger.debug(f"No StrategyPickerDecision found for trade #{trade_id}; skipping weight update")
+        from ..services.score_feedback import run_trade_close_hooks
+        run_trade_close_hooks(db, trade)
     except Exception as exc:
-        logger.warning(f"Picker weight update failed for trade #{trade_id}: {exc}")
+        logger.warning(f"Trade-close hooks failed for trade #{trade_id}: {exc}")
 
     return {"status": "ok", "trade_id": trade.id, "result": result, "pnl": pnl}

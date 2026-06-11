@@ -2,36 +2,25 @@
 Strategy Orchestrator
 Manages multi-strategy signal combination and live trade routing.
 
-Phase 3 changes:
-  - `process_signal()` now delegates strategy selection and ensemble resolution
-    to `strategy_picker.pick_and_route()` instead of using static `is_live`.
-  - `StrategyPickerDecision.trade_id` is back-filled after the trade is created.
-  - `EnsembleDecision` record is still created for voting audit trail.
-  - DOMINANT mode migrated to WEIGHTED_VOTE on read (unchanged from Phase 2).
+Direction resolution:
+  - The EnsembleVoter (with optimized backtested weights from WeightManager) is
+    the sole authority on trade direction/confidence/weights.
+  - A news-veto check (news_veto.news_veto_check) runs first and can block the
+    trade when high-confidence news opposes every signalling strategy; it also
+    writes a NewsVetoDecision audit record whose trade_id is back-filled after
+    the trade is created. A voter failure means "no strategy direction this bar".
+  - An EnsembleDecision record is created for the voting audit trail.
 
-Phase 4 additions:
-  - MTF (multi-timeframe) market_data is built for strategies with `requires_mtf = True`.
-    Uses `build_mtf_market_data()` + `fetch_ohlcv_with_fallback()` from ohlcv.py.
-  - Per-strategy MTF data is fetched once per orchestrator call and reused across
-    all active MTF strategies (keyed by symbol).
-  - EnsembleVoter (with optimized backtested weights from WeightManager) replaces
-    the ad-hoc resolve_direction() call inside process_signal().  pick_and_route()
-    is still called for the StrategyPickerDecision audit record and news-veto check,
-    but direction/confidence/weights are overridden by the voter result.
+Multi-timeframe:
+  - MTF market_data is built for strategies with `requires_mtf = True`
+    (build_mtf_market_data() + fetch_ohlcv_with_fallback() from ohlcv.py), fetched
+    once per orchestrator call and reused across active MTF strategies.
 
-Fix (confidence always 0.0):
-  - Non-MTF strategies return a plain string signal, so confidence was being set
-    to `1.0 if sig else 0.0`.  That is correct, but downstream `pick_and_route`
-    was passing ALL selected strategy signals (including those with direction=None
-    whose confidence=0.0) into `resolve_direction`, causing buy_weight=0 always.
-  - The fix is in strategy_picker.py (filter to signaling strategies only before
-    voting).  The orchestrator change here makes the confidence value explicit and
-    always a float, which makes debugging easier and removes the implicit 0/1 cast.
-
-Model 2 changes:
-  - After `crud.log_trade(...)` creates an OPEN trade, immediately call
-    `learn_from_trade` from news_intelligence so that news items published
-    before this trade are flagged as ``trade_correlation_pending = True``.
+News learning:
+  - After `crud.log_trade(...)` creates an OPEN trade, `learn_from_trade` flags
+    news items published before the trade as ``trade_correlation_pending``; at
+    trade close, score_feedback.run_trade_close_hooks updates news learning and
+    nudges each voting strategy's composite_score.
 """
 import json
 import logging
@@ -205,48 +194,6 @@ def _enrich_market_data_from_df(df, params: dict) -> dict:
 # Core ensemble resolution (exported for pair analysis and tests)
 # ---------------------------------------------------------------------------
 
-def resolve_direction(
-    signals: list[dict],
-    weights: dict[str, float],
-) -> tuple[str | None, float]:
-    """
-    DEPRECATED — Direction resolution is now handled by EnsembleVoter.vote()
-    in process_signal(). This function is retained only because strategy_picker.py
-    still calls it for its own weighted-vote fallback path.
-
-    Unified weighted-vote direction resolver.
-    Returns (resolved_direction, confidence_score).
-
-    NOTE: `signals` should only contain entries where direction is not None.
-    Passing signals with direction=None produces zero-weight votes, which
-    causes confidence to always resolve to 0.0 even when a real signal exists.
-    The caller (pick_and_route) is responsible for pre-filtering.
-    """
-    total_weight = sum(weights.values()) or 1.0
-    norm_weights = {k: v / total_weight for k, v in weights.items()}
-
-    buy_weight = sum(
-        norm_weights.get(s["strategy_name"], 0.0) * float(s.get("confidence") or 0.0)
-        for s in signals
-        if s.get("direction") == "BUY"
-    )
-    sell_weight = sum(
-        norm_weights.get(s["strategy_name"], 0.0) * float(s.get("confidence") or 0.0)
-        for s in signals
-        if s.get("direction") == "SELL"
-    )
-
-    if buy_weight == 0.0 and sell_weight == 0.0:
-        return None, 0.0
-
-    total = buy_weight + sell_weight
-    if buy_weight > sell_weight:
-        return "BUY", buy_weight / total
-    if sell_weight > buy_weight:
-        return "SELL", sell_weight / total
-    return None, 0.0
-
-
 def resolve_ensemble_levels(
     resolved_direction: str,
     signals: list[dict],
@@ -324,6 +271,26 @@ def _load_ensemble_voter(db: Database) -> "EnsembleVoter":  # type: ignore[name-
     if weights is None:
         weights = wm.get_default_weights()
         logger.debug("EnsembleVoter: no saved weights found — using defaults")
+
+    # ── Blend in live score feedback ──────────────────────────────────────
+    # Each strategy carries a `live_score` (EWMA of realised R-multiples from
+    # live trades, centred on 0). We scale its backtest weight by
+    # (1 + gain * live_score), floored at a small positive so a recently-bad
+    # strategy is dampened (not erased — suspension handles full removal) and a
+    # recently-good one is amplified. This keeps the backtest weights as the
+    # base and lets live outcomes tilt them, WITHOUT touching composite_score.
+    if str(crud.get_setting(db, "score_feedback_enabled") or "true").lower() in ("1", "true", "yes", "on"):
+        try:
+            gain = float(crud.get_setting(db, "score_feedback_weight_gain") or 0.25)
+            floor = float(crud.get_setting(db, "score_feedback_weight_floor") or 0.1)
+            live_scores = crud.get_live_scores(db)
+            if gain > 0 and live_scores:
+                weights = {
+                    name: w * max(floor, 1.0 + gain * float(live_scores.get(name, 0.0)))
+                    for name, w in weights.items()
+                }
+        except Exception as exc:
+            logger.warning("EnsembleVoter: live-score blend failed, using base weights: %s", exc)
 
     return EnsembleVoter(
         weights=weights,
@@ -418,31 +385,27 @@ async def process_signal(
     extra_trade_fields: dict | None = None,
 ) -> dict:
     """
-    Main orchestrator entry point (Phase 3 + Phase 4 MTF + EnsembleVoter + Model 2).
+    Main orchestrator entry point.
 
     1. Determine which active strategies require MTF data; fetch once.
     2. Gather signals from all active strategies (injecting MTF market_data
        for strategies with requires_mtf=True).
-    3. Call strategy_picker.pick_and_route() for the StrategyPickerDecision
-       audit record and news-veto check.
-    4. Override direction/confidence/weights with EnsembleVoter result (uses
-       optimized backtested weights from WeightManager).  Falls back to picker
-       result if EnsembleVoter raises any exception.
+    3. Run the news-veto check (news_veto_check) — writes a NewsVetoDecision
+       audit record and blocks the trade if news opposes every signal.
+    4. Resolve direction/confidence/weights via the EnsembleVoter (optimized
+       backtested weights from WeightManager). A voter failure means no strategy
+       direction this bar (the news-driven fallback may still apply).
     5. Apply risk check.
     6. Place order via bridge.
     7. Log EnsembleDecision (with voter breakdown) and back-fill
-       StrategyPickerDecision.trade_id.
-    8. (Model 2) Call learn_from_trade so news items published before this
-       trade are marked as trade_correlation_pending for later learning.
+       NewsVetoDecision.trade_id.
+    8. Call learn_from_trade so news items published before this trade are
+       marked as trade_correlation_pending for later learning.
 
-    Confidence fix: for non-MTF strategies, signal() returns a plain string.
-    We now explicitly set confidence=1.0 when a direction is present, rather
-    than using a conditional expression that could silently become 0.0 due to
-    falsy string checks.  MTF strategies return (direction, confidence) tuples
-    and their confidence is used as-is.
+    Confidence: for non-MTF strategies, signal() returns a plain string, so
+    confidence is set to 1.0 when a direction is present; MTF strategies return
+    (direction, confidence) tuples and their confidence is used as-is.
     """
-    from ..services.strategy_picker import pick_and_route, update_picker_weights_from_trade  # noqa
-
     active_strategies = get_active_strategies(db)
 
     if not active_strategies:
@@ -500,8 +463,8 @@ async def process_signal(
 
             # MTF strategies (e.g. Alchemist) return (direction, confidence) tuples.
             # Legacy/non-MTF strategies return a plain string or None.
-            # FIX: always produce an explicit float confidence so downstream
-            # resolve_direction never multiplies by an accidental 0.
+            # Always produce an explicit float confidence so the EnsembleVoter
+            # never multiplies a vote by an accidental 0.
             if isinstance(raw_sig, tuple):
                 sig, confidence = raw_sig
                 # Ensure confidence is a proper float even if the strategy
@@ -571,23 +534,28 @@ async def process_signal(
     except Exception as exc:
         logger.warning("Shadow signal logging failed: %s", exc)
 
-    # ── Strategy Picker: audit trail + news-veto check ────────────────────
-    # pick_and_route() is still called to persist the StrategyPickerDecision
-    # record and to apply any news-veto logic.  Its direction/confidence output
-    # is overridden below by the EnsembleVoter result.
-    picker_result = await pick_and_route(symbol, signal_dicts, db, market_data)
-    picker_decision_id: int | None = picker_result.get("picker_decision_id")
+    # ── News veto check ───────────────────────────────────────────────────
+    # The strategy picker has been retired: the EnsembleVoter (below) is the
+    # sole authority on direction. All that remains of the picker is the
+    # news-driven veto, which can block a trade when high-confidence news points
+    # against every signalling strategy. It also persists an audit record.
+    from ..services.news_veto import news_veto_check
+    veto_result = news_veto_check(symbol, signal_dicts, db)
+    news_veto_decision_id: int | None = veto_result.get("decision_id")
 
-    if picker_result.get("veto"):
+    if veto_result.get("veto"):
         return {
-            "status": "BLOCKED_BY_PICKER_VETO",
-            "veto_reason": picker_result.get("veto_reason"),
-            "picker_decision_id": picker_decision_id,
+            "status": "BLOCKED_BY_NEWS_VETO",
+            "veto_reason": veto_result.get("veto_reason"),
+            "news_veto_decision_id": news_veto_decision_id,
         }
 
     # ── EnsembleVoter: weighted consensus decision (Phase 4) ──────────────
     # Load optimized backtested weights from MongoDB and run the voter.
-    # Falls back to picker result on any exception to keep the live loop safe.
+    # The voter is the sole source of direction/confidence/weights — there is no
+    # longer a picker direction to fall back to, so a voter failure means
+    # "no trade this bar" (the news-driven fallback below may still synthesize
+    # a direction from news bias alone).
     _vote_result: dict = {}
     _level_strategy_name: str | None = None
 
@@ -610,13 +578,14 @@ async def process_signal(
             _vote_result["threshold_used"],
         )
     except Exception as _voter_exc:
-        # Voter failure: degrade gracefully to picker result
-        logger.warning(
-            "[EnsembleVoter] Failed — falling back to picker result: %s", _voter_exc
+        # Voter failure: there is no picker direction to fall back to. Degrade to
+        # "no strategy direction" — the news-driven fallback below still applies.
+        logger.error(
+            "[EnsembleVoter] Failed — no strategy direction this bar: %s", _voter_exc
         )
-        final_direction = picker_result.get("resolved_direction")
-        resolved_confidence = float(picker_result.get("picker_confidence") or 0.0)
-        ensemble_weights = picker_result.get("ensemble_weights") or {}
+        final_direction = None
+        resolved_confidence = 0.0
+        ensemble_weights = {}
         _level_strategy_name = None
 
     # ── Compute levels via the designated level strategy ──────────────────
@@ -722,7 +691,7 @@ async def process_signal(
                 "signals": signals_summary,
                 "news_bias": _nb,
                 "news_confidence": _nc,
-                "picker_decision_id": picker_decision_id,
+                "news_veto_decision_id": news_veto_decision_id,
                 "ensemble_decision_id": decision.id,
             }
 
@@ -772,7 +741,7 @@ async def process_signal(
                 "take_profit": levels.get("tp1"),
                 "lot_size": 0,
                 "result": "BLOCKED",
-                "strategy_name": selected_strategies[0] if selected_strategies else "PICKER",
+                "strategy_name": selected_strategies[0] if selected_strategies else "ENSEMBLE",
                 "opened_at": datetime.utcnow(),
                 **(extra_trade_fields or {}),
             },
@@ -782,7 +751,7 @@ async def process_signal(
             "status": "BLOCKED_BY_RISK",
             "reason": block_reason,
             "trade_id": trade.id,
-            "picker_decision_id": picker_decision_id,
+            "news_veto_decision_id": news_veto_decision_id,
             "ensemble_decision_id": decision.id,
         }
 
@@ -882,7 +851,7 @@ async def process_signal(
                 "required_distance":    round(required_dist, 5),
                 "agreeing_strategies":  agreeing_count,
                 "required_strategies":  dup_min_strats,
-                "picker_decision_id":   picker_decision_id,
+                "news_veto_decision_id":   news_veto_decision_id,
                 "ensemble_decision_id": _dup_decision.id,
             }
 
@@ -983,7 +952,7 @@ async def process_signal(
                     "reason":              "Low confidence reversal — tightened existing stops",
                     "resolved_confidence": resolved_confidence,
                     "modified_positions":  len(opposite_positions),
-                    "picker_decision_id":  picker_decision_id,
+                    "news_veto_decision_id":  news_veto_decision_id,
                     "ensemble_decision_id": _rev_decision.id,
                 }
 
@@ -1025,7 +994,7 @@ async def process_signal(
         "take_profit": levels.get("tp1"),
         "lot_size": lot_size,
         "result": "OPEN",
-        "strategy_name": selected_strategies[0] if selected_strategies else "PICKER",
+        "strategy_name": selected_strategies[0] if selected_strategies else "ENSEMBLE",
         "params_version": version,
         "opened_at": datetime.utcnow(),
         **(extra_trade_fields or {}),
@@ -1075,8 +1044,8 @@ async def process_signal(
     except Exception as _ws_exc:
         logger.debug("WebSocket ensemble_vote broadcast failed: %s", _ws_exc)
 
-    if picker_decision_id:
-        crud.update_picker_decision_trade_id(db, picker_decision_id, trade.id)
+    if news_veto_decision_id:
+        crud.update_news_veto_decision_trade_id(db, news_veto_decision_id, trade.id)
 
     signals_summary = {sd["strategy_name"]: sd["direction"] for sd in signal_dicts}
 
@@ -1092,7 +1061,7 @@ async def process_signal(
         "ensemble_weights": ensemble_weights,
         "news_bias": news_bias,
         "resolved_confidence": resolved_confidence,
-        "picker_decision_id": picker_decision_id,
+        "news_veto_decision_id": news_veto_decision_id,
         "ensemble_decision_id": decision.id,
     }
 
@@ -1122,8 +1091,8 @@ def _log_ensemble_decision(
     If `voter_breakdown` is provided (from EnsembleVoter.vote()["votes_breakdown"]),
     it is stored directly in strategy_votes_json — it is already in the correct
     per-strategy dict format and includes suspension/contribution flags.
-    If not provided (e.g. voter fell back to picker), the legacy manual construction
-    is used so all existing call sites remain backward-compatible.
+    If not provided (e.g. the voter failed and no breakdown exists), the legacy
+    manual construction is used so all existing call sites remain compatible.
     """
     if voter_breakdown is not None:
         strategy_votes = voter_breakdown

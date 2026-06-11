@@ -222,6 +222,7 @@ class Strategy:
     is_active: bool = False
     is_live: bool = False
     params_json: str = "{}"
+    live_score: float = 0.0  # EWMA of realised R-multiples from live trades (0 = neutral)
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     id: str = ""
@@ -241,6 +242,7 @@ class Strategy:
             is_active=doc.get("is_active", False),
             is_live=doc.get("is_live", False),
             params_json=_ensure_str(doc.get("params_json", "{}")),
+            live_score=float(doc.get("live_score") or 0.0),
             created_at=doc.get("created_at", datetime.utcnow()),
             updated_at=doc.get("updated_at", datetime.utcnow()),
         )
@@ -663,20 +665,22 @@ class EnsembleDecision:
 
 
 # ---------------------------------------------------------------------------
-# StrategyPickerDecision
+# NewsVetoDecision
+#
+# Audit record for the news-veto check — the only surviving piece of the old
+# strategy picker. The EnsembleVoter is now the sole direction authority; this
+# only records whether news blocked the trade. (Replaces the former
+# StrategyPickerDecision; the picker's factor-scoring fields are gone.)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class StrategyPickerDecision:
+class NewsVetoDecision:
     symbol: str
     timestamp: datetime
-    strategy_scores_json: list | None = None
-    selected_strategies_json: list | None = None
-    ensemble_weights_used_json: dict | None = None
     trade_id: int | None = None
+    veto: bool = False
+    veto_reason: str | None = None
     news_influence_json: dict | None = None
-    picker_confidence: float | None = None
-    reasoning: str | None = None
     id: str = ""
 
     def to_dict(self) -> dict:
@@ -685,52 +689,15 @@ class StrategyPickerDecision:
         return _oid_to_str(d)
 
     @classmethod
-    def from_doc(cls, doc: dict) -> "StrategyPickerDecision":
+    def from_doc(cls, doc: dict) -> "NewsVetoDecision":
         doc = dict(doc)
         obj = cls(
             symbol=doc.get("symbol", ""),
             timestamp=doc.get("timestamp", datetime.utcnow()),
-            strategy_scores_json=doc.get("strategy_scores_json"),
-            selected_strategies_json=doc.get("selected_strategies_json"),
-            ensemble_weights_used_json=doc.get("ensemble_weights_used_json"),
             trade_id=doc.get("trade_id"),
+            veto=doc.get("veto", False),
+            veto_reason=doc.get("veto_reason"),
             news_influence_json=doc.get("news_influence_json"),
-            picker_confidence=doc.get("picker_confidence"),
-            reasoning=doc.get("reasoning"),
-        )
-        obj.id = _doc_id(doc)
-        return obj
-
-
-# ---------------------------------------------------------------------------
-# PickerWeightHistory
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PickerWeightHistory:
-    trade_id: int
-    trade_result: str
-    weights_before_json: dict | None = None
-    weights_after_json: dict | None = None
-    weight_deltas_json: dict | None = None
-    updated_at: datetime = field(default_factory=datetime.utcnow)
-    id: str = ""
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d.pop("id", None)
-        return _oid_to_str(d)
-
-    @classmethod
-    def from_doc(cls, doc: dict) -> "PickerWeightHistory":
-        doc = dict(doc)
-        obj = cls(
-            trade_id=doc.get("trade_id", 0),
-            trade_result=doc.get("trade_result", ""),
-            weights_before_json=doc.get("weights_before_json"),
-            weights_after_json=doc.get("weights_after_json"),
-            weight_deltas_json=doc.get("weight_deltas_json"),
-            updated_at=doc.get("updated_at", datetime.utcnow()),
         )
         obj.id = _doc_id(doc)
         return obj

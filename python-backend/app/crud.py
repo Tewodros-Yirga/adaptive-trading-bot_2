@@ -4,6 +4,7 @@ CRUD helpers — rewritten for MongoDB (pymongo).
 The `db` parameter throughout is a pymongo `Database` object (from get_database()),
 NOT a SQLAlchemy Session. All collection names come from db.py constants.
 """
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -14,13 +15,13 @@ from .db import (
     COLL_APP_SETTINGS, COLL_STRATEGIES, COLL_BACKTEST_RESULTS,
     COLL_BACKTEST_CANDIDATES, COLL_BACKTEST_BATCHES,
     COLL_STRATEGY_PAIR_ANALYSES, COLL_ENSEMBLE_DECISIONS,
-    COLL_STRATEGY_PICKER_DECISIONS, COLL_PICKER_WEIGHT_HISTORY,
+    COLL_NEWS_VETO_DECISIONS,
     next_id,
 )
 from .models import (
     AdaptationLog, AppSetting, BacktestBatch, BacktestCandidate,
-    BacktestResult, EnsembleDecision, ParameterVersion, PickerWeightHistory,
-    StrategyPairAnalysis, StrategyPickerDecision, Strategy, Trade,
+    BacktestResult, EnsembleDecision, NewsVetoDecision, ParameterVersion,
+    StrategyPairAnalysis, Strategy, Trade,
 )
 
 
@@ -562,82 +563,146 @@ def get_ensemble_decision(db: Database, decision_id: int) -> EnsembleDecision | 
     return EnsembleDecision.from_doc(doc) if doc else None
 
 
+def get_ensemble_decision_by_trade_id(
+    db: Database, trade_id: int
+) -> EnsembleDecision | None:
+    """Most recent EnsembleDecision linked to a given trade (for score feedback)."""
+    doc = db[COLL_ENSEMBLE_DECISIONS].find_one(
+        {"trade_id": trade_id}, sort=[("timestamp", -1)]
+    )
+    return EnsembleDecision.from_doc(doc) if doc else None
+
+
 # ---------------------------------------------------------------------------
-# StrategyPickerDecision CRUD
+# NewsVetoDecision CRUD
 # ---------------------------------------------------------------------------
 
-def create_picker_decision(db: Database, row: StrategyPickerDecision) -> StrategyPickerDecision:
+def create_news_veto_decision(db: Database, row: NewsVetoDecision) -> NewsVetoDecision:
     doc = row.to_dict()
-    doc["_id"] = next_id(db, COLL_STRATEGY_PICKER_DECISIONS)
-    db[COLL_STRATEGY_PICKER_DECISIONS].insert_one(doc)
+    doc["_id"] = next_id(db, COLL_NEWS_VETO_DECISIONS)
+    db[COLL_NEWS_VETO_DECISIONS].insert_one(doc)
     row.id = str(doc["_id"])
     return row
 
 
-def update_picker_decision_trade_id(
+def update_news_veto_decision_trade_id(
     db: Database, decision_id: int, trade_id: int
-) -> StrategyPickerDecision | None:
-    doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one_and_update(
+) -> NewsVetoDecision | None:
+    doc = db[COLL_NEWS_VETO_DECISIONS].find_one_and_update(
         {"_id": decision_id},
         {"$set": {"trade_id": trade_id}},
         return_document=True,
     )
-    return StrategyPickerDecision.from_doc(doc) if doc else None
+    return NewsVetoDecision.from_doc(doc) if doc else None
 
 
-def get_picker_decisions(
+def get_news_veto_decisions(
     db: Database,
     page: int = 1,
     limit: int = 50,
     symbol: str | None = None,
-) -> list[StrategyPickerDecision]:
+) -> list[NewsVetoDecision]:
     query: dict = {}
     if symbol:
         query["symbol"] = symbol
     docs = (
-        db[COLL_STRATEGY_PICKER_DECISIONS]
+        db[COLL_NEWS_VETO_DECISIONS]
         .find(query)
         .sort("timestamp", -1)
         .skip((page - 1) * limit)
         .limit(limit)
     )
-    return [StrategyPickerDecision.from_doc(d) for d in docs]
+    return [NewsVetoDecision.from_doc(d) for d in docs]
 
 
-def get_picker_decision(db: Database, decision_id: int) -> StrategyPickerDecision | None:
-    doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one({"_id": decision_id})
-    return StrategyPickerDecision.from_doc(doc) if doc else None
-
-
-def get_picker_decisions_for_trade(
-    db: Database, trade_id: int
-) -> list[StrategyPickerDecision]:
-    docs = db[COLL_STRATEGY_PICKER_DECISIONS].find({"trade_id": trade_id})
-    return [StrategyPickerDecision.from_doc(d) for d in docs]
+def get_news_veto_decision(db: Database, decision_id: int) -> NewsVetoDecision | None:
+    doc = db[COLL_NEWS_VETO_DECISIONS].find_one({"_id": decision_id})
+    return NewsVetoDecision.from_doc(doc) if doc else None
 
 
 # ---------------------------------------------------------------------------
-# PickerWeightHistory CRUD
+# Live score feedback helpers
+#
+# At trade close we update each voting strategy's ``live_score`` — a decaying
+# average of realised R-multiples (reward earned per unit of risk taken). This
+# is a SEPARATE field from the backtest ``composite_score`` so the backtester
+# can never clobber the live signal and vice-versa. The EnsembleVoter blends
+# live_score in as a weight multiplier at vote time.
 # ---------------------------------------------------------------------------
 
-def create_picker_weight_history(db: Database, row: PickerWeightHistory) -> PickerWeightHistory:
-    doc = row.to_dict()
-    doc["_id"] = next_id(db, COLL_PICKER_WEIGHT_HISTORY)
-    db[COLL_PICKER_WEIGHT_HISTORY].insert_one(doc)
-    row.id = str(doc["_id"])
-    return row
+def _params_fingerprint(params_json: str | None) -> str:
+    """
+    Stable fingerprint of a strategy's param set. live_score is tied to this
+    fingerprint so that when a NEW parameter set is promoted (by either service,
+    via update_strategy_params → a different params_json), the accumulated
+    live_score is treated as stale and resets to 0 — the old R-multiples were
+    earned by parameters that are no longer live.
+
+    Normalised (parse + sort keys) so cosmetic re-serialisation of identical
+    params does not trigger a spurious reset.
+    """
+    raw = params_json or "{}"
+    try:
+        normalised = json.dumps(json.loads(raw), sort_keys=True)
+    except (ValueError, TypeError):
+        normalised = raw
+    return hashlib.sha1(normalised.encode("utf-8")).hexdigest()
 
 
-def get_picker_weight_history(
-    db: Database, limit: int = 50
-) -> list[PickerWeightHistory]:
-    docs = (
-        db[COLL_PICKER_WEIGHT_HISTORY]
-        .find()
-        .sort("updated_at", -1)
-        .limit(limit)
+def get_strategy_live_score(db: Database, strategy_name: str) -> float:
+    """
+    Return the strategy's ``live_score`` — an EWMA of realised R-multiples from
+    live trades, centred on 0.0 (positive = recently profitable). Kept separate
+    from the backtest ``composite_score`` so the two control loops never corrupt
+    each other.
+
+    Returns 0.0 if the stored score was accumulated under a different parameter
+    set than the one currently live (i.e. a new candidate has been promoted).
+    """
+    doc = db[COLL_STRATEGIES].find_one(
+        {"name": strategy_name}, {"live_score": 1, "live_score_params_hash": 1, "params_json": 1}
     )
-    return [PickerWeightHistory.from_doc(d) for d in docs]
+    if not doc:
+        return 0.0
+    current_hash = _params_fingerprint(doc.get("params_json"))
+    if doc.get("live_score_params_hash") != current_hash:
+        return 0.0  # stale — earned under params that are no longer live
+    return float(doc.get("live_score") or 0.0)
+
+
+def get_live_scores(db: Database) -> dict[str, float]:
+    """
+    All strategies' live_score, keyed by name (missing → 0.0). Scores stamped
+    with a params hash that no longer matches the live params are reported as 0.0.
+    """
+    out: dict[str, float] = {}
+    for doc in db[COLL_STRATEGIES].find(
+        {}, {"name": 1, "live_score": 1, "live_score_params_hash": 1, "params_json": 1}
+    ):
+        current_hash = _params_fingerprint(doc.get("params_json"))
+        if doc.get("live_score_params_hash") == current_hash:
+            out[doc.get("name", "")] = float(doc.get("live_score") or 0.0)
+        else:
+            out[doc.get("name", "")] = 0.0
+    return out
+
+
+def update_strategy_live_score(db: Database, strategy_name: str, value: float) -> None:
+    """
+    Persist a strategy's updated live_score, stamped with the fingerprint of the
+    params currently live. If a new param set was promoted since the last update,
+    this naturally rebases the score onto the new params.
+    """
+    doc = db[COLL_STRATEGIES].find_one({"name": strategy_name}, {"params_json": 1})
+    params_hash = _params_fingerprint(doc.get("params_json") if doc else None)
+    db[COLL_STRATEGIES].update_one(
+        {"name": strategy_name},
+        {"$set": {
+            "live_score": value,
+            "live_score_params_hash": params_hash,
+            "updated_at": datetime.utcnow(),
+        }},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -687,26 +752,24 @@ def seed_default_settings(db: Database) -> None:
         "backtest_adapt_every_n_trades": "20",
     }
 
-    # ── Global picker ──────────────────────────────────────────────────────
-    picker_defaults: dict[str, str] = {
-        "picker_max_simultaneous_strategies": "1",
-        "picker_min_score": "0.3",
-        "picker_secondary_threshold": "0.85",
-        "picker_lookback_trades": "20",
-        "picker_min_trades_for_scoring": "5",
-        "picker_learning_rate": "0.05",
-        "picker_recency_lambda": "0.1",
-        "picker_news_bias_threshold": "0.5",
-        "picker_news_bonus": "0.15",
-        "picker_news_penalty": "0.15",
-        "picker_news_veto_threshold": "0.85",
-        "picker_weight_recent_win_rate": "0.25",
-        "picker_weight_profit_factor": "0.20",
-        "picker_weight_backtest_composite_score": "0.20",
-        "picker_weight_drawdown": "0.15",
-        "picker_weight_signal_confidence": "0.10",
-        "picker_weight_recency_of_last_win": "0.05",
-        "picker_weight_parameter_freshness": "0.05",
+    # ── News-veto (the only surviving piece of the old strategy picker) ────
+    news_veto_defaults: dict[str, str] = {
+        "news_veto_bias_threshold": "0.5",
+        "news_veto_threshold": "0.85",
+    }
+
+    # ── Live score feedback (R-multiple live_score at trade close) ──────────
+    # On every closed trade, each voting strategy's `live_score` (EWMA of
+    # realised R-multiples, centred on 0) is updated. The EnsembleVoter scales
+    # each backtest weight by (1 + weight_gain * live_score), floored at
+    # weight_floor — so recently-profitable strategies are amplified and
+    # recently-losing ones dampened, WITHOUT touching the backtest composite_score.
+    score_feedback_defaults: dict[str, str] = {
+        "score_feedback_enabled": "true",
+        "score_feedback_alpha": "0.2",          # EWMA smoothing per closed trade
+        "score_feedback_score_bound": "3.0",    # clamp on accumulated live_score
+        "score_feedback_weight_gain": "0.25",   # how hard live_score tilts the vote weight
+        "score_feedback_weight_floor": "0.1",   # min multiplier (never fully zero a strategy)
     }
 
     # ── Live trading loop ──────────────────────────────────────────────────
@@ -769,7 +832,10 @@ def seed_default_settings(db: Database) -> None:
     for key, value in backtest_globals.items():
         _maybe_insert(key, value)
 
-    for key, value in picker_defaults.items():
+    for key, value in news_veto_defaults.items():
+        _maybe_insert(key, value)
+
+    for key, value in score_feedback_defaults.items():
         _maybe_insert(key, value)
 
     for key, value in live_trading_defaults.items():

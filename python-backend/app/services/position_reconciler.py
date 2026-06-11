@@ -28,7 +28,7 @@ Algorithm
    c. Calculate PnL = profit + swap + commission (if available).
    d. Determine result: WIN if PnL > 0, LOSS if PnL <= 0.
    e. Call crud.close_trade() to persist the closure.
-   f. Trigger picker weight update via update_picker_weights_from_trade.
+   f. Run trade-close hooks (score feedback + news learning).
 
 6. Log all actions. If bridge is unreachable, skip cycle without crashing.
 
@@ -109,39 +109,30 @@ def _extract_close_deal(deals: list[dict]) -> dict | None:
     return closing[-1]
 
 
-def _trigger_picker_weight_update(db: Database, trade_id: int, trade_result: str) -> None:
+def _trigger_trade_close_hooks(db: Database, trade_id: int, trade_result: str) -> None:
     """
-    Trigger online picker weight learning after a ghost trade is closed.
-    Silently skips if no matching StrategyPickerDecision exists.
+    Run trade-close learning hooks after a ghost trade is closed: strategy
+    score feedback + news intelligence learning.
+    Silently skips if the trade can't be loaded.
     """
     try:
-        from ..services.strategy_picker import update_picker_weights_from_trade
-        from ..db import COLL_STRATEGY_PICKER_DECISIONS, COLL_TRADES
-        from ..models import StrategyPickerDecision, Trade
+        from ..services.score_feedback import run_trade_close_hooks
+        from ..db import COLL_TRADES
+        from ..models import Trade
 
         trade_doc = db[COLL_TRADES].find_one({"_id": trade_id})
         if not trade_doc:
             return
 
         trade = Trade.from_doc(trade_doc)
-
-        picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one({"trade_id": trade_id})
-        if picker_doc is None and trade.symbol:
-            picker_doc = db[COLL_STRATEGY_PICKER_DECISIONS].find_one(
-                {"symbol": trade.symbol},
-                sort=[("timestamp", -1)],
-            )
-
-        if picker_doc:
-            picker_decision = StrategyPickerDecision.from_doc(picker_doc)
-            update_picker_weights_from_trade(trade, picker_decision, db)
-            logger.info(
-                "Position reconciler: picker weights updated for ghost trade db_id=%s result=%s",
-                trade_id, trade_result,
-            )
+        run_trade_close_hooks(db, trade)
+        logger.info(
+            "Position reconciler: trade-close hooks ran for ghost trade db_id=%s result=%s",
+            trade_id, trade_result,
+        )
     except Exception as exc:
         logger.warning(
-            "Position reconciler: picker weight update failed for trade %s: %s",
+            "Position reconciler: trade-close hooks failed for trade %s: %s",
             trade_id, exc,
         )
 
@@ -311,7 +302,7 @@ def reconcile_positions(db: Database) -> dict[str, int]:
                     result="LOSS",
                 )
                 summary["closed"] += 1
-                _trigger_picker_weight_update(db, trade_id, "LOSS")
+                _trigger_trade_close_hooks(db, trade_id, "LOSS")
                 continue
 
             close_deal = _extract_close_deal(deals)
@@ -346,8 +337,8 @@ def reconcile_positions(db: Database) -> dict[str, int]:
             )
             summary["closed"] += 1
 
-            # ── 6. Trigger picker weight learning ────────────────────────
-            _trigger_picker_weight_update(db, trade_id, result)
+            # ── 6. Run trade-close hooks (score feedback + news learning) ─
+            _trigger_trade_close_hooks(db, trade_id, result)
 
         except Exception as exc:
             summary["errors"] += 1

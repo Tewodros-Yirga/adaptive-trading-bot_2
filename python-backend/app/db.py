@@ -29,8 +29,7 @@ COLL_BACKTEST_CANDIDATES = "backtest_candidates"
 COLL_BACKTEST_BATCHES = "backtest_batches"
 COLL_STRATEGY_PAIR_ANALYSES = "strategy_pair_analyses"
 COLL_ENSEMBLE_DECISIONS = "ensemble_decisions"
-COLL_STRATEGY_PICKER_DECISIONS = "strategy_picker_decisions"
-COLL_PICKER_WEIGHT_HISTORY = "picker_weight_history"
+COLL_NEWS_VETO_DECISIONS = "news_veto_decisions"
 COLL_COUNTERS = "counters"
 
 _client: MongoClient | None = None
@@ -125,12 +124,9 @@ def create_indexes(db: Database) -> None:
         [("strategy_name", ASCENDING), ("qualified", ASCENDING)], background=True
     )
 
-    # strategy_picker_decisions
-    db[COLL_STRATEGY_PICKER_DECISIONS].create_index([("symbol", ASCENDING)], background=True)
-    db[COLL_STRATEGY_PICKER_DECISIONS].create_index([("timestamp", DESCENDING)], background=True)
-
-    # picker_weight_history
-    db[COLL_PICKER_WEIGHT_HISTORY].create_index([("trade_id", ASCENDING)], background=True)
+    # news_veto_decisions
+    db[COLL_NEWS_VETO_DECISIONS].create_index([("symbol", ASCENDING)], background=True)
+    db[COLL_NEWS_VETO_DECISIONS].create_index([("timestamp", DESCENDING)], background=True)
 
     # backtest_results
     db[COLL_BACKTEST_RESULTS].create_index([("batch_id", ASCENDING)], background=True)
