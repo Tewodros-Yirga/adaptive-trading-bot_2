@@ -30,7 +30,11 @@ from pymongo.database import Database
 
 from .. import crud
 from ..models import EnsembleDecision, Strategy
-from ..services.bridge_client import bridge_client
+from ..services.bridge_client import (
+    bridge_client,
+    BridgeRateLimitedError,
+    BridgeUnavailableError,
+)
 from ..services.news_intelligence import get_news_bias
 from ..services.risk_manager import check_and_compute_lot_size
 from ..strategy.registry import get_strategy
@@ -957,16 +961,35 @@ async def process_signal(
                 }
 
     # ── Place order ────────────────────────────────────────────────────────
-    order = bridge_client.place_order(
-        {
+    try:
+        order = bridge_client.place_order(
+            {
+                "symbol": symbol,
+                "direction": final_direction,
+                "lot_size": lot_size,
+                "stop_loss": sl,
+                "take_profit": levels.get("tp1"),
+                "price": price,
+            }
+        )
+    except BridgeRateLimitedError as _rl_exc:
+        logger.info(
+            "Order rate-limited by broker for %s — skipping cycle: %s", symbol, _rl_exc
+        )
+        return {
+            "status": "RATE_LIMITED",
+            "reason": "Broker is rate-limiting order requests (429); will retry next cycle",
             "symbol": symbol,
-            "direction": final_direction,
-            "lot_size": lot_size,
-            "stop_loss": sl,
-            "take_profit": levels.get("tp1"),
-            "price": price,
         }
-    )
+    except BridgeUnavailableError as _bu_exc:
+        logger.info(
+            "Bridge unavailable for %s — skipping cycle: %s", symbol, _bu_exc
+        )
+        return {
+            "status": "BRIDGE_UNAVAILABLE",
+            "reason": "Bridge circuit breaker is open; will retry next cycle",
+            "symbol": symbol,
+        }
 
     # Extract MT5 ticket from the bridge response so position_stream and
     # reconciler can match this DB trade to a live MT5 position by ticket.

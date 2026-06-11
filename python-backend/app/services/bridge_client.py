@@ -31,6 +31,16 @@ class BridgeUnavailableError(RuntimeError):
     """Raised by the circuit breaker when the bridge is known to be down."""
 
 
+class BridgeRateLimitedError(RuntimeError):
+    """
+    Raised when the broker is rate-limiting order requests.
+
+    Maps to the bridge's HTTP 429 (MT5 retcode 10027). This is a transient,
+    self-resolving condition — callers should back off and retry on the next
+    cycle rather than treating it as an unexpected error.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Circuit breaker
 # ---------------------------------------------------------------------------
@@ -188,6 +198,63 @@ class MT5BridgeClient:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _error_detail(exc: httpx.HTTPStatusError) -> str:
+        """Best-effort extraction of the bridge's JSON `detail` error message."""
+        try:
+            data = exc.response.json()
+            if isinstance(data, dict) and data.get("detail"):
+                return str(data["detail"])
+        except Exception:
+            pass
+        return f"HTTP {exc.response.status_code}"
+
+    def _order_post(self, path: str, body: dict) -> dict:
+        """
+        POST through the long-timeout order client *with* circuit-breaker
+        awareness.
+
+        Unlike a bare ``_order_client.post(...)``, this:
+          * fast-fails with BridgeUnavailableError while the breaker is OPEN,
+            so we don't keep hammering a rate-limited broker every cycle;
+          * counts a 429 (broker rate-limit / MT5 10027) as a breaker failure
+            so sustained rate-limiting opens the breaker and lets the broker
+            cool down, then re-raises a typed BridgeRateLimitedError instead of
+            a raw HTTPStatusError that surfaces as a generic "Live loop error".
+        """
+        if not self._cb.allow():
+            raise BridgeUnavailableError(
+                f"Bridge circuit breaker is OPEN — skipping order request to {path}"
+            )
+        try:
+            response = self._order_client.post(path, json=body)
+            response.raise_for_status()
+            result = response.json()
+            self._cb.record_success()
+            return result
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                self._cb.record_failure()
+                raise BridgeRateLimitedError(
+                    f"Broker is rate-limiting orders (429) on {path}; "
+                    "will retry next cycle"
+                ) from exc
+            if exc.response.status_code in (502, 503, 504):
+                self._cb.record_failure()
+                # 503 carries an actionable reason (e.g. "AutoTrading disabled
+                # by client terminal", "MT5 not connected"). Surface it via the
+                # graceful BridgeUnavailable path so the live loop logs the real
+                # cause at info level and the breaker suppresses any flood —
+                # rather than letting a raw HTTPStatusError read as a scary error.
+                if exc.response.status_code == 503:
+                    raise BridgeUnavailableError(
+                        f"Bridge cannot place order on {path}: {self._error_detail(exc)}"
+                    ) from exc
+            raise
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError):
+            self._cb.record_failure()
+            raise
+
     def place_order(self, payload: dict) -> dict:
         # Use the long-timeout order client so the request survives the full
         # MT5 retry window inside the bridge (~35s worst case).
@@ -203,9 +270,7 @@ class MT5BridgeClient:
         # timeout-then-retry never produces two fills.
         if payload.get("idempotency_key"):
             body["idempotencyKey"] = payload["idempotency_key"]
-        response = self._order_client.post("/order", json=body)
-        response.raise_for_status()
-        data = response.json()
+        data = self._order_post("/order", body)
         return {
             "orderId": str(data.get("ticket")),
             "symbol": data.get("symbol", payload["symbol"]),
@@ -240,10 +305,8 @@ class MT5BridgeClient:
             body["expiration"] = expiration
 
         # Limit/stop orders also go through MT5 order_send — use the long-timeout
-        # order client for the same reason as place_order.
-        response = self._order_client.post("/order/limit", json=body)
-        response.raise_for_status()
-        data = response.json()
+        # order client (via _order_post) for the same reason as place_order.
+        data = self._order_post("/order/limit", body)
         return {
             "orderId": str(data.get("ticket")),
             "symbol": data.get("symbol", symbol),
@@ -259,12 +322,10 @@ class MT5BridgeClient:
     def close_position(self, ticket: int, lot_size: float, partial: bool = False) -> dict:
         # Use the long-timeout order client — closing a position also goes
         # through MT5 order_send and may be subject to the same 10027 retries.
-        response = self._order_client.post(
+        data = self._order_post(
             "/close",
-            json={"ticket": ticket, "volume": lot_size, "partial": partial},
+            {"ticket": ticket, "volume": lot_size, "partial": partial},
         )
-        response.raise_for_status()
-        data = response.json()
         return {
             "closed": data.get("closed", True),
             "ticket": ticket,
