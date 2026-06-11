@@ -143,3 +143,16 @@ def send_test_alert(db: Database = Depends(get_db), _w=Depends(require_write_acc
         level="info",
     )
     return result
+
+
+@router.get("/alerts/diagnostics")
+def alerts_diagnostics(db: Database = Depends(get_db), _w=Depends(require_write_access)):
+    """Probe every alert delivery route (proxy + direct Telegram edges) from this
+    backend's own network and report which work. Lets you confirm — from the
+    deployed host's egress — whether the proxy is detected/reachable and whether
+    the direct path is genuinely blocked. Sends no alert; returns no secrets.
+
+    A 404 here means the proxy-capable build is NOT deployed yet.
+    """
+    from ..services.alerts import diagnose
+    return diagnose(db)

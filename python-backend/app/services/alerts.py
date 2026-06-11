@@ -125,6 +125,92 @@ def _proxy_url(db: Database) -> str | None:
     return None
 
 
+def _proxy_source(db: Database) -> str | None:
+    """Where the active proxy URL came from (for diagnostics)."""
+    if _first_setting(db, _PROXY_KEYS):
+        return "setting:alerts_proxy_url"
+    for env in _PROXY_ENV:
+        if (os.environ.get(env) or "").strip():
+            return f"env:{env}"
+    return None
+
+
+def _mask_proxy(url: str) -> str:
+    """Render a proxy URL with credentials masked, safe to return to the UI."""
+    try:
+        p = urlsplit(url if "://" in url else f"http://{url}")
+        host = p.hostname or "?"
+        port = f":{p.port}" if p.port else ""
+        if p.username:
+            um = (p.username[:3] + "***") if len(p.username) > 3 else "***"
+            return f"{p.scheme}://{um}@{host}{port}"
+        return f"{p.scheme}://{host}{port}"
+    except Exception:
+        return "(set)"
+
+
+# Marker so the diagnostics endpoint can confirm the proxy-capable build is the
+# one actually running. Bump when the delivery path changes materially.
+ALERTS_BUILD = "proxy-support-v2"
+
+
+def diagnose(db: Database, timeout: float = 8.0) -> dict:
+    """Actively probe every delivery route from THIS process's network and
+    report what works. Used by GET /system/alerts/diagnostics so a blocked host
+    can tell us, from its own egress, whether the proxy is configured/reachable
+    and whether the direct path is really dead — instead of guessing from logs.
+
+    Makes a real (harmless) GET to api.telegram.org over each route. No alert is
+    sent. Credentials are never returned.
+    """
+    host = "api.telegram.org"
+    proxy = _proxy_url(db)
+    tg_token = _first_setting(db, _TG_TOKEN_KEYS)
+    tg_chat = _first_setting(db, _TG_CHAT_KEYS)
+
+    token = (tg_token or "").removeprefix("bot").strip()
+    path = f"/bot{token}/getMe" if token else "/"
+    request = (
+        f"GET {path} HTTP/1.0\r\n"
+        f"Host: {host}\r\n"
+        f"Connection: close\r\n"
+        f"User-Agent: adaptive-trading-alerts/1\r\n"
+        f"\r\n"
+    ).encode("utf-8")
+
+    routes: list[tuple[str, str]] = []
+    if proxy:
+        routes.append(("proxy", f"proxy:{proxy}"))
+    routes.extend((ip, ip) for ip in _ipv4_addresses(host))
+
+    probes: list[dict] = []
+    for name, route in routes:
+        t0 = time.monotonic()
+        try:
+            resp = _send_once(host, route, request, timeout)
+            probes.append({
+                "route": name, "ok": True, "status": resp.status_code,
+                "ms": int((time.monotonic() - t0) * 1000),
+            })
+        except Exception as exc:
+            probes.append({
+                "route": name, "ok": False, "error": str(exc),
+                "ms": int((time.monotonic() - t0) * 1000),
+            })
+
+    return {
+        "build": ALERTS_BUILD,
+        "telegram_configured": bool(tg_token and tg_chat),
+        "proxy_configured": bool(proxy),
+        "proxy_source": _proxy_source(db),
+        "proxy": _mask_proxy(proxy) if proxy else None,
+        "routes_tried": [p["route"] for p in probes],
+        "any_route_ok": any(p["ok"] for p in probes),
+        "probes": probes,
+        "queue_depth": _alert_q.qsize(),
+    }
+
+
 def _enabled_channels(db: Database) -> list[tuple[str, dict]]:
     channels: list[tuple[str, dict]] = []
     proxy = _proxy_url(db)
