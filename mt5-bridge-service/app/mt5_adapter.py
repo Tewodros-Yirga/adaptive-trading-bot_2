@@ -28,19 +28,22 @@ _MAX_RETRY_INTERVAL = 300
 # ---------------------------------------------------------------------------
 # Global order-send serialisation lock + rate-limit cooldown.
 #
-# Root cause of retcode 10027: multiple concurrent callers (one per bot
-# instance) each block a thread doing exponential-backoff retries, which
-# compounds the pressure on the broker's rate limiter and guarantees that
-# every caller exhausts their retries.
+# Two distinct MT5 retcodes were historically conflated here:
+#   * 10024 TRADE_RETCODE_TOO_MANY_REQUESTS — the real broker throttle. Multiple
+#     concurrent callers (one per bot instance) compound the pressure; serialising
+#     through this lock + a cooldown after a hit keeps us under the limit.
+#   * 10027 TRADE_RETCODE_CLIENT_DISABLES_AT — AutoTrading toggled OFF in the
+#     terminal. This is NOT a rate-limit and the lock/cooldown does nothing for
+#     it; it is handled separately in _order_send_with_ratelimit.
 #
-# Fix: serialise all order_send calls through a threading.Lock so only one
-# runs at a time, and enforce a minimum inter-order gap after any 10027 hit.
+# Fix: serialise all order_send calls through a threading.Lock so only one runs
+# at a time, and enforce a minimum inter-order gap after any 10024 hit.
 # ---------------------------------------------------------------------------
 _ORDER_LOCK = threading.Lock()
 
-# Minimum seconds to wait between successive order_send calls after a 10027.
+# Minimum seconds to wait between successive order_send calls after a 10024.
 # Broker docs say the window is typically 1-2 seconds; we use 3s to be safe.
-_ORDER_MIN_GAP_AFTER_10027 = float(os.environ.get("MT5_ORDER_MIN_GAP_SECONDS", "3"))
+_ORDER_MIN_GAP_AFTER_RATELIMIT = float(os.environ.get("MT5_ORDER_MIN_GAP_SECONDS", "3"))
 _last_order_send_at: float = 0.0          # monotonic timestamp of last send
 _order_cooldown_until: float = 0.0        # monotonic timestamp: don't send before this
 
@@ -104,6 +107,22 @@ class MT5Adapter:
     def _last_error_repr(self) -> str:
         return self.last_error or "unknown error"
 
+    def _trade_allowed_repr(self) -> str:
+        """
+        Best-effort read of terminal_info().trade_allowed for diagnostics.
+
+        Returns "True"/"False" when known, or "unknown" if the terminal info
+        cannot be read. trade_allowed reflects whether the terminal's
+        "Algo Trading" toggle is currently ON.
+        """
+        try:
+            info = self._mt.terminal_info() if self._mt is not None else None
+            if info is not None:
+                return str(bool(getattr(info, "trade_allowed", False)))
+        except Exception:
+            pass
+        return "unknown"
+
     @staticmethod
     def _classify_error_text(error_text: str) -> str:
         low = (error_text or "").lower()
@@ -159,17 +178,33 @@ class MT5Adapter:
 
     def _order_send_with_ratelimit(self, request: dict) -> Any:
         """
-        Serialise all order_send calls through a process-level lock and
-        enforce a cooldown period after any retcode 10027 response.
+        Serialise all order_send calls through a process-level lock, and
+        classify the trade-server return code correctly.
 
-        This prevents concurrent callers from compounding broker rate-limit
-        pressure. With the lock, at most one order_send is in-flight at any
-        moment; after a 10027 the cooldown drains before the next attempt.
+        IMPORTANT — MT5 trade return codes (enum_trade_return_codes):
+          * 10024 TRADE_RETCODE_TOO_MANY_REQUESTS  — *real* rate-limit; the
+            broker is throttling us. Transient → cooldown + retry, then 429.
+          * 10026 TRADE_RETCODE_SERVER_DISABLES_AT — AutoTrading disabled by
+            the SERVER. Not a rate-limit.
+          * 10027 TRADE_RETCODE_CLIENT_DISABLES_AT — AutoTrading disabled by
+            the CLIENT terminal (the "Algo Trading" toggle is OFF). This is a
+            persistent configuration state, NOT a rate-limit: hammering
+            order_send will return 10027 forever. The start.sh watcher
+            re-enables it via Ctrl+E within a few seconds, so we retry briefly
+            to let that land, then surface a clear AutoTradingDisabledError.
+
+        Historic bug: this method treated 10027 as "too many requests" and
+        converted it to HTTP 429. With AutoTrading off in the terminal, EVERY
+        order returned 10027 → the bridge looked like it was permanently
+        rate-limited ("barely accepts orders, always 429"). The fix is to
+        classify 10027 as AutoTrading-disabled, not a rate-limit.
         """
         global _last_order_send_at, _order_cooldown_until
 
         _RETCODE_DONE              = self._mt.TRADE_RETCODE_DONE
-        _RETCODE_TOO_MANY_REQUESTS = 10027
+        _RETCODE_TOO_MANY_REQUESTS = 10024   # TRADE_RETCODE_TOO_MANY_REQUESTS — real rate-limit
+        _RETCODE_SERVER_DISABLES   = 10026   # TRADE_RETCODE_SERVER_DISABLES_AT — algo off (server)
+        _RETCODE_CLIENT_DISABLES   = 10027   # TRADE_RETCODE_CLIENT_DISABLES_AT — algo off (client)
         # 3 attempts max: sleeps of 5s, 10s, 20s → worst-case hold ≈35s.
         # (Previously 5 attempts with sleeps up to 80s totalling 155s, which
         # exceeded the backend's 8s read timeout and opened the circuit breaker
@@ -201,21 +236,43 @@ class MT5Adapter:
                     return result
 
                 if result.retcode == _RETCODE_TOO_MANY_REQUESTS:
-                    # Cap at 20s so total worst-case wait is 5+10+20=35s,
-                    # safely inside the backend's 60s order-client read timeout.
+                    # Real broker throttle. Cap at 20s so total worst-case wait
+                    # is 5+10+20=35s, safely inside the backend's 60s order-client
+                    # read timeout.
                     sleep_s = min(5 * (2 ** attempt), 20)  # 5, 10, 20
                     # Set global cooldown so the NEXT caller also waits
                     _order_cooldown_until = time.monotonic() + sleep_s
                     if attempt < _MAX_RETRIES - 1:
                         logger.warning(
-                            "order_send retcode=10027 (too many requests) — retry %d/%d in %ds",
+                            "order_send retcode=10024 (too many requests) — retry %d/%d in %ds",
                             attempt + 1, _MAX_RETRIES, sleep_s,
                         )
                         time.sleep(sleep_s)
                         continue
                     raise TooManyRequestsError(
-                        f"order_send retcode=10027 after {_MAX_RETRIES} attempts — "
+                        f"order_send retcode=10024 after {_MAX_RETRIES} attempts — "
                         f"broker is rate-limiting order requests"
+                    )
+
+                if result.retcode in (_RETCODE_CLIENT_DISABLES, _RETCODE_SERVER_DISABLES):
+                    # AutoTrading is OFF. NOT a rate-limit — retrying immediately
+                    # is pointless because the terminal config won't change on its
+                    # own. The start.sh watcher re-enables client-side AutoTrading
+                    # via Ctrl+E within a few seconds, so give it a brief window to
+                    # land, then surface an actionable error.
+                    who = "client terminal" if result.retcode == _RETCODE_CLIENT_DISABLES else "server"
+                    if attempt < _MAX_RETRIES - 1 and result.retcode == _RETCODE_CLIENT_DISABLES:
+                        logger.warning(
+                            "order_send retcode=%d — AutoTrading disabled by %s; "
+                            "waiting 3s for terminal to re-enable (retry %d/%d)",
+                            result.retcode, who, attempt + 1, _MAX_RETRIES,
+                        )
+                        time.sleep(3)
+                        continue
+                    raise AutoTradingDisabledError(
+                        f"order_send retcode={result.retcode}: AutoTrading disabled by {who}. "
+                        f"Enable the 'Algo Trading' toggle in the MT5 terminal "
+                        f"(terminal_info().trade_allowed={self._trade_allowed_repr()})."
                     )
 
                 raise RuntimeError(
@@ -1046,7 +1103,16 @@ class MT5Adapter:
 # ---------------------------------------------------------------------------
 
 class TooManyRequestsError(RuntimeError):
-    """Raised when MT5 retcode 10027 exhausts all retries."""
+    """Raised when MT5 retcode 10024 (too frequent requests) exhausts all retries."""
+
+
+class AutoTradingDisabledError(RuntimeError):
+    """
+    Raised when MT5 returns retcode 10027 (CLIENT_DISABLES_AT) or 10026
+    (SERVER_DISABLES_AT) — AutoTrading is disabled, so no order can be placed
+    until the 'Algo Trading' toggle is turned back on. This is a persistent
+    configuration state, not a transient rate-limit.
+    """
 
 
 adapter = MT5Adapter()

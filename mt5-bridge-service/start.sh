@@ -352,7 +352,12 @@ fi
   _mt5_precfg() {
     local _d="$1"
     mkdir -p "${_d}" 2>/dev/null || return
-    printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\n' \
+    # Account=0 / Profile=0 are CRITICAL: they disable MT5's "disable algorithmic
+    # trading when the account/profile has been changed" safety toggles. Headless
+    # login is perceived as an account change, so with the defaults (1) MT5 turns
+    # the Algo Trading button OFF moments after startup → every order_send returns
+    # retcode 10027 (CLIENT_DISABLES_AT). Setting them to 0 keeps AutoTrading on.
+    printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\nAccount=0\r\nProfile=0\r\n' \
       "${MT_LOGIN}" "${MT_SERVER}" > "${_d}/common.ini" 2>/dev/null || true
     echo "[mt5-terminal] Wrote server config → ${_d}/common.ini"
   }
@@ -392,16 +397,26 @@ fi
   # MT5 has a safety feature: when the account "changes" (which happens on
   # every container restart because credentials are injected fresh), it auto-
   # disables the Algo Trading button. With Algo Trading disabled, MT5 does
-  # NOT create the IPC named pipes, causing mt5.initialize() → -10005.
-  # Fix: patch every terminal.ini we can find to force AllowLiveTrading=1.
+  # NOT create the IPC named pipes, causing mt5.initialize() → -10005, and
+  # order_send returns retcode 10027 (CLIENT_DISABLES_AT).
+  # Fix: patch every terminal.ini to force AllowLiveTrading=1 AND set
+  # Account=0 / Profile=0 so the account-change / profile-change auto-disable
+  # never fires (this is the durable fix — no UI Ctrl+E toggling required).
   _mt5_patch_terminal_ini() {
     local _ini="$1"
     if [ -f "${_ini}" ]; then
-      # Enable AllowLiveTrading if it exists as 0
+      # Force the safe values if the keys already exist.
       sed -i 's/AllowLiveTrading=0/AllowLiveTrading=1/g' "${_ini}" 2>/dev/null || true
+      sed -i 's/^Account=1/Account=0/g'                  "${_ini}" 2>/dev/null || true
+      sed -i 's/^Profile=1/Profile=0/g'                  "${_ini}" 2>/dev/null || true
       # Ensure [Experts] section exists with the right settings
       if ! grep -q '\[Experts\]' "${_ini}" 2>/dev/null; then
-        printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\n' >> "${_ini}" 2>/dev/null || true
+        printf '\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\nAccount=0\r\nProfile=0\r\n' >> "${_ini}" 2>/dev/null || true
+      else
+        # Section exists but may be missing the account/profile keys — append
+        # them if absent so older terminal.ini files are upgraded in place.
+        grep -q '^Account='  "${_ini}" 2>/dev/null || sed -i '/\[Experts\]/a Account=0'  "${_ini}" 2>/dev/null || true
+        grep -q '^Profile='  "${_ini}" 2>/dev/null || sed -i '/\[Experts\]/a Profile=0'  "${_ini}" 2>/dev/null || true
       fi
       echo "[mt5-terminal] Patched terminal.ini → ${_ini}"
     fi
@@ -417,7 +432,7 @@ fi
   # This is the most reliable way to pass Login/Server to the terminal on startup
   # regardless of which profile directory it selects internally.
   _WIN_CFG_LINUX="${WINEPREFIX}/drive_c/mt5-headless.ini"
-  printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\n' \
+  printf '[Common]\r\nLogin=%s\r\nServer=%s\r\nNewsEnable=0\r\nAutoSync=0\r\nAutoUpdate=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=1\r\nAccount=0\r\nProfile=0\r\n' \
     "${MT_LOGIN}" "${MT_SERVER}" > "${_WIN_CFG_LINUX}" 2>/dev/null || true
   echo "[mt5-terminal] Wrote Windows-accessible config → ${_WIN_CFG_LINUX}"
 

@@ -9,7 +9,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .config import settings, validate_required_settings
-from .mt5_adapter import TooManyRequestsError, adapter
+from .mt5_adapter import AutoTradingDisabledError, TooManyRequestsError, adapter
 from .schemas import CancelRequest, CandlesRequest, CloseRequest, LimitOrderRequest, ModifyRequest, OrderRequest
 
 app = FastAPI(title="Adaptive MT5 Bridge")
@@ -524,6 +524,11 @@ def order(payload: OrderRequest):
         raise HTTPException(status_code=400, detail="type must be BUY or SELL")
     try:
         return adapter.place_order(payload.model_dump())
+    except AutoTradingDisabledError as exc:
+        # AutoTrading is OFF in the terminal — a persistent config state, not a
+        # transient throttle. 503 (not 429) so callers/operators see the real
+        # cause instead of a misleading "too many requests".
+        raise HTTPException(status_code=503, detail=str(exc))
     except TooManyRequestsError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
     except ValueError as exc:
@@ -555,6 +560,11 @@ def limit_order(payload: LimitOrderRequest):
         raise HTTPException(status_code=400, detail=f"type must be one of {sorted(valid_types)}")
     try:
         return adapter.place_limit_order(payload.model_dump())
+    except AutoTradingDisabledError as exc:
+        # AutoTrading is OFF in the terminal — a persistent config state, not a
+        # transient throttle. 503 (not 429) so callers/operators see the real
+        # cause instead of a misleading "too many requests".
+        raise HTTPException(status_code=503, detail=str(exc))
     except TooManyRequestsError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
     except ValueError as exc:
@@ -580,6 +590,11 @@ def close(payload: CloseRequest):
     """
     try:
         return adapter.close_position(payload.ticket, payload.volume)
+    except AutoTradingDisabledError as exc:
+        # AutoTrading is OFF in the terminal — a persistent config state, not a
+        # transient throttle. 503 (not 429) so callers/operators see the real
+        # cause instead of a misleading "too many requests".
+        raise HTTPException(status_code=503, detail=str(exc))
     except TooManyRequestsError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
     except ValueError as exc:
@@ -677,6 +692,11 @@ def cancel_order(payload: CancelRequest):
     """Cancel a pending (limit/stop) order by ticket."""
     try:
         return adapter.cancel_order(payload.ticket)
+    except AutoTradingDisabledError as exc:
+        # AutoTrading is OFF in the terminal — a persistent config state, not a
+        # transient throttle. 503 (not 429) so callers/operators see the real
+        # cause instead of a misleading "too many requests".
+        raise HTTPException(status_code=503, detail=str(exc))
     except TooManyRequestsError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
     except ValueError as exc:
