@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import ssl
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from pymongo.database import Database
 
@@ -37,6 +40,17 @@ _LEVELS = {"info": 10, "warning": 20, "critical": 30}
 
 # In-memory per-event throttle (monotonic clock; resets on process restart).
 _last_forwarded: dict[str, float] = {}
+
+# Per-host cache of the last IPv4 edge address that completed a TLS handshake.
+# api.telegram.org is served by a rotating pool of edge IPs and on container
+# hosts (Render, etc.) some of those IPs black-hole the TLS ClientHello, which
+# surfaces as "_ssl.c:999: handshake operation timed out". Remembering a known
+# good IP makes every send after the first one fast and reliable instead of
+# gambling on DNS round-robin each time.
+_last_good_ip: dict[str, str] = {}
+
+# Shared TLS context (created once; thread-safe for concurrent use).
+_TLS_CTX = ssl.create_default_context()
 
 
 # Canonical AppSettings keys (written by the Settings UI), plus a few common
@@ -85,24 +99,122 @@ def _enabled_channels(db: Database) -> list[tuple[str, dict]]:
     return channels
 
 
-def _http_post(url: str, json_body: dict, timeout: float = 15.0):
-    """POST helper that forces IPv4 and uses a generous timeout.
+class _Resp:
+    """Minimal response shim exposing the ``.status_code`` / ``.json()`` surface
+    that ``_forward`` relies on, so the sender can be swapped without touching
+    the callers."""
 
-    Container hosts (Render, etc.) often advertise IPv6 (AAAA) routes that
-    black-hole outbound traffic, so an httpx call to api.telegram.org picks the
-    IPv6 address and the TLS handshake hangs until timeout
-    (``_ssl.c:999: handshake operation timed out``) — even though IPv4 works
-    fine and a local curl succeeds. Binding the socket to an IPv4 source address
-    (``local_address="0.0.0.0"``) forces IPv4 and avoids the dead IPv6 path.
+    __slots__ = ("status_code", "_body")
+
+    def __init__(self, status_code: int, body: bytes):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict:
+        return json.loads(self._body.decode("utf-8", "replace"))
+
+
+def _ipv4_addresses(host: str) -> list[str]:
+    """Resolve ``host`` to its IPv4 (A-record) addresses only.
+
+    IPv6 is deliberately excluded: container hosts often advertise AAAA routes
+    that black-hole outbound traffic, so letting the socket pick an IPv6 edge is
+    the classic cause of a hung TLS handshake even when IPv4 works fine.
     """
-    import httpx
+    try:
+        infos = socket.getaddrinfo(host, 443, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
+    seen: list[str] = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in seen:
+            seen.append(ip)
+    return seen
 
-    transport = httpx.HTTPTransport(local_address="0.0.0.0", retries=1)
-    with httpx.Client(
-        transport=transport,
-        timeout=httpx.Timeout(timeout, connect=timeout),
-    ) as client:
-        return client.post(url, json=json_body)
+
+def _send_once(host: str, ip: str, request: bytes, timeout: float) -> _Resp:
+    """Open one IPv4 TLS connection to ``ip`` (SNI/cert validated against
+    ``host``), send a pre-built HTTP/1.0 request, and parse the response.
+
+    HTTP/1.0 with ``Connection: close`` keeps parsing trivial (read to EOF) and
+    sidesteps keep-alive/chunked edge cases — alerts are tiny one-shot POSTs.
+    """
+    raw = socket.create_connection((ip, 443), timeout=timeout)
+    try:
+        raw.settimeout(timeout)
+        with _TLS_CTX.wrap_socket(raw, server_hostname=host) as tls:
+            tls.sendall(request)
+            chunks: list[bytes] = []
+            while True:
+                buf = tls.recv(65536)
+                if not buf:
+                    break
+                chunks.append(buf)
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+
+    data = b"".join(chunks)
+    head, _, body = data.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    parts = status_line.split(" ", 2)
+    status_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    return _Resp(status_code, body)
+
+
+def _http_post(url: str, json_body: dict, timeout: float = 10.0):
+    """Robust IPv4-only JSON POST for tiny alert payloads.
+
+    Resolves the host to its IPv4 edge IPs and tries each one (last-known-good
+    first) with a short per-attempt timeout, so a single black-holed Telegram
+    edge IP — the usual cause of ``_ssl.c:999: handshake operation timed out`` —
+    no longer fails the whole send. The first IP to complete a TLS handshake is
+    cached for subsequent calls. Uses only the stdlib (socket + ssl) so it does
+    not depend on httpx's connection/retry behaviour.
+    """
+    split = urlsplit(url)
+    host = split.hostname or ""
+    path = split.path or "/"
+    if split.query:
+        path = f"{path}?{split.query}"
+
+    payload = json.dumps(json_body).encode("utf-8")
+    request = (
+        f"POST {path} HTTP/1.0\r\n"
+        f"Host: {host}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        f"Connection: close\r\n"
+        f"User-Agent: adaptive-trading-alerts/1\r\n"
+        f"\r\n"
+    ).encode("utf-8") + payload
+
+    ips = _ipv4_addresses(host)
+    if not ips:
+        raise OSError(f"could not resolve any IPv4 address for {host}")
+
+    # Try the last known-good IP first, then the rest, without duplicates.
+    cached = _last_good_ip.get(host)
+    ordered = ([cached] if cached in ips else []) + [ip for ip in ips if ip != cached]
+
+    last_exc: Exception | None = None
+    for attempt, ip in enumerate(ordered):
+        try:
+            resp = _send_once(host, ip, request, timeout)
+            _last_good_ip[host] = ip
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            _last_good_ip.pop(host, None)
+            logger.debug("alert POST to %s via %s failed: %s", host, ip, exc)
+            # brief backoff between edge IPs; keeps total time bounded
+            if attempt + 1 < len(ordered):
+                time.sleep(0.25)
+
+    raise last_exc or OSError(f"all {len(ordered)} IPv4 routes to {host} failed")
 
 
 def _forward(channel: str, cfg: dict, level: str, event: str, message: str, context: dict | None) -> dict:
