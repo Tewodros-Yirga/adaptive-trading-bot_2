@@ -186,29 +186,40 @@ class MT5Adapter:
             broker is throttling us. Transient → cooldown + retry, then 429.
           * 10026 TRADE_RETCODE_SERVER_DISABLES_AT — AutoTrading disabled by
             the SERVER. Not a rate-limit.
-          * 10027 TRADE_RETCODE_CLIENT_DISABLES_AT — AutoTrading disabled by
-            the CLIENT terminal (the "Algo Trading" toggle is OFF). This is a
-            persistent configuration state, NOT a rate-limit: hammering
-            order_send will return 10027 forever. The start.sh watcher
-            re-enables it via Ctrl+E within a few seconds, so we retry briefly
-            to let that land, then surface a clear AutoTradingDisabledError.
+          * 10027 TRADE_RETCODE_CLIENT_DISABLES_AT — This retcode is returned
+            in TWO distinct situations that look identical but have different root
+            causes:
 
-        Historic bug: this method treated 10027 as "too many requests" and
-        converted it to HTTP 429. With AutoTrading off in the terminal, EVERY
-        order returned 10027 → the bridge looked like it was permanently
-        rate-limited ("barely accepts orders, always 429"). The fix is to
-        classify 10027 as AutoTrading-disabled, not a rate-limit.
+            (a) Algo Trading toggle is genuinely OFF in the terminal UI.
+                Rare in production since common.ini / terminal.ini set
+                Account=0 / Profile=0 to suppress the auto-disable event.
+
+            (b) THE COMMON CASE: The MT5 EA session has been invalidated by
+                the terminal after a successful order. When order_send fills
+                the first trade, the terminal internally fires position-open
+                and account-update events that reset the Expert Advisor
+                authorization context. All subsequent calls through the SAME
+                mt5.initialize() session return 10027 — even though the Algo
+                Trading button is visually ON. This is why:
+                  * The first order after every bridge restart always succeeds
+                  * Every subsequent order fails with 10027
+                  * The Algo Trading toggle appears enabled in a screenshot
+                  * Restarting the bridge (which calls mt5.initialize() again)
+                    fixes the issue for exactly one more order
+
+                FIX: On 10027, call mt5.shutdown() + re-initialize() to obtain
+                a fresh EA session. This is equivalent to a bridge restart but
+                without stopping the process. After re-init, the next
+                order_send attempt succeeds.
         """
         global _last_order_send_at, _order_cooldown_until
 
         _RETCODE_DONE              = self._mt.TRADE_RETCODE_DONE
         _RETCODE_TOO_MANY_REQUESTS = 10024   # TRADE_RETCODE_TOO_MANY_REQUESTS — real rate-limit
         _RETCODE_SERVER_DISABLES   = 10026   # TRADE_RETCODE_SERVER_DISABLES_AT — algo off (server)
-        _RETCODE_CLIENT_DISABLES   = 10027   # TRADE_RETCODE_CLIENT_DISABLES_AT — algo off (client)
-        # 3 attempts max: sleeps of 5s, 10s, 20s → worst-case hold ≈35s.
-        # (Previously 5 attempts with sleeps up to 80s totalling 155s, which
-        # exceeded the backend's 8s read timeout and opened the circuit breaker
-        # before MT5 had a chance to recover.)
+        _RETCODE_CLIENT_DISABLES   = 10027   # TRADE_RETCODE_CLIENT_DISABLES_AT — stale EA session or algo off
+        # 3 attempts max. Each retry does shutdown + re-initialize (≈2-5s) + 2s
+        # pause, so worst-case hold ≈ 3 × 7s = 21s, well inside the 60s timeout.
         _MAX_RETRIES = 3
 
         with _ORDER_LOCK:
@@ -255,24 +266,65 @@ class MT5Adapter:
                     )
 
                 if result.retcode in (_RETCODE_CLIENT_DISABLES, _RETCODE_SERVER_DISABLES):
-                    # AutoTrading is OFF. NOT a rate-limit — retrying immediately
-                    # is pointless because the terminal config won't change on its
-                    # own. The start.sh watcher re-enables client-side AutoTrading
-                    # via Ctrl+E within a few seconds, so give it a brief window to
-                    # land, then surface an actionable error.
+                    # ── Root cause: stale EA session (most common) ────────────
+                    # After the first successful order_send, MT5 fires internal
+                    # position/account events that invalidate the current EA
+                    # authorization context. The next order_send returns 10027
+                    # even though the Algo Trading toggle is visually ON.
+                    #
+                    # Fix: call mt5.shutdown() then re-initialize() to obtain a
+                    # fresh EA session — identical to what a bridge restart does.
+                    # This must happen BEFORE the retry so the next iteration
+                    # has a valid session.
+                    #
+                    # Also handles the genuine "toggle is OFF" case: re-init
+                    # requests a new EA registration which prompts the terminal
+                    # to re-check and re-grant trade permission.
                     who = "client terminal" if result.retcode == _RETCODE_CLIENT_DISABLES else "server"
-                    if attempt < _MAX_RETRIES - 1 and result.retcode == _RETCODE_CLIENT_DISABLES:
+                    if attempt < _MAX_RETRIES - 1:
                         logger.warning(
-                            "order_send retcode=%d — AutoTrading disabled by %s; "
-                            "waiting 3s for terminal to re-enable (retry %d/%d)",
+                            "order_send retcode=%d (stale EA session / AutoTrading, %s) — "
+                            "resetting mt5 session and retrying (%d/%d)",
                             result.retcode, who, attempt + 1, _MAX_RETRIES,
                         )
-                        time.sleep(3)
+                        # Shutdown the stale session inside Wine before re-init
+                        try:
+                            self._mt.shutdown()
+                        except Exception as _sd_exc:
+                            logger.debug("mt5.shutdown() before re-init raised: %s", _sd_exc)
+                        self.connected = False
+                        self._mt = None
+                        time.sleep(2)  # brief pause so terminal processes pending events
+                        try:
+                            self.ensure_connection()
+                            logger.info(
+                                "mt5 session re-initialized after retcode=%d — retrying order",
+                                result.retcode,
+                            )
+                        except Exception as _reinit_exc:
+                            logger.warning(
+                                "mt5 re-initialize after retcode=%d failed: %s — aborting",
+                                result.retcode, _reinit_exc,
+                            )
+                            raise AutoTradingDisabledError(
+                                f"order_send retcode={result.retcode}: EA session reset failed "
+                                f"({_reinit_exc}). AutoTrading disabled by {who}."
+                            ) from _reinit_exc
+                        if self._mt is None:
+                            raise AutoTradingDisabledError(
+                                f"order_send retcode={result.retcode}: re-initialize returned "
+                                f"no connection. AutoTrading disabled by {who}."
+                            )
+                        # Retry with the IDENTICAL request dict — price, SL, TP,
+                        # volume, and symbol are all preserved exactly as supplied
+                        # by the caller. We do NOT re-fetch the tick price.
+                        # The `deviation=20` in the request tolerates any minor
+                        # market movement during the 2s re-init window.
                         continue
                     raise AutoTradingDisabledError(
-                        f"order_send retcode={result.retcode}: AutoTrading disabled by {who}. "
-                        f"Enable the 'Algo Trading' toggle in the MT5 terminal "
-                        f"(terminal_info().trade_allowed={self._trade_allowed_repr()})."
+                        f"order_send retcode={result.retcode}: EA session / AutoTrading issue "
+                        f"({who}) — exhausted {_MAX_RETRIES} re-initialize attempts. "
+                        f"trade_allowed={self._trade_allowed_repr()}."
                     )
 
                 raise RuntimeError(

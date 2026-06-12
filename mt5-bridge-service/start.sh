@@ -508,7 +508,15 @@ fi
     _uniq_ids() { awk 'NF' | sort -n -u; }
     trap 'echo "[dismiss-loop] exit=$?" >> "${DISMISS_LOG}"' EXIT
     sleep 8
-    for _try in $(seq 1 120); do
+    # Run INDEFINITELY — not just 10 minutes.
+    # Root cause of retcode 10027: MT5 disables AutoTrading when it perceives
+    # a headless credential injection as an "account change". This event can
+    # fire MINUTES after startup and can recur throughout the session. A
+    # finite loop (old: seq 1 120 = 10 min) exits before the event fires,
+    # leaving nothing to re-enable AutoTrading for the container's lifetime.
+    _try=0
+    while true; do
+      _try=$(( _try + 1 ))
       # Step 1: Press Return on the currently focused window.
       # This dismisses the IPC Login/Auth dialog which is an embedded
       # Win32 modal inside the MT5 main X11 window (not a separate
