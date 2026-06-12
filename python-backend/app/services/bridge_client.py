@@ -35,9 +35,20 @@ class BridgeRateLimitedError(RuntimeError):
     """
     Raised when the broker is rate-limiting order requests.
 
-    Maps to the bridge's HTTP 429 (MT5 retcode 10027). This is a transient,
+    Maps to the bridge's HTTP 429 (MT5 retcode 10024). This is a transient,
     self-resolving condition — callers should back off and retry on the next
     cycle rather than treating it as an unexpected error.
+    """
+
+
+class BridgeAutoTradingDisabledError(BridgeUnavailableError):
+    """
+    Raised when the MT5 terminal's 'Algo Trading' toggle is OFF (retcode 10027).
+
+    This is a terminal configuration state, NOT a bridge connectivity failure.
+    The circuit breaker must NOT be opened for this error — the bridge itself
+    is healthy; only the MT5 trade permission is temporarily disabled.
+    The start.sh watcher re-enables AutoTrading automatically within seconds.
     """
 
 
@@ -117,6 +128,23 @@ def _is_retryable_error(exc: BaseException) -> bool:
         return exc.response.status_code in (429, 502, 503, 504)
     # Do NOT retry on ReadTimeout — the circuit breaker handles repeated failures
     return isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError))
+
+
+def _is_autotrading_disabled_response(exc: httpx.HTTPStatusError) -> bool:
+    """Return True when a 503 is specifically caused by MT5 AutoTrading being OFF.
+
+    The bridge sets HTTP 503 for both 'bridge not connected' and 'AutoTrading
+    disabled by terminal'. Only the latter must NOT trip the circuit breaker —
+    the bridge is reachable and healthy; only the MT5 trade permission is off.
+    We detect it by inspecting the JSON detail the bridge includes.
+    """
+    if exc.response.status_code != 503:
+        return False
+    try:
+        detail = exc.response.json().get("detail", "")
+        return "autotrading disabled" in detail.lower() or "algo trading" in detail.lower()
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +268,18 @@ class MT5BridgeClient:
                     "will retry next cycle"
                 ) from exc
             if exc.response.status_code in (502, 503, 504):
+                # 503 with AutoTrading-disabled detail: the bridge is reachable
+                # and healthy — MT5's Algo Trading toggle is simply OFF. Do NOT
+                # record a circuit-breaker failure; the breaker must stay CLOSED
+                # so the next order attempt reaches the bridge normally (the
+                # start.sh watcher re-enables AutoTrading within seconds).
+                if _is_autotrading_disabled_response(exc):
+                    raise BridgeAutoTradingDisabledError(
+                        f"Bridge cannot place order on {path}: {self._error_detail(exc)}"
+                    ) from exc
                 self._cb.record_failure()
-                # 503 carries an actionable reason (e.g. "AutoTrading disabled
-                # by client terminal", "MT5 not connected"). Surface it via the
-                # graceful BridgeUnavailable path so the live loop logs the real
-                # cause at info level and the breaker suppresses any flood —
-                # rather than letting a raw HTTPStatusError read as a scary error.
+                # Other 503/502/504: surface via BridgeUnavailable so the live
+                # loop logs the real cause at info level.
                 if exc.response.status_code == 503:
                     raise BridgeUnavailableError(
                         f"Bridge cannot place order on {path}: {self._error_detail(exc)}"

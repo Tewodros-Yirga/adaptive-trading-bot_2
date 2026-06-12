@@ -22,6 +22,8 @@ News learning:
     trade close, score_feedback.run_trade_close_hooks updates news learning and
     nudges each voting strategy's composite_score.
 """
+import asyncio
+import functools
 import json
 import logging
 from datetime import datetime, timedelta
@@ -32,6 +34,7 @@ from .. import crud
 from ..models import EnsembleDecision, Strategy
 from ..services.bridge_client import (
     bridge_client,
+    BridgeAutoTradingDisabledError,
     BridgeRateLimitedError,
     BridgeUnavailableError,
 )
@@ -40,6 +43,43 @@ from ..services.risk_manager import check_and_compute_lot_size
 from ..strategy.registry import get_strategy
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Blocking-call offloading
+# ---------------------------------------------------------------------------
+# `bridge_client` is a fully synchronous client (httpx.Client + a threading
+# circuit breaker). Calling it directly from this `async` function blocks the
+# event loop — and `place_order` carries a 60s read timeout, so a single slow
+# order would freeze every other coroutine (WebSocket streams, health checks,
+# the reconciliation loop, all other symbols). Route every blocking bridge call
+# through the default thread-pool executor so the loop stays responsive.
+
+
+async def _to_thread(func, *args, **kwargs):
+    """Run a blocking callable in the default executor without blocking the loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+
+
+# ---------------------------------------------------------------------------
+# Per-symbol concurrency control (TOCTOU guard)
+# ---------------------------------------------------------------------------
+# The duplicate-position and max_open_trades checks read live state, then place
+# an order with no lock in between. Two coroutines processing the same symbol
+# (live loop + webhook, or two webhooks) can both pass the checks and double
+# fill. A per-symbol asyncio.Lock serializes the read-check-place sequence for a
+# given symbol while letting different symbols proceed in parallel.
+_symbol_locks: dict[str, "asyncio.Lock"] = {}
+
+
+def _get_symbol_lock(symbol: str) -> "asyncio.Lock":
+    key = (symbol or "").upper()
+    lock = _symbol_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _symbol_locks[key] = lock
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +422,28 @@ async def _fetch_mtf_bars(symbol: str, db: Database) -> dict:
 # ---------------------------------------------------------------------------
 
 async def process_signal(
+    db: Database,
+    market_data: dict,
+    symbol: str,
+    price: float,
+    extra_trade_fields: dict | None = None,
+) -> dict:
+    """
+    Per-symbol serialized entry point for the signal pipeline.
+
+    Wraps `_process_signal_inner` in a per-symbol async lock so two concurrent
+    callers for the SAME symbol (e.g. the live trading loop and an incoming
+    webhook, or two webhooks) cannot both pass the `max_open_trades` and
+    duplicate-position guards and then double-fill. Different symbols still run
+    fully concurrently — the lock is keyed by symbol.
+    """
+    async with _get_symbol_lock(symbol):
+        return await _process_signal_inner(
+            db, market_data, symbol, price, extra_trade_fields
+        )
+
+
+async def _process_signal_inner(
     db: Database,
     market_data: dict,
     symbol: str,
@@ -762,7 +824,7 @@ async def process_signal(
     # ── Duplicate position awareness ───────────────────────────────────────
     existing_same_dir: list[dict] = []
     try:
-        live_positions = bridge_client.get_positions()
+        live_positions = await _to_thread(bridge_client.get_positions)
         _sym_variants: set[str] = {symbol.upper()}
         _sym_u = symbol.upper()
         if _sym_u.endswith("M"):
@@ -894,7 +956,7 @@ async def process_signal(
                     volume = float(p.get("volume") or 0)
                     if ticket and volume > 0 and not p.get("_from_db"):
                         try:
-                            bridge_client.close_position(int(ticket), volume)
+                            await _to_thread(bridge_client.close_position, int(ticket), volume)
                             logger.info(
                                 "[Reversal] Full close opposite %s position ticket=%s vol=%.2f",
                                 p.get("type"), ticket, volume,
@@ -911,7 +973,7 @@ async def process_signal(
                     close_vol = round(volume * partial_close_pct, 2)
                     if ticket and close_vol > 0 and not p.get("_from_db"):
                         try:
-                            bridge_client.close_position(int(ticket), close_vol)
+                            await _to_thread(bridge_client.close_position, int(ticket), close_vol)
                             logger.info(
                                 "[Reversal] Partial close opposite ticket=%s vol=%.2f/%.2f",
                                 ticket, close_vol, volume,
@@ -931,7 +993,9 @@ async def process_signal(
                         new_sl = levels.get("entry")  # new signal entry as tighter SL
                         if new_sl:
                             try:
-                                bridge_client.modify_position(int(ticket), stop_loss=new_sl)
+                                await _to_thread(
+                                    bridge_client.modify_position, int(ticket), stop_loss=new_sl
+                                )
                                 logger.info(
                                     "[Reversal] Tightened SL on opposite ticket=%s to %.5f",
                                     ticket, new_sl,
@@ -962,7 +1026,8 @@ async def process_signal(
 
     # ── Place order ────────────────────────────────────────────────────────
     try:
-        order = bridge_client.place_order(
+        order = await _to_thread(
+            bridge_client.place_order,
             {
                 "symbol": symbol,
                 "direction": final_direction,
@@ -970,8 +1035,21 @@ async def process_signal(
                 "stop_loss": sl,
                 "take_profit": levels.get("tp1"),
                 "price": price,
-            }
+            },
         )
+    except BridgeAutoTradingDisabledError as _at_exc:
+        logger.warning(
+            "AutoTrading disabled in MT5 terminal for %s — skipping cycle: %s",
+            symbol, _at_exc,
+        )
+        return {
+            "status": "AUTOTRADING_DISABLED",
+            "reason": (
+                "MT5 AutoTrading toggle is OFF; the terminal watcher will re-enable it "
+                "automatically. Will retry next cycle."
+            ),
+            "symbol": symbol,
+        }
     except BridgeRateLimitedError as _rl_exc:
         logger.info(
             "Order rate-limited by broker for %s — skipping cycle: %s", symbol, _rl_exc
