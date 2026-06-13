@@ -119,6 +119,43 @@ def _day_of_week(date_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Date canonicalisation (keeps a single timeframe's bars format-consistent)
+# ---------------------------------------------------------------------------
+
+_DAILY_TFS = {"1d", "1w", "1mo", "1month"}
+
+
+def _normalize_bar_date(date_str: str, timeframe: str) -> str:
+    """Canonicalise a bar date so one (symbol, timeframe) never mixes date-only
+    and full-datetime strings. Daily/weekly → 'YYYY-MM-DD'; intraday →
+    'YYYY-MM-DD HH:MM:SS'. Mirrors the writer in the backtester microservice's
+    ``save_ohlcv_to_cache`` so cache reads and writes agree.
+    """
+    s = str(date_str).strip().replace("T", " ").rstrip("Z").strip()[:19]
+    if not s:
+        return s
+    if timeframe in _DAILY_TFS:
+        return s[:10]
+    if len(s) <= 10:  # date-only value for an intraday frame → pad to midnight
+        return f"{s[:10]} 00:00:00"
+    return s
+
+
+def _normalize_ohlcv_dates(bars: list[dict], timeframe: str) -> list[dict]:
+    """Return ``bars`` with each row's ``date`` canonicalised for ``timeframe``.
+
+    Cleans existing rows that the per-bar cache accumulated in mixed formats
+    (e.g. some daily bars stored as "2026-05-22", others as "2026-05-22 00:00:00")
+    before they reach pandas. Mutates rows in place and returns the list.
+    """
+    for bar in bars or []:
+        d = bar.get("date")
+        if d is not None:
+            bar["date"] = _normalize_bar_date(d, timeframe)
+    return bars or []
+
+
+# ---------------------------------------------------------------------------
 # MTF helpers for simulation
 # ---------------------------------------------------------------------------
 
@@ -150,7 +187,12 @@ def _build_mtf_bars_for_index(
         if not filtered:
             return pd.DataFrame()
         df = pd.DataFrame(filtered)
-        df["datetime"] = pd.to_datetime(df["date"])
+        # format="mixed": the per-bar ohlcv_cache can hold a mix of date-only
+        # ("2026-05-22") and full-datetime ("2026-05-22 00:00:00") strings for the
+        # same timeframe (bars written by different sources/runs). Without this,
+        # pandas infers a with-time format from the first rows and then raises on a
+        # later date-only value.
+        df["datetime"] = pd.to_datetime(df["date"], format="mixed")
         df = df.set_index("datetime")
         for col in ("open", "high", "low", "close", "volume"):
             if col in df.columns:
@@ -514,7 +556,8 @@ def _run_backtest_sync(
                     _htf_filtered = [r for r in _htf_raw if r.get("date", "")[:10] <= _cutoff]
                     if _htf_filtered:
                         _htf_df = _pd.DataFrame(_htf_filtered)
-                        _htf_df["datetime"] = _pd.to_datetime(_htf_df["date"])
+                        # Tolerate mixed date-only / full-datetime strings (see _list_to_df).
+                        _htf_df["datetime"] = _pd.to_datetime(_htf_df["date"], format="mixed")
                         _htf_df = _htf_df.set_index("datetime")
                         for _col in ("open", "high", "low", "close", "volume"):
                             if _col in _htf_df.columns:
@@ -1133,6 +1176,15 @@ def run_backtest(
             {"$set": {"metrics_json": json.dumps({"error": "No OHLCV data available"}), "status": "FAILED"}},
         )
         return result_id
+
+    # Canonicalise dates before simulation. The per-bar ohlcv_cache can hold a mix
+    # of date-only and full-datetime strings for the same timeframe (written by
+    # different sources/runs); normalising here keeps each frame format-consistent
+    # so pandas parsing in the MTF builder can't choke on a stray date-only value.
+    ohlcv = _normalize_ohlcv_dates(ohlcv, "1d")
+    extra_ohlcv_by_tf = {
+        tf: _normalize_ohlcv_dates(rows, tf) for tf, rows in extra_ohlcv_by_tf.items()
+    }
 
     try:
         metrics = _run_backtest_sync(
