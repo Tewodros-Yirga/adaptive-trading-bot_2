@@ -83,6 +83,23 @@ def _get_symbol_lock(symbol: str) -> "asyncio.Lock":
 
 
 # ---------------------------------------------------------------------------
+# Background task GC protection
+# ---------------------------------------------------------------------------
+# Tasks created with asyncio.create_task() that are not stored in a reference
+# can be garbage-collected before completing. This set keeps a strong reference
+# until the task finishes (the done-callback auto-discards it).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> asyncio.Task:
+    """Schedule a coroutine as a background task with GC protection."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+# ---------------------------------------------------------------------------
 # Indicator enrichment for non-MTF strategies
 # ---------------------------------------------------------------------------
 
@@ -736,8 +753,7 @@ async def _process_signal_inner(
             # ── Broadcast ensemble_vote (no signal) to dashboard clients ──
             try:
                 from ..routers.websocket import broadcast_ws_event
-                import asyncio as _asyncio
-                _asyncio.create_task(broadcast_ws_event({
+                _fire_and_forget(broadcast_ws_event({
                     "event": "ensemble_vote",
                     "symbol": symbol,
                     "direction": None,
@@ -1128,8 +1144,7 @@ async def _process_signal_inner(
     # ── Broadcast ensemble_vote (fired trade) to dashboard clients ────────
     try:
         from ..routers.websocket import broadcast_ws_event
-        import asyncio as _asyncio
-        _asyncio.create_task(broadcast_ws_event({
+        _fire_and_forget(broadcast_ws_event({
             "event": "ensemble_vote",
             "symbol": symbol,
             "direction": final_direction,
