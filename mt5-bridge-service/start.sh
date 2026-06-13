@@ -1127,10 +1127,25 @@ fi
     _FUNCTIONAL_LAST_STDERR=""
 
     _functional_mt5_probe() {
-      # The ONLY definitive test of IPC readiness: call mt5.initialize() from
-      # inside Wine (same wineserver as terminal).  If this returns True, the
-      # terminal's IPC backend is alive and serving, regardless of whether
-      # `dir \.\|\pipe\` shows anything.
+      # IPC readiness test: call mt5.initialize() from inside Wine (same
+      # wineserver as terminal).  If this returns True, the terminal's IPC
+      # backend is alive and serving.
+      #
+      # ╔══════════════════════════════════════════════════════════════════╗
+      # ║  CRITICAL: DO NOT pass login/password/server credentials here! ║
+      # ║                                                                ║
+      # ║  This probe runs in a SEPARATE ephemeral Wine Python process.  ║
+      # ║  Wine's MapViewOfFile across separate processes is incomplete   ║
+      # ║  (see comment at line ~1008). Passing credentials triggers an  ║
+      # ║  "account change" event inside the terminal which POISONS the  ║
+      # ║  EA authorization state for ALL subsequent IPC sessions.       ║
+      # ║                                                                ║
+      # ║  Result: terminal_info().trade_allowed=False + order_send      ║
+      # ║  returns 10027 even though the UI shows AutoTrading enabled.   ║
+      # ║                                                                ║
+      # ║  The adapter (through the persistent mt5linux RPyC server)     ║
+      # ║  must be the FIRST and ONLY process that logs in.              ║
+      # ╚══════════════════════════════════════════════════════════════════╝
       local _out _ok_line _err_line _stderr_file _term_linux_path _term_wine_path
       if [[ -z "${FOUND_PYTHON:-}" ]] || [[ ! -f "${FOUND_PYTHON}" ]]; then
         _FUNCTIONAL_LAST_ERR="FUNCTIONAL_ERR=(no_python, 'FOUND_PYTHON not set')"
@@ -1146,46 +1161,12 @@ fi
         _term_wine_path="C:\\\\${_term_wine_path////\\\\}"
       fi
 
-      # Attempt 1: credentialed initialize with path — give MetaTrader5.pyd
-      # full context to find the terminal.  Bare initialize (no path, no login)
-      # relies on Windows registry discovery which is unreliable under Wine.
-      # Passing login/password/server triggers the terminal's auth flow and
-      # ensures the correct IPC shared-memory segment is opened.
-      # Timeout increased from 15s to 60s for Wine overhead.
-      _out="$(timeout 70s wine "${FOUND_PYTHON}" -u -c "
-import sys, os, MetaTrader5 as mt5
-login = int(os.environ.get('MT_LOGIN', '0'))
-password = os.environ.get('MT_PASSWORD', '')
-server = os.environ.get('MT_SERVER', '')
-path = r'${_term_wine_path}'
-kwargs = {'path': path, 'timeout': 60000}
-if login and password and server:
-    kwargs['login'] = login
-    kwargs['password'] = password
-    kwargs['server'] = server
-ok = mt5.initialize(**kwargs)
-err = mt5.last_error()
-try:
-    mt5.shutdown()
-except Exception:
-    pass
-print(f'FUNCTIONAL_OK={ok}')
-print(f'FUNCTIONAL_ERR={err}')
-print(f'FUNCTIONAL_MODE=credentialed')
-sys.stdout.flush()
-" 2>"${_stderr_file}" || true)"
-      _FUNCTIONAL_LAST_OUT="${_out}"
-      _FUNCTIONAL_LAST_STDERR="$(cat "${_stderr_file}" 2>/dev/null | head -c 4096 || true)"
-      rm -f "${_stderr_file}" 2>/dev/null || true
-      _ok_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_OK=(True|False|None)' | head -1 || true)"
-      _err_line="$(echo "${_out}" | grep -oE 'FUNCTIONAL_ERR=\([^)]*\)' | head -1 || true)"
-      _FUNCTIONAL_LAST_ERR="${_err_line}"
-      if echo "${_ok_line}" | grep -qE 'FUNCTIONAL_OK=(True|None)'; then
-        return 0
-      fi
-
-      # Attempt 2: bare initialize (no credentials) — fallback in case
-      # the credentialed call causes an auth dialog that blocks.
+      # Bare initialize only — path + timeout, NO credentials.
+      # This verifies the IPC backend is alive without triggering any
+      # terminal state changes.  The terminal may still be on its Login
+      # screen (not yet authenticated) — that is fine.  A successful
+      # initialize here means the IPC named-pipe handshake works;
+      # the adapter will supply credentials later via mt5linux.
       _out="$(timeout 70s wine "${FOUND_PYTHON}" -u -c "
 import sys, MetaTrader5 as mt5
 ok = mt5.initialize(path=r'${_term_wine_path}', timeout=60000)
@@ -1331,8 +1312,8 @@ sys.stdout.flush()
             _FORCE_PASS=true
           elif (( IPC_PIPES_HITS >= IPC_PIPES_REQUIRED_HITS )); then
             _FORCE_PASS=true
-          elif [[ "${MT5_SKIP_PIPE_VERIFICATION}" == "1" ]] && (( TCP_WAITED >= 180 )); then
-            echo "[mt5-probe] MT5_SKIP_PIPE_VERIFICATION=1 and elapsed=${TCP_WAITED}s >= 180s — forcing gate pass for diagnostic connection" >&2
+          elif [[ "${MT5_SKIP_PIPE_VERIFICATION}" == "1" ]] && (( TCP_WAITED >= 60 )); then
+            echo "[mt5-probe] MT5_SKIP_PIPE_VERIFICATION=1 and elapsed=${TCP_WAITED}s >= 60s — forcing gate pass (adapter will log in via mt5linux)" >&2
             _FORCE_PASS=true
           fi
 

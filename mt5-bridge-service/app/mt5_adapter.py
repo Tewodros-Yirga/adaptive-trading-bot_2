@@ -26,6 +26,19 @@ _RETRY_BACKOFF_SECONDS = [5, 10, 20, 30, 60, 120, 180, 300]
 _MAX_RETRY_INTERVAL = 300
 
 # ---------------------------------------------------------------------------
+# AutoTrading re-enable sentinel.
+#
+# When order_send returns 10027 (CLIENT_DISABLES_AT), the terminal's Algo
+# Trading toggle is OFF. The Python API *cannot* change this toggle — only
+# the terminal UI (Ctrl+E keystroke) can. The dismiss loop in start.sh
+# periodically sends Ctrl+E, but on a 5-second cycle. To make it react
+# instantly, we write a sentinel file that the dismiss loop checks on every
+# iteration. When the sentinel is present, the dismiss loop sends Ctrl+E
+# immediately and removes it.
+# ---------------------------------------------------------------------------
+_REENABLE_SENTINEL_DIR = os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs")
+
+# ---------------------------------------------------------------------------
 # Global order-send serialisation lock + rate-limit cooldown.
 #
 # Two distinct MT5 retcodes were historically conflated here:
@@ -123,6 +136,70 @@ class MT5Adapter:
             pass
         return "unknown"
 
+    def _is_trade_allowed(self) -> bool:
+        """Return True if terminal_info().trade_allowed is True."""
+        try:
+            if self._mt is None:
+                return False
+            info = self._mt.terminal_info()
+            if info is not None:
+                return bool(getattr(info, "trade_allowed", False))
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _signal_reenable_autotrading() -> None:
+        """
+        Write a sentinel file that the dismiss loop in start.sh watches.
+        When the dismiss loop sees this file, it immediately sends Ctrl+E
+        to the terminal window to re-enable AutoTrading, then removes it.
+        """
+        sentinel = os.path.join(_REENABLE_SENTINEL_DIR, "mt5_reenable_autotrading")
+        try:
+            with open(sentinel, "w") as f:
+                f.write(f"requested_at={time.time()}\n")
+            logger.info("Wrote AutoTrading re-enable sentinel: %s", sentinel)
+        except Exception as exc:
+            logger.warning("Failed to write re-enable sentinel %s: %s", sentinel, exc)
+
+    def _wait_for_trade_allowed(self, timeout: float = 30.0) -> bool:
+        """
+        Signal the dismiss loop to send Ctrl+E and poll terminal_info().trade_allowed
+        until it becomes True or we run out of time.
+
+        Returns True if trade_allowed became True within the timeout.
+
+        This keeps the existing mt5 connection alive — NO shutdown/reinitialize.
+        The root cause of 10027 is that the terminal's AutoTrading toggle is OFF,
+        which is a terminal UI state that mt5.initialize() cannot change.
+        Only the Ctrl+E keystroke (sent by the dismiss loop) can toggle it.
+        """
+        self._signal_reenable_autotrading()
+
+        poll_interval = 2.0
+        deadline = time.monotonic() + timeout
+        polls = 0
+
+        while time.monotonic() < deadline:
+            polls += 1
+            if self._is_trade_allowed():
+                logger.info(
+                    "trade_allowed became True after %d polls (%.1fs)",
+                    polls, timeout - (deadline - time.monotonic()),
+                )
+                return True
+            # Re-signal every ~8s in case the dismiss loop missed it
+            if polls % 4 == 0:
+                self._signal_reenable_autotrading()
+            time.sleep(poll_interval)
+
+        logger.warning(
+            "trade_allowed did not become True within %.0fs (%d polls)",
+            timeout, polls,
+        )
+        return False
+
     @staticmethod
     def _classify_error_text(error_text: str) -> str:
         low = (error_text or "").lower()
@@ -186,41 +263,28 @@ class MT5Adapter:
             broker is throttling us. Transient → cooldown + retry, then 429.
           * 10026 TRADE_RETCODE_SERVER_DISABLES_AT — AutoTrading disabled by
             the SERVER. Not a rate-limit.
-          * 10027 TRADE_RETCODE_CLIENT_DISABLES_AT — This retcode is returned
-            in TWO distinct situations that look identical but have different root
-            causes:
+          * 10027 TRADE_RETCODE_CLIENT_DISABLES_AT — The terminal's EA
+            authorization state is corrupted / stale. Under Wine, this
+            happens when a SEPARATE process previously called
+            mt5.initialize(login, password, server) and then shutdown(),
+            corrupting the shared-memory EA-auth segment via Wine's
+            broken MapViewOfFile.
 
-            (a) Algo Trading toggle is genuinely OFF in the terminal UI.
-                Rare in production since common.ini / terminal.ini set
-                Account=0 / Profile=0 to suppress the auto-disable event.
+            The Algo Trading button may appear green (Account=0 prevents
+            toggle change), but the IPC session has lost trade permission.
 
-            (b) THE COMMON CASE: The MT5 EA session has been invalidated by
-                the terminal after a successful order. When order_send fills
-                the first trade, the terminal internally fires position-open
-                and account-update events that reset the Expert Advisor
-                authorization context. All subsequent calls through the SAME
-                mt5.initialize() session return 10027 — even though the Algo
-                Trading button is visually ON. This is why:
-                  * The first order after every bridge restart always succeeds
-                  * Every subsequent order fails with 10027
-                  * The Algo Trading toggle appears enabled in a screenshot
-                  * Restarting the bridge (which calls mt5.initialize() again)
-                    fixes the issue for exactly one more order
-
-                FIX: On 10027, call mt5.shutdown() + re-initialize() to obtain
-                a fresh EA session. This is equivalent to a bridge restart but
-                without stopping the process. After re-init, the next
-                order_send attempt succeeds.
+            FIX: Call a BARE mt5.initialize() (no credentials, no shutdown)
+            on the EXISTING mt5linux connection to refresh the IPC handshake.
+            Do NOT pass credentials — that triggers another "account change"
+            event which re-poisons the state.
         """
         global _last_order_send_at, _order_cooldown_until
 
         _RETCODE_DONE              = self._mt.TRADE_RETCODE_DONE
         _RETCODE_TOO_MANY_REQUESTS = 10024   # TRADE_RETCODE_TOO_MANY_REQUESTS — real rate-limit
         _RETCODE_SERVER_DISABLES   = 10026   # TRADE_RETCODE_SERVER_DISABLES_AT — algo off (server)
-        _RETCODE_CLIENT_DISABLES   = 10027   # TRADE_RETCODE_CLIENT_DISABLES_AT — stale EA session or algo off
-        # 3 attempts max. Each retry does shutdown + re-initialize (≈2-5s) + 2s
-        # pause, so worst-case hold ≈ 3 × 7s = 21s, well inside the 60s timeout.
-        _MAX_RETRIES = 3
+        _RETCODE_CLIENT_DISABLES   = 10027   # TRADE_RETCODE_CLIENT_DISABLES_AT — stale EA auth
+        _MAX_RETRIES = 4
 
         with _ORDER_LOCK:
             result = None
@@ -266,64 +330,42 @@ class MT5Adapter:
                     )
 
                 if result.retcode in (_RETCODE_CLIENT_DISABLES, _RETCODE_SERVER_DISABLES):
-                    # ── Root cause: stale EA session (most common) ────────────
-                    # After the first successful order_send, MT5 fires internal
-                    # position/account events that invalidate the current EA
-                    # authorization context. The next order_send returns 10027
-                    # even though the Algo Trading toggle is visually ON.
+                    # ── IPC EA-auth is stale / corrupted ──────────────────
+                    # The terminal's AutoTrading button may be green, but the
+                    # IPC session has lost EA authorization (Wine shared-memory
+                    # bug).
                     #
-                    # Fix: call mt5.shutdown() then re-initialize() to obtain a
-                    # fresh EA session — identical to what a bridge restart does.
-                    # This must happen BEFORE the retry so the next iteration
-                    # has a valid session.
-                    #
-                    # Also handles the genuine "toggle is OFF" case: re-init
-                    # requests a new EA registration which prompts the terminal
-                    # to re-check and re-grant trade permission.
+                    # Strategy: refresh the IPC session with a BARE
+                    # mt5.initialize() — NO credentials, NO shutdown first.
+                    # This re-does the IPC handshake on the existing mt5linux
+                    # RPyC connection without triggering an "account change".
                     who = "client terminal" if result.retcode == _RETCODE_CLIENT_DISABLES else "server"
                     if attempt < _MAX_RETRIES - 1:
                         logger.warning(
-                            "order_send retcode=%d (stale EA session / AutoTrading, %s) — "
-                            "resetting mt5 session and retrying (%d/%d)",
+                            "order_send retcode=%d (EA auth stale, %s) — "
+                            "refreshing IPC session with bare initialize "
+                            "(attempt %d/%d, trade_allowed=%s)",
                             result.retcode, who, attempt + 1, _MAX_RETRIES,
+                            self._trade_allowed_repr(),
                         )
-                        # Shutdown the stale session inside Wine before re-init
+                        # Refresh IPC without credentials to avoid account-change poison
                         try:
-                            self._mt.shutdown()
-                        except Exception as _sd_exc:
-                            logger.debug("mt5.shutdown() before re-init raised: %s", _sd_exc)
-                        self.connected = False
-                        self._mt = None
-                        time.sleep(2)  # brief pause so terminal processes pending events
-                        try:
-                            self.ensure_connection()
+                            ok = self._mt.initialize(timeout=30000)
                             logger.info(
-                                "mt5 session re-initialized after retcode=%d — retrying order",
-                                result.retcode,
+                                "bare mt5.initialize() returned %s after retcode=%d",
+                                ok, result.retcode,
                             )
-                        except Exception as _reinit_exc:
+                        except Exception as _re_exc:
                             logger.warning(
-                                "mt5 re-initialize after retcode=%d failed: %s — aborting",
-                                result.retcode, _reinit_exc,
+                                "bare mt5.initialize() failed after retcode=%d: %s",
+                                result.retcode, _re_exc,
                             )
-                            raise AutoTradingDisabledError(
-                                f"order_send retcode={result.retcode}: EA session reset failed "
-                                f"({_reinit_exc}). AutoTrading disabled by {who}."
-                            ) from _reinit_exc
-                        if self._mt is None:
-                            raise AutoTradingDisabledError(
-                                f"order_send retcode={result.retcode}: re-initialize returned "
-                                f"no connection. AutoTrading disabled by {who}."
-                            )
-                        # Retry with the IDENTICAL request dict — price, SL, TP,
-                        # volume, and symbol are all preserved exactly as supplied
-                        # by the caller. We do NOT re-fetch the tick price.
-                        # The `deviation=20` in the request tolerates any minor
-                        # market movement during the 2s re-init window.
+                        time.sleep(2)  # brief pause for terminal to process
                         continue
                     raise AutoTradingDisabledError(
-                        f"order_send retcode={result.retcode}: EA session / AutoTrading issue "
-                        f"({who}) — exhausted {_MAX_RETRIES} re-initialize attempts. "
+                        f"order_send retcode={result.retcode}: EA authorization "
+                        f"stale ({who}) — exhausted {_MAX_RETRIES} bare-init "
+                        f"refresh attempts. "
                         f"trade_allowed={self._trade_allowed_repr()}."
                     )
 
@@ -549,12 +591,32 @@ class MT5Adapter:
             raise RuntimeError(
                 f"mt5 not connected [{self.last_error_class or 'unknown'}]: {self.last_error or 'connection unavailable'}"
             )
-        try:
-            info = self._mt.account_info()
-        except Exception as exc:
-            self.connected = False
-            self._mt = None
-            raise RuntimeError(f"mt5 account_info exception: {exc}") from exc
+        # Retry once on the existing connection before tearing it down.
+        # Transient RPyC hiccups (Wine GC pauses, pipe stalls) should NOT
+        # nuke the mt5linux connection — a destroyed connection triggers
+        # ensure_connection() which may fall back to credential-based init,
+        # re-poisoning the IPC EA-auth state.
+        info = None
+        last_exc = None
+        for _acc_attempt in range(2):
+            try:
+                info = self._mt.account_info()
+                if info is not None:
+                    break
+                # info is None — terminal might be momentarily busy
+                if _acc_attempt == 0:
+                    logger.warning("account_info() returned None — retrying in 2s")
+                    time.sleep(2)
+                    continue
+            except Exception as exc:
+                last_exc = exc
+                if _acc_attempt == 0:
+                    logger.warning("account_info() exception (retrying in 2s): %s", exc)
+                    time.sleep(2)
+                    continue
+                self.connected = False
+                self._mt = None
+                raise RuntimeError(f"mt5 account_info exception: {exc}") from exc
         if info is None:
             self.connected = False
             self._mt = None
@@ -572,12 +634,20 @@ class MT5Adapter:
         self.ensure_connection()
         if self._mt is None or not self.connected:
             return []
-        try:
-            rows = self._mt.positions_get()
-        except Exception as exc:
-            self.connected = False
-            self._mt = None
-            raise RuntimeError(f"mt5 positions_get exception: {exc}") from exc
+        # Same retry-before-teardown pattern as account() above.
+        rows = None
+        for _pos_attempt in range(2):
+            try:
+                rows = self._mt.positions_get()
+                break  # success (rows may be None = no positions, which is fine)
+            except Exception as exc:
+                if _pos_attempt == 0:
+                    logger.warning("positions_get() exception (retrying in 2s): %s", exc)
+                    time.sleep(2)
+                    continue
+                self.connected = False
+                self._mt = None
+                raise RuntimeError(f"mt5 positions_get exception: {exc}") from exc
         if rows is None:
             return []
 
