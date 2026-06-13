@@ -853,18 +853,28 @@ def run_backtest_sync_standalone(
     try:
         strat_check = get_strategy(strategy_name, params)
         if getattr(strat_check, "requires_mtf", False):
-            # Always seed with daily data so MTF strategies have a base
-            extra_ohlcv_by_tf["1d"] = ohlcv
-            extra_ohlcv_by_tf["4h"] = ohlcv  # daily as 4h proxy until real 4h loads
-            for tf in ("4h", "1h", "15m"):
+            # The primary `ohlcv` is whatever `timeframe` was requested (1h/4h/1d),
+            # NOT necessarily daily — key it by its REAL timeframe. Then fetch every
+            # OTHER timeframe the MTF strategy needs (including 1d). Only fall back to
+            # the primary array as a proxy when a real fetch genuinely fails, so we
+            # never alias two timeframes to the same bars (the old code seeded
+            # "1d" = primary and omitted "1d" from the fetch loop, so a 1h primary
+            # left 1d holding 1h data → identical 1d/1h charts).
+            extra_ohlcv_by_tf[timeframe] = ohlcv
+            for tf in ("1d", "4h", "1h", "15m"):
+                if tf == timeframe:
+                    continue
                 try:
                     fetched = fetch_ohlcv_sync(symbol, from_date, to_date, tf)
                     if fetched:
                         extra_ohlcv_by_tf[tf] = fetched
                         logger.info("MTF standalone %s %s: %d bars", symbol, tf, len(fetched))
+                    else:
+                        extra_ohlcv_by_tf.setdefault(tf, ohlcv)
+                        logger.warning("MTF standalone %s %s: empty — using %s proxy", symbol, tf, timeframe)
                 except Exception as exc:
-                    logger.warning("MTF standalone fetch failed %s %s: %s — using daily proxy", symbol, tf, exc)
-                    # Leave the daily proxy already set; don't overwrite with nothing
+                    extra_ohlcv_by_tf.setdefault(tf, ohlcv)
+                    logger.warning("MTF standalone fetch failed %s %s: %s — using %s proxy", symbol, tf, exc, timeframe)
     except Exception as exc:
         logger.warning("MTF strategy check failed for %s: %s", strategy_name, exc)
 

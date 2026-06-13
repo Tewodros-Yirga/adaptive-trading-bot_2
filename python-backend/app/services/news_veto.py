@@ -46,6 +46,7 @@ def news_veto_check(symbol: str, signal_dicts: list[dict], db: Database) -> dict
     bias_data = get_news_bias(db, symbol)
     news_bias = float(bias_data.get("bias") or 0.0)
     news_confidence = float(bias_data.get("confidence") or 0.0)
+    news_item_ids: list = bias_data.get("item_ids") or []
 
     strategy_signals = {s["strategy_name"]: s.get("direction") for s in signal_dicts}
     signaling = {name: d for name, d in strategy_signals.items() if d}
@@ -100,4 +101,6 @@ def news_veto_check(symbol: str, signal_dicts: list[dict], db: Database) -> dict
         "veto_reason": veto_reason,
         "news_influence": news_influence,
         "decision_id": decision_id,
+        # News items that drove the bias — recorded on the trade for close-time learning.
+        "news_item_ids": news_item_ids,
     }

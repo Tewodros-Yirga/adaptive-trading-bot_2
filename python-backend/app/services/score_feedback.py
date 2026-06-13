@@ -150,6 +150,7 @@ def run_trade_close_hooks(db: Database, trade: Trade) -> None:
             "closed_at": trade.closed_at,
             "pnl": trade.pnl,
             "result": trade.result,
+            "contributing_news_ids": getattr(trade, "contributing_news_ids", None) or [],
         })
     except Exception as exc:
         logger.warning("news learn-from-close failed for trade #%s: %s", getattr(trade, "id", "?"), exc)

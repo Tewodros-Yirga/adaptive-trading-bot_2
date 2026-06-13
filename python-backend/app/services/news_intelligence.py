@@ -95,11 +95,14 @@ def analyze_sentiment(headline: str, summary: str, groq_key: str | None) -> dict
         try:
             result = _groq_sentiment(headline, summary or "", groq_key)
             if result:
+                raw_syms = result.get("affected_symbols") or []
+                affected = [str(s).upper() for s in raw_syms if isinstance(s, str)] if isinstance(raw_syms, list) else []
                 return {
                     "ai_sentiment_label": result.get("sentiment_label", "NEUTRAL"),
                     "ai_sentiment_score": float(result.get("sentiment_score", 0.0)),
                     "ai_confidence": float(result.get("confidence", 0.5)),
                     "market_impact_predicted": float(result.get("market_impact_predicted", 0.0)),
+                    "affected_symbols": affected,
                 }
         except Exception:
             pass
@@ -109,6 +112,7 @@ def analyze_sentiment(headline: str, summary: str, groq_key: str | None) -> dict
         "ai_sentiment_score": kw["score"],
         "ai_confidence": kw["confidence"],
         "market_impact_predicted": kw["score"],
+        "affected_symbols": [],
     }
 
 
@@ -290,6 +294,9 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
 
         sentiment = analyze_sentiment(headline, item.get("summary", ""), groq_key)
         pub_dt = _parse_dt(item.get("published_at"))
+        # Tag with the fetch symbol PLUS any extra symbols the model flagged, so
+        # multi-symbol news correlates with trades on those symbols too.
+        symbols_mentioned = sorted({sym.upper(), *(sentiment.get("affected_symbols") or [])})
 
         try:
             from ..db import next_id
@@ -301,7 +308,7 @@ def fetch_and_store_news(db: Database, symbol: str | None = None) -> int:
                 "url": item.get("url", ""),
                 "published_at": pub_dt,
                 "fetched_at": datetime.now(timezone.utc),
-                "symbols_mentioned": json.dumps([sym]),
+                "symbols_mentioned": json.dumps(symbols_mentioned),
                 "raw_sentiment_score": item.get("raw_sentiment_score"),
                 "ai_sentiment_score": sentiment["ai_sentiment_score"],
                 "ai_sentiment_label": sentiment["ai_sentiment_label"],
@@ -362,6 +369,7 @@ def get_news_bias(db: Database, symbol: str, hours: int = 12) -> dict:
     now = datetime.now(timezone.utc)
     total_weight = 0.0
     weighted_score = 0.0
+    contributing_ids: list[int] = []
     for item in items:
         if item.get("ai_sentiment_score") is None:
             continue
@@ -383,13 +391,23 @@ def get_news_bias(db: Database, symbol: str, hours: int = 12) -> dict:
         )
         weighted_score += w * item["ai_sentiment_score"]
         total_weight += w
+        if item.get("_id") is not None:
+            contributing_ids.append(item["_id"])
 
     if total_weight == 0:
-        return {"bias": 0.0, "confidence": 0.0, "item_count": len(items)}
+        return {"bias": 0.0, "confidence": 0.0, "item_count": len(items), "item_ids": []}
 
     bias = weighted_score / total_weight
     confidence = min(1.0, total_weight / (len(items) * 0.5))
-    return {"bias": round(bias, 4), "confidence": round(confidence, 4), "item_count": len(items)}
+    # ``item_ids`` are the news items that actually contributed to this bias —
+    # the decision path records them on the trade so close-time learning updates
+    # exactly these items (see learn_from_trade).
+    return {
+        "bias": round(bias, 4),
+        "confidence": round(confidence, 4),
+        "item_count": len(items),
+        "item_ids": contributing_ids,
+    }
 
 
 def run_retrospective_learning(db: Database) -> int:
@@ -476,27 +494,41 @@ def learn_from_trade(db: Database, trade: dict) -> int:
     if isinstance(opened_at, datetime) and opened_at.tzinfo is None:
         opened_at = opened_at.replace(tzinfo=timezone.utc)
 
-    window_hours = int(crud.get_setting(db, "news_trade_learning_window_hours") or 4)
-    window_start = opened_at - timedelta(hours=window_hours)
+    # Preferred path: the orchestrator recorded exactly which news items drove the
+    # bias for this trade at decision time. Learn from those directly — no fuzzy
+    # time/symbol reconstruction needed. This is what makes learning fire for every
+    # news-driven trade regardless of when it eventually closed.
+    recorded_ids: list = trade.get("contributing_news_ids") or []
+    matching_docs: list = []
+    if recorded_ids:
+        matching_docs = list(db[COLL_NEWS].find({"_id": {"$in": recorded_ids}}))
 
-    # Find news items in the look-back window that mention this symbol
-    docs = list(
-        db[COLL_NEWS].find(
-            {"published_at": {"$gte": window_start, "$lte": opened_at}}
+    # Fallback (legacy trades with no recorded IDs): correlate by a window centered
+    # on the open time and the symbol tag. The window is widened to look a little
+    # past the open as well, since a news event can post moments after a trade fires.
+    if not matching_docs:
+        window_hours = int(crud.get_setting(db, "news_trade_learning_window_hours") or 4)
+        window_start = opened_at - timedelta(hours=window_hours)
+        window_end = opened_at + timedelta(hours=window_hours)
+        docs = list(
+            db[COLL_NEWS].find(
+                {"published_at": {"$gte": window_start, "$lte": window_end}}
+            )
         )
-    )
-
-    # Filter by symbol in symbols_mentioned (JSON list field)
-    matching_docs = []
-    for doc in docs:
-        try:
-            sym_list: list[str] = json.loads(doc.get("symbols_mentioned") or "[]")
-        except Exception:
-            sym_list = []
-        if not sym_list or symbol in sym_list:
-            matching_docs.append(doc)
+        for doc in docs:
+            try:
+                sym_list: list[str] = json.loads(doc.get("symbols_mentioned") or "[]")
+            except Exception:
+                sym_list = []
+            if not sym_list or symbol in sym_list:
+                matching_docs.append(doc)
 
     if not matching_docs:
+        logger.info(
+            "learn_from_trade: no correlated news for %s opened_at=%s "
+            "(recorded_ids=%d, closed=%s)",
+            symbol, opened_at, len(recorded_ids), is_closed,
+        )
         return 0
 
     updated = 0

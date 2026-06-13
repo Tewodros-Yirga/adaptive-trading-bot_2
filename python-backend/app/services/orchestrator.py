@@ -625,6 +625,9 @@ async def _process_signal_inner(
     from ..services.news_veto import news_veto_check
     veto_result = news_veto_check(symbol, signal_dicts, db)
     news_veto_decision_id: int | None = veto_result.get("decision_id")
+    # News items that drove the bias this cycle — recorded on the trade (below) so
+    # close-time learning updates exactly the items that influenced the decision.
+    contributing_news_ids: list = veto_result.get("news_item_ids") or []
 
     if veto_result.get("veto"):
         return {
@@ -1114,6 +1117,7 @@ async def _process_signal_inner(
         "strategy_name": selected_strategies[0] if selected_strategies else "ENSEMBLE",
         "params_version": version,
         "opened_at": datetime.utcnow(),
+        "contributing_news_ids": contributing_news_ids,
         **(extra_trade_fields or {}),
     }
     if mt5_ticket is not None:
@@ -1131,6 +1135,7 @@ async def _process_signal_inner(
             "pnl": None,
             "result": "OPEN",
             "closed_at": None,
+            "contributing_news_ids": contributing_news_ids,
         })
     except Exception as exc:
         logger.warning("News learn-from-open failed: %s", exc)

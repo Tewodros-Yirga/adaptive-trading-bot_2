@@ -64,6 +64,10 @@ class Trade:
     mt5_ticket: int | None = None
     opened_at: datetime = field(default_factory=datetime.utcnow)
     closed_at: datetime | None = None
+    # IDs of the news_items that drove the news bias at decision time. Recorded at
+    # open so trade-close learning updates exactly the items that influenced the
+    # trade, instead of re-deriving correlation by a fuzzy time/symbol window.
+    contributing_news_ids: list[int] = field(default_factory=list)
     id: str = ""
 
     def to_dict(self) -> dict:
@@ -93,6 +97,7 @@ class Trade:
             mt5_ticket=doc.get("mt5_ticket"),
             opened_at=doc.get("opened_at", datetime.utcnow()),
             closed_at=doc.get("closed_at"),
+            contributing_news_ids=list(doc.get("contributing_news_ids") or []),
         )
         obj.id = _doc_id(doc)
         return obj
