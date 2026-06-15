@@ -122,6 +122,11 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(trailing_stop_loop()))
     logger.info("Started trailing-stop manager (opt-in via trailing_stop_enabled).")
 
+    # ── 13b. Start pending-order monitor (inert unless pending_orders_enabled) ─
+    from .services.pending_orders import pending_order_monitor_loop
+    bg_tasks.append(asyncio.create_task(pending_order_monitor_loop()))
+    logger.info("Started pending-order monitor (opt-in via pending_orders_enabled).")
+
     # ── 13. Start DB-backed job-queue worker (inert unless job_queue_enabled) ──
     from .services.job_queue import start_job_worker
     bg_tasks.append(asyncio.create_task(start_job_worker()))

@@ -104,6 +104,62 @@ class Trade:
 
 
 # ---------------------------------------------------------------------------
+# PendingOrder
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PendingOrder:
+    symbol: str
+    direction: str                 # BUY or SELL
+    order_type: str                # BUY_LIMIT or SELL_LIMIT
+    limit_price: float
+    lot_size: float = 0.01
+    stop_loss: float | None = None
+    tp1: float | None = None
+    tp2: float | None = None
+    mt5_ticket: int | None = None
+    strategy_name: str | None = None
+    status: str = "PENDING"        # PENDING / FILLED / CANCELLED / EXPIRED
+    cancel_reason: str | None = None
+    ensemble_decision_id: int | None = None
+    params_version: int | None = None
+    contributing_news_ids: list[int] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    resolved_at: datetime | None = None
+    id: str = ""
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("id", None)
+        return _oid_to_str(d)
+
+    @classmethod
+    def from_doc(cls, doc: dict) -> "PendingOrder":
+        doc = dict(doc)
+        obj = cls(
+            symbol=doc.get("symbol", ""),
+            direction=doc.get("direction", ""),
+            order_type=doc.get("order_type", ""),
+            limit_price=doc.get("limit_price", 0.0),
+            lot_size=doc.get("lot_size", 0.01),
+            stop_loss=doc.get("stop_loss"),
+            tp1=doc.get("tp1"),
+            tp2=doc.get("tp2"),
+            mt5_ticket=doc.get("mt5_ticket"),
+            strategy_name=doc.get("strategy_name"),
+            status=doc.get("status", "PENDING"),
+            cancel_reason=doc.get("cancel_reason"),
+            ensemble_decision_id=doc.get("ensemble_decision_id"),
+            params_version=doc.get("params_version"),
+            contributing_news_ids=list(doc.get("contributing_news_ids") or []),
+            created_at=doc.get("created_at", datetime.utcnow()),
+            resolved_at=doc.get("resolved_at"),
+        )
+        obj.id = _doc_id(doc)
+        return obj
+
+
+# ---------------------------------------------------------------------------
 # ParameterVersion
 # ---------------------------------------------------------------------------
 

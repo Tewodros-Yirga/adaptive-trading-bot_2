@@ -410,6 +410,12 @@ class MT5BridgeClient:
                     return self._cached_positions
             raise
 
+    def get_orders(self) -> list:
+        """List live pending orders. Not cached: acting on stale pending-order
+        state is unsafe, so a bridge outage propagates and the caller skips."""
+        data = self._request("GET", "/orders")
+        return data.get("orders", data) if isinstance(data, dict) else data
+
     def get_deals(self, ticket: int, lookback_days: int = 14) -> list[dict]:
         try:
             data = self._request("GET", f"/deals/{ticket}", payload=None)

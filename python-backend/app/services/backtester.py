@@ -192,7 +192,12 @@ def _build_mtf_bars_for_index(
         # same timeframe (bars written by different sources/runs). Without this,
         # pandas infers a with-time format from the first rows and then raises on a
         # later date-only value.
-        df["datetime"] = pd.to_datetime(df["date"], format="mixed")
+        # utc=True coerces mixed/naive offsets to a common timezone (avoids the
+        # "Mixed timezones detected" ValueError); tz_localize(None) restores the
+        # tz-naive index downstream code expects.
+        df["datetime"] = pd.to_datetime(
+            df["date"], format="mixed", utc=True
+        ).dt.tz_localize(None)
         df = df.set_index("datetime")
         for col in ("open", "high", "low", "close", "volume"):
             if col in df.columns:
@@ -557,7 +562,9 @@ def _run_backtest_sync(
                     if _htf_filtered:
                         _htf_df = _pd.DataFrame(_htf_filtered)
                         # Tolerate mixed date-only / full-datetime strings (see _list_to_df).
-                        _htf_df["datetime"] = _pd.to_datetime(_htf_df["date"], format="mixed")
+                        _htf_df["datetime"] = _pd.to_datetime(
+                            _htf_df["date"], format="mixed", utc=True
+                        ).dt.tz_localize(None)
                         _htf_df = _htf_df.set_index("datetime")
                         for _col in ("open", "high", "low", "close", "volume"):
                             if _col in _htf_df.columns:

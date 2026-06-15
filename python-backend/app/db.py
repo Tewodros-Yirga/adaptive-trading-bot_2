@@ -30,6 +30,7 @@ COLL_BACKTEST_BATCHES = "backtest_batches"
 COLL_STRATEGY_PAIR_ANALYSES = "strategy_pair_analyses"
 COLL_ENSEMBLE_DECISIONS = "ensemble_decisions"
 COLL_NEWS_VETO_DECISIONS = "news_veto_decisions"
+COLL_PENDING_ORDERS = "pending_orders"
 COLL_COUNTERS = "counters"
 
 _client: MongoClient | None = None
@@ -127,6 +128,12 @@ def create_indexes(db: Database) -> None:
     # news_veto_decisions
     db[COLL_NEWS_VETO_DECISIONS].create_index([("symbol", ASCENDING)], background=True)
     db[COLL_NEWS_VETO_DECISIONS].create_index([("timestamp", DESCENDING)], background=True)
+
+    # pending_orders
+    db[COLL_PENDING_ORDERS].create_index([("status", ASCENDING)], background=True)
+    db[COLL_PENDING_ORDERS].create_index([("symbol", ASCENDING)], background=True)
+    db[COLL_PENDING_ORDERS].create_index([("mt5_ticket", ASCENDING)], background=True)
+    db[COLL_PENDING_ORDERS].create_index([("created_at", DESCENDING)], background=True)
 
     # backtest_results
     db[COLL_BACKTEST_RESULTS].create_index([("batch_id", ASCENDING)], background=True)

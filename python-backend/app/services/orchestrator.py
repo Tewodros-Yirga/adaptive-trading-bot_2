@@ -1043,6 +1043,72 @@ async def _process_signal_inner(
                     "ensemble_decision_id": _rev_decision.id,
                 }
 
+    # ── Pending limit orders: cancel-opposite + place-pending ─────────────────
+    # Opt-in via pending_orders_enabled. Strategy-driven signals can rest as a
+    # limit order away from market; news-driven signals always market-fill so
+    # they execute immediately. A fresh resolved signal also cancels any
+    # opposite-direction pending (ensemble reversal / opposing news).
+    from .pending_orders import (
+        get_pending_settings, decide_pending_entry, record_and_place_pending,
+        cancel_opposite_pendings,
+    )
+    _pending_settings = get_pending_settings(db)
+    _is_news_driven = selected_strategies == ["NEWS_DRIVEN"]
+
+    if _pending_settings["enabled"]:
+        # Cancel opposite-direction pendings on a fresh resolved signal.
+        if _is_news_driven and _pending_settings["cancel_on_opposing_news"]:
+            await _to_thread(
+                cancel_opposite_pendings, db, symbol, final_direction, "NEWS_OPPOSED"
+            )
+        elif not _is_news_driven and _pending_settings["cancel_on_opposite"]:
+            await _to_thread(
+                cancel_opposite_pendings, db, symbol, final_direction, "ENSEMBLE_REVERSAL"
+            )
+
+        # Decide whether to rest this strategy-driven signal as a limit order.
+        if not _is_news_driven:
+            _atr = float(market_data.get("atr") or price * 0.005)
+            _limit_price = decide_pending_entry(
+                final_direction, price, levels.get("entry"), _atr, _pending_settings
+            )
+            if _limit_price is not None:
+                _strategy_for_params = selected_strategies[0] if selected_strategies else None
+                _latest = (
+                    crud.get_latest_param_version(db, _strategy_for_params)
+                    if _strategy_for_params else None
+                )
+                _pending_result = await _to_thread(
+                    record_and_place_pending, db,
+                    symbol=symbol,
+                    direction=final_direction,
+                    limit_price=_limit_price,
+                    lot_size=lot_size,
+                    stop_loss=sl,
+                    tp1=levels.get("tp1"),
+                    tp2=levels.get("tp2"),
+                    strategy_name=(selected_strategies[0] if selected_strategies else "ENSEMBLE"),
+                    params_version=(_latest.version if _latest else 1),
+                    contributing_news_ids=contributing_news_ids,
+                    ensemble_decision_id=None,
+                )
+                if _pending_result is not None:
+                    _log_ensemble_decision(
+                        db, symbol, signal_dicts, ensemble_weights,
+                        final_direction, resolved_confidence,
+                        levels=levels, news_bias=news_bias,
+                        voter_breakdown=_vote_result.get("votes_breakdown"),
+                    )
+                    return {
+                        "status": "PENDING_PLACED",
+                        "signal": final_direction,
+                        "symbol": symbol,
+                        "limit_price": _limit_price,
+                        "ticket": _pending_result.get("ticket"),
+                        "reason": "Strategy entry away from market — resting as a pending limit order",
+                    }
+                # Placement failed → fall through to a market order below.
+
     # ── Place order ────────────────────────────────────────────────────────
     try:
         order = await _to_thread(

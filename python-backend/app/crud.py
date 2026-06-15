@@ -15,13 +15,13 @@ from .db import (
     COLL_APP_SETTINGS, COLL_STRATEGIES, COLL_BACKTEST_RESULTS,
     COLL_BACKTEST_CANDIDATES, COLL_BACKTEST_BATCHES,
     COLL_STRATEGY_PAIR_ANALYSES, COLL_ENSEMBLE_DECISIONS,
-    COLL_NEWS_VETO_DECISIONS,
+    COLL_NEWS_VETO_DECISIONS, COLL_PENDING_ORDERS,
     next_id,
 )
 from .models import (
     AdaptationLog, AppSetting, BacktestBatch, BacktestCandidate,
     BacktestResult, EnsembleDecision, NewsVetoDecision, ParameterVersion,
-    StrategyPairAnalysis, Strategy, Trade,
+    PendingOrder, StrategyPairAnalysis, Strategy, Trade,
 )
 
 
@@ -150,6 +150,64 @@ def get_recent_closed_trades_for_strategy(
 
 # Alias used by startup_checks and other services
 get_recent_closed_trades = get_recent_closed_trades_for_strategy
+
+
+# ---------------------------------------------------------------------------
+# Pending Order CRUD
+# ---------------------------------------------------------------------------
+
+def create_pending_order(db: Database, fields: dict) -> PendingOrder:
+    """Insert a new pending-order document (status PENDING by default)."""
+    fields = dict(fields)
+    fields.setdefault("created_at", datetime.utcnow())
+    fields.setdefault("status", "PENDING")
+    fields.pop("resolved_at", None)
+    fields["_id"] = next_id(db, COLL_PENDING_ORDERS)
+    db[COLL_PENDING_ORDERS].insert_one(fields)
+    return PendingOrder.from_doc(fields)
+
+
+def get_active_pending_orders(
+    db: Database, symbol: str | None = None
+) -> list[PendingOrder]:
+    """Return all still-pending orders, optionally filtered by symbol."""
+    query: dict = {"status": "PENDING"}
+    if symbol:
+        query["symbol"] = symbol
+    docs = db[COLL_PENDING_ORDERS].find(query).sort("created_at", -1)
+    return [PendingOrder.from_doc(d) for d in docs]
+
+
+def get_pending_order_by_ticket(
+    db: Database, ticket: int
+) -> PendingOrder | None:
+    doc = db[COLL_PENDING_ORDERS].find_one({"mt5_ticket": ticket, "status": "PENDING"})
+    return PendingOrder.from_doc(doc) if doc else None
+
+
+def resolve_pending_order(
+    db: Database, order_id: int, status: str, reason: str | None = None
+) -> None:
+    """Mark a pending order FILLED / CANCELLED / EXPIRED with a reason."""
+    update: dict = {"status": status, "resolved_at": datetime.utcnow()}
+    if reason is not None:
+        update["cancel_reason"] = reason
+    db[COLL_PENDING_ORDERS].update_one({"_id": order_id}, {"$set": update})
+
+
+def get_resolved_pending_orders(
+    db: Database, limit: int = 100, statuses: list[str] | None = None
+) -> list[PendingOrder]:
+    """Return recently resolved pending orders (default CANCELLED + EXPIRED)
+    for the cancellation report."""
+    statuses = statuses or ["CANCELLED", "EXPIRED"]
+    docs = (
+        db[COLL_PENDING_ORDERS]
+        .find({"status": {"$in": statuses}})
+        .sort("resolved_at", -1)
+        .limit(limit)
+    )
+    return [PendingOrder.from_doc(d) for d in docs]
 
 
 def get_stats(db: Database) -> dict:
@@ -793,6 +851,29 @@ def seed_default_settings(db: Database) -> None:
         "duplicate_confidence_escalation": "0.10",
     }
 
+    # ── Pending limit orders ──────────────────────────────────────────────
+    pending_order_defaults: dict[str, str] = {
+        # Master switch. Default OFF — until enabled, all orders stay market.
+        "pending_orders_enabled": "false",
+        # Minimum distance (in ATR multiples) the limit must sit from current
+        # price on the favourable side to justify a pending limit vs a market fill.
+        "pending_entry_min_distance_atr": "0.25",
+        # Pullback distance (in ATR multiples) used to synthesise the limit entry
+        # when the strategy doesn't supply its own proposed entry.
+        "pending_entry_offset_atr": "0.5",
+        # Cancel an unfilled limit once price has travelled this fraction of the
+        # entry→tp1 distance in-favour (missed-entry guard). 0.40 = 40%.
+        "pending_miss_entry_fraction": "0.40",
+        # How often (seconds) the pending-order monitor evaluates open pendings.
+        "pending_order_monitor_interval_seconds": "15",
+        # Safety auto-cancel after this many minutes. 0 = disabled.
+        "pending_order_max_age_minutes": "0",
+        # Cancel an opposite-direction pending when the ensemble resolves a reversal.
+        "pending_cancel_on_opposite_signal": "true",
+        # Cancel an opposite-direction pending when opposing news drives the signal.
+        "pending_cancel_on_opposing_news": "true",
+    }
+
     per_strategy_defaults: dict[str, str] = {
         "qualify_threshold_win_rate": "55.0",
         "score_weight_win_rate": "0.6",
@@ -842,6 +923,9 @@ def seed_default_settings(db: Database) -> None:
         _maybe_insert(key, value)
 
     for key, value in position_mgmt_defaults.items():
+        _maybe_insert(key, value)
+
+    for key, value in pending_order_defaults.items():
         _maybe_insert(key, value)
 
     for strategy_name in STRATEGY_REGISTRY.keys():

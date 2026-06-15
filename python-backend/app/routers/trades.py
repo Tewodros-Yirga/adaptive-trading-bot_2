@@ -121,6 +121,49 @@ def closed_trades(
 
 
 # ---------------------------------------------------------------------------
+# Pending limit orders  — MUST be before /{trade_id} to avoid route conflict
+# ---------------------------------------------------------------------------
+
+def _pending_to_dict(p) -> dict:
+    return {
+        "id": p.id,
+        "symbol": p.symbol,
+        "direction": p.direction,
+        "order_type": p.order_type,
+        "limit_price": p.limit_price,
+        "stop_loss": p.stop_loss,
+        "tp1": p.tp1,
+        "tp2": p.tp2,
+        "lot_size": p.lot_size,
+        "mt5_ticket": p.mt5_ticket,
+        "strategy_name": p.strategy_name,
+        "status": p.status,
+        "cancel_reason": p.cancel_reason,
+        "created_at": p.created_at,
+        "resolved_at": p.resolved_at,
+    }
+
+
+@router.get("/pending")
+def pending_orders(db: Database = Depends(get_db)):
+    """Currently resting (status PENDING) limit orders."""
+    return [_pending_to_dict(p) for p in crud.get_active_pending_orders(db)]
+
+
+@router.get("/pending/history")
+def pending_order_history(
+    limit: int = Query(100, ge=1, le=1000),
+    db: Database = Depends(get_db),
+):
+    """Resolved pending orders (CANCELLED / EXPIRED) with their reason — the
+    cancellation report surfaced on the Trades page."""
+    return [
+        _pending_to_dict(p)
+        for p in crud.get_resolved_pending_orders(db, limit)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # GET /trades/analytics  — MUST be before /{trade_id} to avoid route conflict
 # ---------------------------------------------------------------------------
 
