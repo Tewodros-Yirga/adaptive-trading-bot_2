@@ -435,6 +435,18 @@ def positions():
     return {"positions": _get_positions_full()}
 
 
+@app.get("/orders", dependencies=[Depends(require_secret)])
+def orders():
+    """List live pending orders (BUY_LIMIT / SELL_LIMIT / BUY_STOP / SELL_STOP)."""
+    try:
+        return {"orders": adapter.orders()}
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "not connected" in err_msg or "ipc not ready" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
+
+
 
 def _get_positions_full():
     """

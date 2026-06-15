@@ -677,6 +677,60 @@ class MT5Adapter:
                 continue
         return out
 
+    def orders(self) -> list[dict[str, Any]]:
+        """List live pending orders (BUY_LIMIT / SELL_LIMIT / BUY_STOP / SELL_STOP)."""
+        self.ensure_connection()
+        if self._mt is None or not self.connected:
+            return []
+        rows = None
+        for _ord_attempt in range(2):
+            try:
+                rows = self._mt.orders_get()
+                break
+            except Exception as exc:
+                if _ord_attempt == 0:
+                    logger.warning("orders_get() exception (retrying in 2s): %s", exc)
+                    time.sleep(2)
+                    continue
+                self.connected = False
+                self._mt = None
+                raise RuntimeError(f"mt5 orders_get exception: {exc}") from exc
+        if rows is None:
+            return []
+
+        def _s(obj, attr, default=0.0):
+            try:
+                return getattr(obj, attr)
+            except AttributeError:
+                return default
+
+        # MT5 order type ints → names (2-5 are the pending types).
+        _TYPE_NAMES = {
+            2: "BUY_LIMIT", 3: "SELL_LIMIT", 4: "BUY_STOP", 5: "SELL_STOP",
+        }
+        out = []
+        for o in rows:
+            try:
+                type_int = int(_s(o, "type", -1))
+                # volume_current is the live remaining volume on a pending order.
+                volume = _s(o, "volume_current", None)
+                if volume is None:
+                    volume = _s(o, "volume_initial", 0.0)
+                out.append({
+                    "ticket":    _s(o, "ticket",     0),
+                    "symbol":    _s(o, "symbol",     ""),
+                    "type":      _TYPE_NAMES.get(type_int, str(type_int)),
+                    "volume":    volume,
+                    "price":     _s(o, "price_open", 0.0),
+                    "sl":        _s(o, "sl",         0.0),
+                    "tp":        _s(o, "tp",         0.0),
+                    "timeSetup": _s(o, "time_setup", 0),
+                })
+            except Exception as row_exc:
+                logger.warning("skipping malformed order row: %s", row_exc)
+                continue
+        return out
+
     def _resolve_symbol_tick(self, symbol: str):
         """Select symbol in Market Watch and return its tick, trying broker suffix variants."""
         def _alt(s: str) -> str | None:
