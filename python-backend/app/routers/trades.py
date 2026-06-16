@@ -360,6 +360,20 @@ def modify_trade(
     if update_fields:
         db[COLL_TRADES].update_one({"_id": trade_id}, {"$set": update_fields})
 
+    try:
+        from ..services.alerts import notify_trade_operation
+        notify_trade_operation(
+            db, "modify",
+            symbol=doc.get("symbol"),
+            direction=doc.get("direction"),
+            stop_loss=new_sl,
+            take_profit=new_tp,
+            ticket=int(mt5_ticket),
+            trade_id=trade_id,
+        )
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "trade_id": trade_id,
@@ -408,6 +422,23 @@ def close_partial_trade(
         lot_size=float(volume),
         partial=True,
     )
+
+    try:
+        from ..services.alerts import notify_trade_operation
+        notify_trade_operation(
+            db, "close_partial",
+            symbol=doc.get("symbol"),
+            direction=doc.get("direction"),
+            lot_size=float(volume),
+            ticket=int(mt5_ticket),
+            trade_id=trade_id,
+            extra={
+                "closed_volume": result.get("closedVolume"),
+                "remain_volume": result.get("remainVolume"),
+            },
+        )
+    except Exception:
+        pass
 
     return {
         "status": "ok",

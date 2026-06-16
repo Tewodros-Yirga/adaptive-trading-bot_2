@@ -29,6 +29,16 @@ from .models import (
 # Trade CRUD
 # ---------------------------------------------------------------------------
 
+def _notify_trade_op(db: Database, operation: str, **fields) -> None:
+    """Best-effort 'trade_operations' alert. Lazy import avoids a crud↔alerts
+    circular import; never raises into persistence logic."""
+    try:
+        from .services.alerts import notify_trade_operation
+        notify_trade_operation(db, operation, **fields)
+    except Exception:
+        pass
+
+
 def log_trade(db: Database, fields: dict) -> Trade:
     """
     Insert a new trade document.
@@ -47,6 +57,17 @@ def log_trade(db: Database, fields: dict) -> Trade:
     fields.pop("closed_at", None)
     fields["_id"] = next_id(db, COLL_TRADES)
     db[COLL_TRADES].insert_one(fields)
+    _notify_trade_op(
+        db, "open",
+        symbol=fields.get("symbol"),
+        direction=fields.get("direction"),
+        lot_size=fields.get("lot_size"),
+        price=fields.get("entry_price"),
+        stop_loss=fields.get("stop_loss"),
+        take_profit=fields.get("take_profit"),
+        ticket=fields.get("mt5_ticket"),
+        trade_id=fields["_id"],
+    )
     return Trade.from_doc(fields)
 
 
@@ -98,6 +119,17 @@ def close_trade(
         update["mt5_ticket"] = mt5_ticket
     db[COLL_TRADES].update_one({"_id": trade_id}, {"$set": update})
     doc.update(update)
+    _notify_trade_op(
+        db, "close",
+        symbol=doc.get("symbol"),
+        direction=doc.get("direction"),
+        lot_size=doc.get("lot_size"),
+        price=exit_price,
+        ticket=doc.get("mt5_ticket"),
+        trade_id=trade_id,
+        pnl=pnl,
+        result=result,
+    )
     return Trade.from_doc(doc)
 
 

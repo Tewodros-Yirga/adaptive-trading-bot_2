@@ -118,6 +118,18 @@ def _run_once(db) -> int:
             tp = _num(pos, "tp", "takeProfit", "take_profit")
             bridge_client.modify_position(int(ticket), stop_loss=new_sl, take_profit=tp)
             moved += 1
+            try:
+                from .alerts import notify_trade_operation
+                notify_trade_operation(
+                    db, "modify",
+                    symbol=pos.get("symbol"),
+                    stop_loss=new_sl,
+                    take_profit=tp,
+                    ticket=int(ticket),
+                    extra={"source": "trailing_stop"},
+                )
+            except Exception:
+                pass
             logger.info(
                 "trailing_manager: moved SL for ticket %s (%s) -> %.5f",
                 ticket, pos.get("symbol"), new_sl,

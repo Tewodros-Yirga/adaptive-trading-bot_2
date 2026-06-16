@@ -214,6 +214,18 @@ def cancel_pending(db: Database, pending_order, reason: str) -> bool:
         return False
 
     crud.resolve_pending_order(db, int(pending_order.id), "CANCELLED", reason)
+    try:
+        from .alerts import notify_trade_operation
+        notify_trade_operation(
+            db, "cancel",
+            symbol=pending_order.symbol,
+            direction=pending_order.order_type,
+            ticket=int(ticket) if ticket is not None else None,
+            trade_id=int(pending_order.id),
+            extra={"reason": reason},
+        )
+    except Exception:
+        pass
     logger.info(
         "Cancelled pending %s %s ticket=%s reason=%s",
         pending_order.symbol, pending_order.order_type, ticket, reason,

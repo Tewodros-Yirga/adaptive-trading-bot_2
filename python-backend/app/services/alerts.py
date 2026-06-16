@@ -54,7 +54,21 @@ logger = logging.getLogger("alerts")
 _LEVELS = {"info": 10, "warning": 20, "critical": 30}
 
 # In-memory per-event throttle (monotonic clock; resets on process restart).
+# Keys are usually event names, but high-cardinality events (e.g. one per trade
+# ticket) pass a distinct throttle_key, so the dict is pruned to stay bounded.
 _last_forwarded: dict[str, float] = {}
+_THROTTLE_MAX_KEYS = 2000
+
+
+def _prune_throttle(now: float, throttle: float) -> None:
+    """Drop throttle keys older than the cooldown window once the dict grows
+    large. Such keys can no longer suppress anything, so removing them is safe
+    and keeps memory bounded under high-cardinality throttle keys."""
+    if len(_last_forwarded) <= _THROTTLE_MAX_KEYS:
+        return
+    cutoff = now - throttle
+    for k in [k for k, ts in _last_forwarded.items() if ts < cutoff]:
+        _last_forwarded.pop(k, None)
 
 # Per-host cache of the last IPv4 edge address that completed a TLS handshake.
 # api.telegram.org is served by a rotating pool of edge IPs and on container
@@ -634,11 +648,18 @@ def dispatch_alert(
     event: str,
     message: str,
     context: dict[str, Any] | None = None,
+    throttle_key: str | None = None,
 ) -> None:
     """Emit a structured event and best-effort forward it to configured channels.
 
     `level` is one of "info" | "warning" | "critical". Safe to call from any
     sync context; it never raises.
+
+    `throttle_key` overrides the key used for the per-event forward cooldown
+    (defaults to `event`). High-cardinality events (e.g. one per trade ticket)
+    pass a distinct key so unrelated operations don't suppress each other, while
+    repeats sharing a key (e.g. trailing-stop modifies on one ticket) stay
+    throttled. The allow-list and structured log line always use `event`.
     """
     level = level if level in _LEVELS else "info"
 
@@ -653,15 +674,22 @@ def dispatch_alert(
         pass
 
     try:
-        min_level = str(crud.get_setting(db, "alerts_min_level") or "warning").lower()
-        if _LEVELS[level] < _LEVELS.get(min_level, 20):
-            return
-
         # Optional per-event allow-list. Empty or "all" → forward everything.
+        # Evaluated before the min_level floor so that explicitly enabling an
+        # event opts it in regardless of its level (e.g. info-level
+        # trade_operations with the default min_level of "warning").
         allow_raw = str(crud.get_setting(db, "alerts_enabled_events") or "").strip().lower()
+        explicitly_allowed = False
         if allow_raw and allow_raw != "all":
             allowed = {e.strip() for e in allow_raw.split(",") if e.strip()}
             if event.lower() not in allowed:
+                return
+            explicitly_allowed = True
+
+        # min_level floor — bypassed for events the operator explicitly allow-listed.
+        if not explicitly_allowed:
+            min_level = str(crud.get_setting(db, "alerts_min_level") or "warning").lower()
+            if _LEVELS[level] < _LEVELS.get(min_level, 20):
                 return
 
         channels = _enabled_channels(db)
@@ -670,10 +698,12 @@ def dispatch_alert(
 
         throttle = float(crud.get_setting(db, "alerts_throttle_seconds") or 300)
         now = time.monotonic()
-        last = _last_forwarded.get(event, 0.0)
+        tkey = throttle_key or event
+        last = _last_forwarded.get(tkey, 0.0)
         if now - last < throttle:
             return
-        _last_forwarded[event] = now
+        _last_forwarded[tkey] = now
+        _prune_throttle(now, throttle)
 
         # Hand off to the background worker so a slow/blocked egress never
         # stalls the caller and transient failures are retried automatically.
@@ -681,3 +711,111 @@ def dispatch_alert(
             _enqueue_delivery(channel, cfg, level, event, message, context)
     except Exception as exc:
         logger.debug("dispatch_alert failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Trade/order operation notifications.
+#
+# Fired from every trade/order operation site so an operator who enables the
+# "trade_operations" event in alerts_enabled_events is notified of each open,
+# close, modify and cancel. Dispatched at "info" with a per-operation throttle
+# key so distinct operations never suppress one another, while repeats on one
+# ticket (e.g. trailing-stop modifies) are coalesced by the normal cooldown.
+# ---------------------------------------------------------------------------
+TRADE_OPERATIONS_EVENT = "trade_operations"
+
+_OP_EMOJI = {
+    "open": "🟢",
+    "close": "🔴",
+    "close_partial": "🟠",
+    "modify": "✏️",
+    "cancel": "🚫",
+}
+
+
+def _fmt_num(value: Any) -> str | None:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return None
+
+
+def notify_trade_operation(
+    db: Database,
+    operation: str,
+    *,
+    symbol: str | None = None,
+    direction: str | None = None,
+    lot_size: float | None = None,
+    price: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    ticket: int | None = None,
+    trade_id: int | None = None,
+    pnl: float | None = None,
+    result: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort 'trade_operations' alert for one trade/order operation.
+
+    Never raises into trading/persistence logic. `operation` is one of
+    open | close | close_partial | modify | cancel.
+    """
+    try:
+        emoji = _OP_EMOJI.get(operation, "•")
+        verb = {
+            "open": "Opened",
+            "close": "Closed",
+            "close_partial": "Partially closed",
+            "modify": "Modified",
+            "cancel": "Cancelled",
+        }.get(operation, operation.capitalize())
+
+        # Build a compact human-readable summary, skipping absent fields.
+        head_bits = [b for b in (direction, symbol) if b]
+        lots = _fmt_num(lot_size)
+        if lots:
+            head_bits.append(f"{lots} lots")
+        head = " ".join(head_bits) or (symbol or "order")
+
+        tail: list[str] = []
+        px = _fmt_num(price)
+        if px:
+            tail.append(f"@ {px}")
+        sl, tp = _fmt_num(stop_loss), _fmt_num(take_profit)
+        if sl or tp:
+            tail.append(f"(SL {sl or '—'} / TP {tp or '—'})")
+        if pnl is not None and (pnlf := _fmt_num(pnl)) is not None:
+            tail.append(f"PnL {pnlf}")
+        if result:
+            tail.append(str(result))
+        ref = ticket if ticket is not None else trade_id
+        if ref is not None:
+            tail.append(f"#{ref}")
+
+        message = f"{emoji} {verb} {head}" + (" " + " ".join(tail) if tail else "")
+
+        context: dict[str, Any] = {
+            "operation": operation,
+            "symbol": symbol,
+            "direction": direction,
+            "lot_size": lot_size,
+            "price": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "ticket": ticket,
+            "trade_id": trade_id,
+            "pnl": pnl,
+            "result": result,
+        }
+        if extra:
+            context.update(extra)
+        context = {k: v for k, v in context.items() if v is not None}
+
+        dispatch_alert(
+            db, "info", TRADE_OPERATIONS_EVENT, message,
+            context=context,
+            throttle_key=f"{TRADE_OPERATIONS_EVENT}:{operation}:{ref}",
+        )
+    except Exception as exc:
+        logger.debug("notify_trade_operation failed: %s", exc)

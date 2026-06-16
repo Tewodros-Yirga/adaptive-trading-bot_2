@@ -9,9 +9,11 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 import httpx
+from pymongo.database import Database
 
 from ..services.bridge_client import bridge_client, BridgeUnavailableError
 from ..auth_deps import require_write_access
+from ..db import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/bridge", tags=["bridge"])
@@ -99,10 +101,20 @@ def get_bridge_status():
 
 
 @router.post("/cancel-order")
-def cancel_order(ticket: int, _w=Depends(require_write_access)):
+def cancel_order(
+    ticket: int,
+    db: Database = Depends(get_db),
+    _w=Depends(require_write_access),
+):
     """Cancel a pending (limit/stop) order by ticket — item 16."""
     try:
-        return bridge_client.cancel_order(ticket)
+        result = bridge_client.cancel_order(ticket)
+        try:
+            from ..services.alerts import notify_trade_operation
+            notify_trade_operation(db, "cancel", ticket=ticket, extra={"source": "manual"})
+        except Exception:
+            pass
+        return result
     except Exception as exc:
         _bridge_error_response(exc, "/order/cancel")
 
