@@ -47,13 +47,34 @@ async def _autotrading_watchdog_loop() -> None:
     while True:
         try:
             if ipc_ready_file.exists() and adapter.connected:
-                allowed = await asyncio.to_thread(adapter._is_trade_allowed)
-                if not allowed:
-                    logger.warning(
-                        "AutoTrading watchdog: trade_allowed=False — signalling "
-                        "dismiss loop to re-enable (Ctrl+E)"
-                    )
-                    await asyncio.to_thread(adapter._signal_reenable_autotrading)
+                diag = await asyncio.to_thread(adapter.diagnostics)
+                # Ctrl+E only fixes the AutoTrading TOGGLE. It does nothing for a
+                # broker link that is down or an account that is not logged in —
+                # and trade_allowed reads False in all three cases. So only
+                # signal the dismiss loop when the terminal is connected AND the
+                # account is logged in but the toggle is still off. Otherwise log
+                # the real blocker and back off (no point hammering Ctrl+E).
+                if not diag.get("trade_allowed"):
+                    if diag.get("terminal_connected") and diag.get("account_logged_in"):
+                        logger.warning(
+                            "AutoTrading watchdog: toggle OFF (terminal connected, "
+                            "account %s logged in) — signalling Ctrl+E re-enable",
+                            diag.get("account_login"),
+                        )
+                        await asyncio.to_thread(adapter._signal_reenable_autotrading)
+                    else:
+                        logger.error(
+                            "AutoTrading watchdog: trade_allowed=False but root "
+                            "cause is NOT the toggle — terminal_connected=%s "
+                            "account_logged_in=%s login=%s server=%s. Ctrl+E "
+                            "cannot fix this; check broker link / MT_LOGIN / "
+                            "MT_PASSWORD / MT_SERVER. diag=%s",
+                            diag.get("terminal_connected"),
+                            diag.get("account_logged_in"),
+                            diag.get("account_login"),
+                            diag.get("account_server"),
+                            diag,
+                        )
         except Exception as exc:
             logger.debug("AutoTrading watchdog iteration failed: %s", exc)
         await asyncio.sleep(interval)
@@ -220,6 +241,13 @@ def _wine_mt5_ipc_probe_script(
 # ---------------------------------------------------------------------------
 # Debug endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/debug/diagnostics", dependencies=[Depends(require_secret)])
+def debug_diagnostics():
+    """One-shot state snapshot to tell apart the look-alike failure modes:
+    broker link down vs account not logged in vs AutoTrading toggle off."""
+    return adapter.diagnostics()
+
 
 @app.get("/debug/mt5", dependencies=[Depends(require_secret)])
 def debug_mt5():

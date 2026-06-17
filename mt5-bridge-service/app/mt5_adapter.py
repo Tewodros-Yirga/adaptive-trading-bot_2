@@ -153,6 +153,59 @@ class MT5Adapter:
             pass
         return False
 
+    def _mark_disconnected(self) -> None:
+        """Flag the connection for rebuild WITHOUT nulling the shared handle.
+
+        ``self._mt`` is a single mt5linux connection shared by every concurrent
+        request thread. Nulling it from one failing request makes all the OTHER
+        in-flight requests crash with "'NoneType' object has no attribute ..."
+        (exactly the cascade seen in production: one transient account_info()
+        hiccup took out concurrent /candles calls). Instead we only clear
+        ``connected``; ensure_connection() rebuilds and swaps in a fresh client
+        atomically on the next call, and meanwhile calls on the possibly-stale
+        handle fail gracefully and are caught/retried — never AttributeError.
+        """
+        self.connected = False
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Snapshot the terminal + account state for debugging.
+
+        Distinguishes the three failure modes that all *look* the same from the
+        HTTP side (candles 502, trade_allowed=False, watchdog spam):
+          * terminal_connected=False → broker/data link down (history empty)
+          * account_logged_in=False  → auth failure (wrong login/password/server)
+          * trade_allowed=False      → AutoTrading toggle off
+        Best-effort — every field degrades to None/"error" rather than raising.
+        """
+        diag: dict[str, Any] = {
+            "ipc_connected": self.connected,
+            "last_error": self.last_error,
+            "last_error_class": self.last_error_class,
+            "terminal_connected": None,  # broker/data feed link
+            "trade_allowed": None,       # AutoTrading toggle
+            "account_logged_in": None,
+            "account_login": None,
+            "account_server": None,
+        }
+        try:
+            if self._mt is not None:
+                tinfo = self._mt.terminal_info()
+                if tinfo is not None:
+                    diag["terminal_connected"] = bool(getattr(tinfo, "connected", False))
+                    diag["trade_allowed"] = bool(getattr(tinfo, "trade_allowed", False))
+        except Exception as exc:
+            diag["terminal_info_error"] = str(exc)
+        try:
+            if self._mt is not None:
+                ainfo = self._mt.account_info()
+                if ainfo is not None:
+                    diag["account_logged_in"] = bool(getattr(ainfo, "login", 0))
+                    diag["account_login"] = getattr(ainfo, "login", None)
+                    diag["account_server"] = getattr(ainfo, "server", None)
+        except Exception as exc:
+            diag["account_info_error"] = str(exc)
+        return diag
+
     @staticmethod
     def _signal_reenable_autotrading() -> None:
         """
@@ -648,12 +701,10 @@ class MT5Adapter:
                     logger.warning("account_info() exception (retrying in 2s): %s", exc)
                     time.sleep(2)
                     continue
-                self.connected = False
-                self._mt = None
+                self._mark_disconnected()
                 raise RuntimeError(f"mt5 account_info exception: {exc}") from exc
         if info is None:
-            self.connected = False
-            self._mt = None
+            self._mark_disconnected()
             raise RuntimeError(f"mt5 account_info failed: {self._last_error_repr()}")
         return {
             "balance": info.balance,
@@ -679,8 +730,7 @@ class MT5Adapter:
                     logger.warning("positions_get() exception (retrying in 2s): %s", exc)
                     time.sleep(2)
                     continue
-                self.connected = False
-                self._mt = None
+                self._mark_disconnected()
                 raise RuntimeError(f"mt5 positions_get exception: {exc}") from exc
         if rows is None:
             return []
@@ -726,8 +776,7 @@ class MT5Adapter:
                     logger.warning("orders_get() exception (retrying in 2s): %s", exc)
                     time.sleep(2)
                     continue
-                self.connected = False
-                self._mt = None
+                self._mark_disconnected()
                 raise RuntimeError(f"mt5 orders_get exception: {exc}") from exc
         if rows is None:
             return []
@@ -1148,8 +1197,7 @@ class MT5Adapter:
                         "copy_rates_range exception (attempt %d/%d) for %s %s: %s",
                         data_attempt + 1, _DATA_RETRIES, sym, timeframe, exc,
                     )
-                    self.connected = False
-                    self._mt = None
+                    self._mark_disconnected()
                     raise RuntimeError(f"copy_rates_range exception: {exc}") from exc
 
             if rates is not None and (not hasattr(rates, '__len__') or len(rates) > 0):
