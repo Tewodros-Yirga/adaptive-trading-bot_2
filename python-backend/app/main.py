@@ -74,6 +74,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not seed default settings: {e}")
 
+    # ── 5b. Sync active MT5 account (scopes trade/order data per account) ──
+    # Mirror the bridge's login into AppSettings and, on first run, backfill
+    # legacy trades/orders to it. Best-effort — bridge may be down at boot, in
+    # which case the first GET /bridge/account performs the sync instead.
+    try:
+        db = get_database()
+        from .crud import sync_active_account
+        from .services.bridge_client import bridge_client
+        acct = bridge_client.get_account()
+        sync_active_account(db, acct.get("login"))
+        logger.info("Active MT5 account synced: %s", acct.get("login"))
+    except Exception as e:
+        logger.warning(f"Could not sync active MT5 account at startup: {e}")
+
     # ── 6. Run startup health checks ───────────────────────────────────────
     try:
         db = get_database()

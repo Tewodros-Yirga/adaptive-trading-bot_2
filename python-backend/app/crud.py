@@ -39,6 +39,81 @@ def _notify_trade_op(db: Database, operation: str, **fields) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Active-account scoping
+#
+# Trade/order data is tagged with the MT5 account (login) it belongs to so that
+# risk, drawdown, daily-loss and dashboards are computed per account. The active
+# account is mirrored from the bridge into the `active_mt5_account` AppSetting
+# (cheap to read on hot paths). When the account is unknown the filter is empty,
+# preserving the original unscoped behaviour.
+# ---------------------------------------------------------------------------
+
+ACTIVE_ACCOUNT_KEY = "active_mt5_account"
+
+
+def get_active_account(db: Database) -> int | None:
+    """Return the currently active MT5 account login, or None if not yet known."""
+    raw = get_setting(db, ACTIVE_ACCOUNT_KEY)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _account_filter(db: Database) -> dict:
+    """Mongo query fragment scoping a read to the active account.
+
+    Returns ``{"mt5_account": <login>}`` when the active account is known, else
+    an empty dict (legacy unscoped behaviour)."""
+    acct = get_active_account(db)
+    return {"mt5_account": acct} if acct is not None else {}
+
+
+def sync_active_account(db: Database, login: int | str | None) -> None:
+    """Idempotently mirror the bridge's account login into AppSettings.
+
+    - First time (setting missing): store it AND backfill every existing trade /
+      pending order that has no ``mt5_account`` to this login (one-time migration
+      that attributes all pre-existing data to whatever account is live now).
+    - Account switched (setting present but different): store the new login and
+      do NOT backfill — the new account is intentionally fresh.
+    - Unchanged: no-op.
+    """
+    if login is None or str(login).strip() == "":
+        return
+    try:
+        login_int = int(str(login).strip())
+    except (TypeError, ValueError):
+        return
+
+    stored = get_active_account(db)
+    if stored == login_int:
+        return
+
+    set_setting(db, ACTIVE_ACCOUNT_KEY, str(login_int))
+
+    if stored is None:
+        # One-time backfill: tag legacy (untagged) docs to the current account.
+        for coll in (COLL_TRADES, COLL_PENDING_ORDERS):
+            db[coll].update_many(
+                {"mt5_account": {"$exists": False}},
+                {"$set": {"mt5_account": login_int}},
+            )
+
+
+def clear_account_data(db: Database, account: int) -> dict:
+    """Delete all trades and pending orders belonging to one MT5 account.
+
+    Returns counts of deleted documents. Scoped strictly by ``mt5_account`` so a
+    different account's history is never touched."""
+    trades_deleted = db[COLL_TRADES].delete_many({"mt5_account": account}).deleted_count
+    orders_deleted = db[COLL_PENDING_ORDERS].delete_many({"mt5_account": account}).deleted_count
+    return {"trades_deleted": trades_deleted, "orders_deleted": orders_deleted}
+
+
 def log_trade(db: Database, fields: dict) -> Trade:
     """
     Insert a new trade document.
@@ -53,6 +128,10 @@ def log_trade(db: Database, fields: dict) -> Trade:
     fields = dict(fields)
     fields.setdefault("opened_at", datetime.utcnow())
     fields.setdefault("result", "OPEN")
+    # Tag with the active MT5 account so risk/stats stay scoped per account.
+    acct = get_active_account(db)
+    if acct is not None:
+        fields.setdefault("mt5_account", acct)
     # Never persist closed_at on a freshly opened trade
     fields.pop("closed_at", None)
     fields["_id"] = next_id(db, COLL_TRADES)
@@ -143,7 +222,7 @@ def get_recent_trades(db: Database, limit: int = 50) -> list[Trade]:
     """
     docs = (
         db[COLL_TRADES]
-        .find({"closed_at": {"$exists": False}})
+        .find({"closed_at": {"$exists": False}, **_account_filter(db)})
         .sort("opened_at", -1)
         .limit(limit)
     )
@@ -161,6 +240,7 @@ def get_closed_trades(db: Database, limit: int = 100) -> list[Trade]:
         .find({
             "result": {"$in": ["WIN", "LOSS", "BLOCKED"]},
             "closed_at": {"$exists": True},
+            **_account_filter(db),
         })
         .sort("closed_at", -1)
         .limit(limit)
@@ -173,6 +253,8 @@ def get_recent_closed_trades_for_strategy(
 ) -> list[Trade]:
     docs = (
         db[COLL_TRADES]
+        # Strategy live-score learning pools across ALL accounts (not account-scoped):
+        # a strategy's edge is independent of which MT5 account traded it.
         .find({"result": {"$in": ["WIN", "LOSS"]}, "strategy_name": strategy_name})
         .sort("closed_at", -1)
         .limit(limit)
@@ -193,6 +275,9 @@ def create_pending_order(db: Database, fields: dict) -> PendingOrder:
     fields = dict(fields)
     fields.setdefault("created_at", datetime.utcnow())
     fields.setdefault("status", "PENDING")
+    acct = get_active_account(db)
+    if acct is not None:
+        fields.setdefault("mt5_account", acct)
     fields.pop("resolved_at", None)
     fields["_id"] = next_id(db, COLL_PENDING_ORDERS)
     db[COLL_PENDING_ORDERS].insert_one(fields)
@@ -203,7 +288,7 @@ def get_active_pending_orders(
     db: Database, symbol: str | None = None
 ) -> list[PendingOrder]:
     """Return all still-pending orders, optionally filtered by symbol."""
-    query: dict = {"status": "PENDING"}
+    query: dict = {"status": "PENDING", **_account_filter(db)}
     if symbol:
         query["symbol"] = symbol
     docs = db[COLL_PENDING_ORDERS].find(query).sort("created_at", -1)
@@ -213,7 +298,9 @@ def get_active_pending_orders(
 def get_pending_order_by_ticket(
     db: Database, ticket: int
 ) -> PendingOrder | None:
-    doc = db[COLL_PENDING_ORDERS].find_one({"mt5_ticket": ticket, "status": "PENDING"})
+    doc = db[COLL_PENDING_ORDERS].find_one(
+        {"mt5_ticket": ticket, "status": "PENDING", **_account_filter(db)}
+    )
     return PendingOrder.from_doc(doc) if doc else None
 
 
@@ -235,7 +322,7 @@ def get_resolved_pending_orders(
     statuses = statuses or ["CANCELLED", "EXPIRED"]
     docs = (
         db[COLL_PENDING_ORDERS]
-        .find({"status": {"$in": statuses}})
+        .find({"status": {"$in": statuses}, **_account_filter(db)})
         .sort("resolved_at", -1)
         .limit(limit)
     )
@@ -259,14 +346,15 @@ def get_stats(db: Database) -> dict:
     today_start = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+    filt = _account_filter(db)
 
     if not trades:
         # Still compute today/open counts even with no closed trades
         today_pnl = 0.0
         today_trades = db[COLL_TRADES].count_documents({
-            "opened_at": {"$gte": today_start},
+            "opened_at": {"$gte": today_start}, **filt,
         })
-        open_trades = db[COLL_TRADES].count_documents({"closed_at": {"$exists": False}})
+        open_trades = db[COLL_TRADES].count_documents({"closed_at": {"$exists": False}, **filt})
         return {
             "total_trades": 0,
             "wins": 0,
@@ -314,11 +402,11 @@ def get_stats(db: Database) -> dict:
 
     # Today's opened trade count (open + closed that started today)
     today_trades = db[COLL_TRADES].count_documents({
-        "opened_at": {"$gte": today_start},
+        "opened_at": {"$gte": today_start}, **filt,
     })
 
     # Currently open positions
-    open_trades = db[COLL_TRADES].count_documents({"closed_at": {"$exists": False}})
+    open_trades = db[COLL_TRADES].count_documents({"closed_at": {"$exists": False}, **filt})
 
     return {
         "total_trades": len(trades),

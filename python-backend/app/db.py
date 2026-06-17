@@ -112,6 +112,7 @@ def create_indexes(db: Database) -> None:
     db[COLL_TRADES].create_index([("opened_at", DESCENDING)], background=True)
     db[COLL_TRADES].create_index([("strategy_name", ASCENDING)], background=True)
     db[COLL_TRADES].create_index([("result", ASCENDING)], background=True)
+    db[COLL_TRADES].create_index([("mt5_account", ASCENDING)], background=True)
 
     # parameter_versions
     db[COLL_PARAMETER_VERSIONS].create_index([("version", DESCENDING)], background=True)
@@ -134,6 +135,7 @@ def create_indexes(db: Database) -> None:
     db[COLL_PENDING_ORDERS].create_index([("symbol", ASCENDING)], background=True)
     db[COLL_PENDING_ORDERS].create_index([("mt5_ticket", ASCENDING)], background=True)
     db[COLL_PENDING_ORDERS].create_index([("created_at", DESCENDING)], background=True)
+    db[COLL_PENDING_ORDERS].create_index([("mt5_account", ASCENDING)], background=True)
 
     # backtest_results
     db[COLL_BACKTEST_RESULTS].create_index([("batch_id", ASCENDING)], background=True)

@@ -62,6 +62,9 @@ class Trade:
     params_version: int | None = None
     strategy_name: str | None = "DTC"
     mt5_ticket: int | None = None
+    # MT5 account (login) this trade belongs to. Stamped at open from the active
+    # account so risk/stats can be scoped per account. None on legacy docs.
+    mt5_account: int | None = None
     opened_at: datetime = field(default_factory=datetime.utcnow)
     closed_at: datetime | None = None
     # IDs of the news_items that drove the news bias at decision time. Recorded at
@@ -95,6 +98,7 @@ class Trade:
             params_version=doc.get("params_version"),
             strategy_name=doc.get("strategy_name", "DTC"),
             mt5_ticket=doc.get("mt5_ticket"),
+            mt5_account=doc.get("mt5_account"),
             opened_at=doc.get("opened_at", datetime.utcnow()),
             closed_at=doc.get("closed_at"),
             contributing_news_ids=list(doc.get("contributing_news_ids") or []),
@@ -118,6 +122,7 @@ class PendingOrder:
     tp1: float | None = None
     tp2: float | None = None
     mt5_ticket: int | None = None
+    mt5_account: int | None = None  # MT5 account (login) this order belongs to
     strategy_name: str | None = None
     status: str = "PENDING"        # PENDING / FILLED / CANCELLED / EXPIRED
     cancel_reason: str | None = None
@@ -146,6 +151,7 @@ class PendingOrder:
             tp1=doc.get("tp1"),
             tp2=doc.get("tp2"),
             mt5_ticket=doc.get("mt5_ticket"),
+            mt5_account=doc.get("mt5_account"),
             strategy_name=doc.get("strategy_name"),
             status=doc.get("status", "PENDING"),
             cancel_reason=doc.get("cancel_reason"),

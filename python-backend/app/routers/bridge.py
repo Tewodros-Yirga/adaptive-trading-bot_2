@@ -14,6 +14,7 @@ from pymongo.database import Database
 from ..services.bridge_client import bridge_client, BridgeUnavailableError
 from ..auth_deps import require_write_access
 from ..db import get_db
+from .. import crud
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/bridge", tags=["bridge"])
@@ -46,9 +47,16 @@ def _bridge_error_response(exc: Exception, endpoint: str) -> None:
 
 
 @router.get("/account")
-def get_account():
+def get_account(db: Database = Depends(get_db)):
     try:
-        return bridge_client.get_account()
+        result = bridge_client.get_account()
+        # Mirror the live login into AppSettings so trade/order data is scoped to
+        # this account. Best-effort: never let sync break the account response.
+        try:
+            crud.sync_active_account(db, result.get("login"))
+        except Exception:
+            logger.warning("sync_active_account failed", exc_info=True)
+        return result
     except Exception as exc:
         _bridge_error_response(exc, "/account")
 

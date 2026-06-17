@@ -18,6 +18,7 @@ from pymongo.database import Database
 from ..db import get_db, COLL_TRADES
 from .. import crud
 from ..models import Trade
+from ..auth_deps import require_admin
 from ..services.bridge_client import bridge_client
 
 router = APIRouter(prefix="/trades", tags=["trades"])
@@ -177,6 +178,7 @@ def trade_analytics(
     query: dict = {
         "result": {"$in": ["WIN", "LOSS"]},
         "closed_at": {"$gte": cutoff},
+        **crud._account_filter(db),
     }
     if strategy_name:
         query["strategy_name"] = strategy_name
@@ -288,6 +290,32 @@ def trade_analytics(
             "max_loss_streak": max_loss,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /trades/clear  — wipe the active account's trade/order data
+# MUST be before /{trade_id} to avoid route conflict.
+# ---------------------------------------------------------------------------
+
+@router.post("/clear")
+def clear_account_trades(
+    db: Database = Depends(get_db),
+    _admin=Depends(require_admin),
+):
+    """Delete all trades and pending orders for the currently active MT5 account.
+
+    Used when switching accounts so daily-drawdown / stats start fresh. Scoped
+    strictly to the active account — other accounts' history is untouched.
+    """
+    account = crud.get_active_account(db)
+    if account is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Active MT5 account unknown — cannot scope a clear. "
+                   "Ensure the MT5 bridge is reachable first.",
+        )
+    result = crud.clear_account_data(db, account)
+    return {"status": "ok", "account": account, **result}
 
 
 # ---------------------------------------------------------------------------
