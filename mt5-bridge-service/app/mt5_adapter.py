@@ -60,6 +60,11 @@ _ORDER_MIN_GAP_AFTER_RATELIMIT = float(os.environ.get("MT5_ORDER_MIN_GAP_SECONDS
 _last_order_send_at: float = 0.0          # monotonic timestamp of last send
 _order_cooldown_until: float = 0.0        # monotonic timestamp: don't send before this
 
+# Wall-clock budget for recovering from an AutoTrading-disabled (10027/10026)
+# rejection. The backend's order client reads with a 60s timeout, so all
+# re-enable signalling + polling must finish comfortably inside that window.
+_DISABLE_RECOVERY_BUDGET_S = float(os.environ.get("MT5_DISABLE_RECOVERY_BUDGET_SECONDS", "40"))
+
 
 class MT5Adapter:
     def __init__(self) -> None:
@@ -288,6 +293,8 @@ class MT5Adapter:
 
         with _ORDER_LOCK:
             result = None
+            # Set on the first 10027/10026 hit; bounds total re-enable time.
+            disable_deadline: float | None = None
             for attempt in range(_MAX_RETRIES):
                 # Honour any active cooldown before sending
                 now = time.monotonic()
@@ -330,42 +337,69 @@ class MT5Adapter:
                     )
 
                 if result.retcode in (_RETCODE_CLIENT_DISABLES, _RETCODE_SERVER_DISABLES):
-                    # ── IPC EA-auth is stale / corrupted ──────────────────
-                    # The terminal's AutoTrading button may be green, but the
-                    # IPC session has lost EA authorization (Wine shared-memory
-                    # bug).
+                    # ── AutoTrading disabled / EA-auth lost ───────────────
+                    # Two distinct sub-cases, told apart by terminal_info()
+                    # .trade_allowed. The previous code applied a bare
+                    # mt5.initialize() to BOTH, but that cannot help the more
+                    # common case (a), so orders failed permanently:
                     #
-                    # Strategy: refresh the IPC session with a BARE
-                    # mt5.initialize() — NO credentials, NO shutdown first.
-                    # This re-does the IPC handshake on the existing mt5linux
-                    # RPyC connection without triggering an "account change".
+                    #  (a) trade_allowed == False — the terminal's "Algo
+                    #      Trading" toggle is OFF. mt5.initialize() CANNOT turn
+                    #      it back on; only a Ctrl+E keystroke in the terminal
+                    #      UI can. We drop a sentinel file that the start.sh
+                    #      dismiss loop watches, it sends Ctrl+E, and we poll
+                    #      terminal_info().trade_allowed until it flips True.
+                    #
+                    #  (b) trade_allowed == True — toggle is on but the order
+                    #      was still rejected → the IPC EA-auth segment is
+                    #      stale (Wine shared-memory bug). A BARE
+                    #      mt5.initialize() (no credentials → no account-change
+                    #      re-poison) refreshes the handshake.
                     who = "client terminal" if result.retcode == _RETCODE_CLIENT_DISABLES else "server"
-                    if attempt < _MAX_RETRIES - 1:
+                    if disable_deadline is None:
+                        disable_deadline = time.monotonic() + _DISABLE_RECOVERY_BUDGET_S
+                    remaining = disable_deadline - time.monotonic()
+
+                    if attempt < _MAX_RETRIES - 1 and remaining > 1.0:
+                        trade_allowed = self._is_trade_allowed()
                         logger.warning(
-                            "order_send retcode=%d (EA auth stale, %s) — "
-                            "refreshing IPC session with bare initialize "
-                            "(attempt %d/%d, trade_allowed=%s)",
+                            "order_send retcode=%d (AutoTrading disabled, %s) — "
+                            "recovering (attempt %d/%d, trade_allowed=%s, "
+                            "%.0fs budget left)",
                             result.retcode, who, attempt + 1, _MAX_RETRIES,
-                            self._trade_allowed_repr(),
+                            trade_allowed, remaining,
                         )
-                        # Refresh IPC without credentials to avoid account-change poison
-                        try:
-                            ok = self._mt.initialize(timeout=30000)
+                        if not trade_allowed:
+                            # (a) Toggle OFF → drive the Ctrl+E re-enable via
+                            # the dismiss loop and wait for it to take effect.
+                            wait_t = min(remaining, 25.0)
+                            recovered = self._wait_for_trade_allowed(timeout=wait_t)
                             logger.info(
-                                "bare mt5.initialize() returned %s after retcode=%d",
-                                ok, result.retcode,
+                                "AutoTrading re-enable %s after retcode=%d",
+                                "succeeded" if recovered else "timed out",
+                                result.retcode,
                             )
-                        except Exception as _re_exc:
-                            logger.warning(
-                                "bare mt5.initialize() failed after retcode=%d: %s",
-                                result.retcode, _re_exc,
-                            )
-                        time.sleep(2)  # brief pause for terminal to process
+                        else:
+                            # (b) Toggle ON but order rejected → stale IPC
+                            # EA-auth. Refresh without credentials.
+                            try:
+                                ok = self._mt.initialize(timeout=30000)
+                                logger.info(
+                                    "bare mt5.initialize() returned %s after retcode=%d",
+                                    ok, result.retcode,
+                                )
+                            except Exception as _re_exc:
+                                logger.warning(
+                                    "bare mt5.initialize() failed after retcode=%d: %s",
+                                    result.retcode, _re_exc,
+                                )
+                            time.sleep(2)  # brief pause for terminal to process
                         continue
                     raise AutoTradingDisabledError(
-                        f"order_send retcode={result.retcode}: EA authorization "
-                        f"stale ({who}) — exhausted {_MAX_RETRIES} bare-init "
-                        f"refresh attempts. "
+                        f"order_send retcode={result.retcode}: AutoTrading "
+                        f"disabled ({who}) — recovery exhausted after "
+                        f"{_MAX_RETRIES} attempts / "
+                        f"{_DISABLE_RECOVERY_BUDGET_S:.0f}s budget. "
                         f"trade_allowed={self._trade_allowed_repr()}."
                     )
 
@@ -731,6 +765,33 @@ class MT5Adapter:
                 continue
         return out
 
+    def _prime_history(self, sym: str, mt5_timeframe: Any) -> bool:
+        """Force MT5 to start downloading recent history for ``sym``.
+
+        A ``copy_rates_range`` over a historical date window returns nothing
+        until the bars exist in the terminal's local cache, and the range query
+        alone does not trigger that download. After a binary LiveUpdate the cache
+        is cold, so range queries stay empty forever. Requesting bars by position
+        from the most-recent end (``copy_rates_from_pos(sym, tf, 0, N)``) is the
+        standard idiom that wakes the broker-side history pull; once it lands the
+        original range query succeeds. Best-effort — never raises.
+
+        Returns True if the prime call itself returned bars (history is warming).
+        """
+        try:
+            try:
+                self._mt.symbol_select(sym, True)
+            except Exception:
+                pass
+            from_pos = getattr(self._mt, "copy_rates_from_pos", None)
+            if from_pos is None:
+                return False  # backend lacks it — degrade to passive retry
+            primed = from_pos(sym, mt5_timeframe, 0, 256)
+            return primed is not None and (not hasattr(primed, "__len__") or len(primed) > 0)
+        except Exception as exc:
+            logger.debug("_prime_history(%s) failed: %s", sym, exc)
+            return False
+
     def _resolve_symbol_tick(self, symbol: str):
         """Select symbol in Market Watch and return its tick, trying broker suffix variants."""
         def _alt(s: str) -> str | None:
@@ -1059,10 +1120,15 @@ class MT5Adapter:
         # After a terminal self-restart (e.g. LiveUpdate) the broker data
         # feed takes time to reconnect.  mt5.initialize() passes the IPC
         # probe before price/history data is available, so copy_rates_range
-        # returns None for a window of ~30s.  Retry to let the terminal sync
-        # rather than immediately returning 502 to every caller.
-        _DATA_RETRIES    = 4
-        _DATA_RETRY_SLEEP = 5  # seconds between retries
+        # returns None for a window that, after a *binary* update, can exceed a
+        # minute.  Retry to let the terminal sync rather than immediately
+        # returning 502 to every caller.  Crucially, a range query alone does
+        # not trigger the history download — on an empty result we actively
+        # prime via copy_rates_from_pos so the next attempt has bars to read.
+        # Total worst-case in-call time (~6 attempts, capped backoff) stays
+        # inside the backend candle client's 120s read timeout.
+        _DATA_RETRIES    = 6
+        _DATA_RETRY_SLEEP = 5  # base seconds between retries (capped backoff below)
 
         for data_attempt in range(_DATA_RETRIES):
             for sym in symbols_to_try:
@@ -1090,13 +1156,24 @@ class MT5Adapter:
                 break  # got data
 
             if data_attempt < _DATA_RETRIES - 1:
+                # Actively wake the broker-side history pull for each symbol
+                # variant before sleeping, so the next attempt's range query
+                # has cached bars to return.
+                for sym in symbols_to_try:
+                    if self._prime_history(sym, mt5_timeframe):
+                        logger.info(
+                            "priming history for %s %s via copy_rates_from_pos "
+                            "(range query empty, terminal cache cold)",
+                            sym, timeframe,
+                        )
+                sleep_s = min(_DATA_RETRY_SLEEP * (1 + data_attempt), 15)
                 logger.warning(
                     "copy_rates_range returned no data for %s %s "
                     "(attempt %d/%d) — terminal may still be syncing after restart; "
                     "retrying in %ds",
-                    symbol, timeframe, data_attempt + 1, _DATA_RETRIES, _DATA_RETRY_SLEEP,
+                    symbol, timeframe, data_attempt + 1, _DATA_RETRIES, sleep_s,
                 )
-                time.sleep(_DATA_RETRY_SLEEP)
+                time.sleep(sleep_s)
 
         if rates is None or (hasattr(rates, '__len__') and len(rates) == 0):
             tried = " / ".join(symbols_to_try)

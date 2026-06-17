@@ -515,8 +515,29 @@ fi
     # finite loop (old: seq 1 120 = 10 min) exits before the event fires,
     # leaving nothing to re-enable AutoTrading for the container's lifetime.
     _try=0
+    _REENABLE_SENTINEL="${LOGDIR}/mt5_reenable_autotrading"
     while true; do
       _try=$(( _try + 1 ))
+      # Step 0: On-demand AutoTrading re-enable.
+      # The bridge (mt5_adapter._wait_for_trade_allowed) writes the sentinel
+      # file ${_REENABLE_SENTINEL} when an order hit retcode 10027 with
+      # trade_allowed=False — i.e. the Algo Trading toggle is OFF and only a
+      # Ctrl+E keystroke can turn it back on. A stale sentinel (>20s old, e.g.
+      # left over after the toggle already recovered) is ignored and removed so
+      # we never spuriously toggle a healthy terminal OFF.
+      _REENABLE_REQUESTED=0
+      if [ -f "${_REENABLE_SENTINEL}" ]; then
+        _SENT_TS=$(sed -n 's/^requested_at=//p' "${_REENABLE_SENTINEL}" 2>/dev/null | head -1 | cut -d. -f1)
+        _NOW_TS=$(date +%s 2>/dev/null || echo 0)
+        if [ -n "${_SENT_TS}" ] && [ "${_NOW_TS}" -gt 0 ] 2>/dev/null \
+           && [ $(( _NOW_TS - _SENT_TS )) -le 20 ] 2>/dev/null; then
+          _REENABLE_REQUESTED=1
+          echo "[dismiss-action] iter=${_try} re-enable sentinel present (age=$(( _NOW_TS - _SENT_TS ))s)" >> "${DISMISS_LOG}"
+        else
+          rm -f "${_REENABLE_SENTINEL}" 2>/dev/null || true
+          echo "[dismiss-action] iter=${_try} removed stale re-enable sentinel" >> "${DISMISS_LOG}"
+        fi
+      fi
       # Step 1: Press Return on the currently focused window.
       # This dismisses the IPC Login/Auth dialog which is an embedded
       # Win32 modal inside the MT5 main X11 window (not a separate
@@ -642,16 +663,33 @@ fi
             _ALGO_STATE="enabled"
           fi
         fi
+        # Decide whether to send Ctrl+E. Ctrl+E is a TOGGLE, so we must only
+        # send it when the toggle is (or is very likely) OFF:
+        #   * journal says "disabled"                          → send
+        #   * bridge requested re-enable AND journal != enabled → send
+        #     (the bridge only asks when it read trade_allowed=False)
+        #   * journal unknown (log not ready) → periodic fallback
+        _CTRL_E_REASON=""
         if [ "${_ALGO_STATE}" = "disabled" ]; then
-          _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
-          _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
-          echo "[dismiss-action] iter=${_try} Algo Trading was DISABLED → sent Ctrl+E to re-enable (main_wid=${_MAIN_WID})" >> "${DISMISS_LOG}"
+          _CTRL_E_REASON="journal=disabled"
+        elif [ "${_REENABLE_REQUESTED}" = "1" ] && [ "${_ALGO_STATE}" != "enabled" ]; then
+          _CTRL_E_REASON="bridge-sentinel"
         elif [ "${_ALGO_STATE}" = "unknown" ] && [ $(( _try % 10 )) -eq 5 ]; then
           # Fallback: if we can't determine state (log not created yet),
           # try at iter 5,15,25,35... (every ~50s)
+          _CTRL_E_REASON="unknown-fallback"
+        fi
+        if [ -n "${_CTRL_E_REASON}" ]; then
           _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
           _xd key --window "${_MAIN_WID}" --clearmodifiers ctrl+e; sleep 0.1
-          echo "[dismiss-action] iter=${_try} Algo Trading state unknown → sent Ctrl+E (fallback)" >> "${DISMISS_LOG}"
+          echo "[dismiss-action] iter=${_try} sent Ctrl+E to re-enable Algo Trading (${_CTRL_E_REASON}, main_wid=${_MAIN_WID})" >> "${DISMISS_LOG}"
+        fi
+        # We had a shot at the main window this iteration, so the bridge's
+        # request has been serviced (acted on, or skipped because the journal
+        # already reads "enabled"). Clear the sentinel so it never lingers and
+        # toggles a healthy terminal OFF on a later iteration.
+        if [ "${_REENABLE_REQUESTED}" = "1" ]; then
+          rm -f "${_REENABLE_SENTINEL}" 2>/dev/null || true
         fi
       fi
       # Step 4: Enumerate ALL windows owned by the terminal process (including
