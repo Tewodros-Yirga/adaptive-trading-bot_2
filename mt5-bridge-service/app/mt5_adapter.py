@@ -468,7 +468,15 @@ class MT5Adapter:
     # Connection management
     # ------------------------------------------------------------------
 
-    def ensure_connection(self) -> None:
+    def ensure_connection(self, bare_only: bool = False) -> None:
+        # bare_only=True is used by reconnect/recovery paths (force_reconnect).
+        # It performs ONLY a credential-less re-attach and never falls back to a
+        # credentialed initialize(**creds). Passing credentials triggers an MT5
+        # "account change" event that poisons EA-auth (trade_allowed→False / order
+        # 10027) and destabilises the IPC — so we must do it at most ONCE, on the
+        # very first login. Reconnects re-attach bare to the already-logged-in
+        # terminal; a genuine logout is recovered by normal request traffic
+        # (bare_only=False) as a last resort.
         if self.connected and self._mt is not None:
             return
 
@@ -585,7 +593,10 @@ class MT5Adapter:
                                 continue
                             break
 
-                        if not ok:
+                        if not ok and not bare_only:
+                            # CREDENTIALED login — only on the initial connect.
+                            # This is the EA-auth "account change" poison source;
+                            # reconnect paths pass bare_only=True to skip it.
                             for init_attempt in range(1, 3):
                                 ok = client.initialize(**creds, timeout=60000)
                                 if ok:
@@ -687,7 +698,12 @@ class MT5Adapter:
         # Dropping the reference + a fresh initialize() re-establishes the IPC.
         self.reset_connection()
         try:
-            self.ensure_connection()
+            # bare_only=True: re-attach WITHOUT credentials so recovery never
+            # re-triggers the "account change" EA-auth poison (trade_allowed→False
+            # / 10027). The terminal is already logged in, so a bare re-attach is
+            # sufficient. If it genuinely logged out, ordinary request traffic
+            # (bare_only=False) performs the credentialed re-login as a fallback.
+            self.ensure_connection(bare_only=True)
         except Exception as exc:
             logger.warning("force_reconnect: rebuild failed (will retry next cycle): %s", exc)
         return self.connected
