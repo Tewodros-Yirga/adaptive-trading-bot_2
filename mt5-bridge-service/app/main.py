@@ -26,6 +26,39 @@ async def _background_connect_loop() -> None:
         await asyncio.sleep(60)
 
 
+async def _autotrading_watchdog_loop() -> None:
+    """Proactively keep MT5 'Algo Trading' enabled.
+
+    The terminal can flip its AutoTrading toggle OFF mid-session (a late
+    account-change event, a stray UI toggle). ``terminal_info().trade_allowed``
+    is the authoritative, real-time signal — unlike the on-disk MT5 journal,
+    which is buffered and lags by seconds/minutes. When trade_allowed reads
+    False while IPC is up, we drop the re-enable sentinel that the start.sh
+    dismiss loop watches; it then sends Ctrl+E to turn AutoTrading back on.
+
+    This heals the toggle even with zero order traffic, so order_send rarely
+    has to recover from 10027 in the first place.
+    """
+    logdir = Path(os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"))
+    ipc_ready_file = logdir / "mt5_ipc.ready"
+    interval = float(os.environ.get("MT5_AUTOTRADING_WATCHDOG_SECONDS", "20"))
+    # Let startup, IPC bring-up and the dismiss loop's own cold-start settle.
+    await asyncio.sleep(45)
+    while True:
+        try:
+            if ipc_ready_file.exists() and adapter.connected:
+                allowed = await asyncio.to_thread(adapter._is_trade_allowed)
+                if not allowed:
+                    logger.warning(
+                        "AutoTrading watchdog: trade_allowed=False — signalling "
+                        "dismiss loop to re-enable (Ctrl+E)"
+                    )
+                    await asyncio.to_thread(adapter._signal_reenable_autotrading)
+        except Exception as exc:
+            logger.debug("AutoTrading watchdog iteration failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
 async def _peer_keepalive_loop() -> None:
     base = settings.peer_healthcheck_url.strip().rstrip("/")
     if not base:
@@ -59,6 +92,7 @@ async def startup_validation() -> None:
     validate_required_settings()
     asyncio.create_task(_background_connect_loop())
     asyncio.create_task(_peer_keepalive_loop())
+    asyncio.create_task(_autotrading_watchdog_loop())
 
 
 

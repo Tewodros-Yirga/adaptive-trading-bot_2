@@ -516,6 +516,11 @@ fi
     # leaving nothing to re-enable AutoTrading for the container's lifetime.
     _try=0
     _REENABLE_SENTINEL="${LOGDIR}/mt5_reenable_autotrading"
+    # Becomes 1 the first time we successfully read the Algo-Trading state from
+    # the MT5 journal. After that we TRUST positive signals only and never
+    # blind-toggle Ctrl+E again — a blind periodic toggle oscillates a healthy
+    # ON state OFF every cycle and was disabling AutoTrading mid-session.
+    _ALGO_LOG_EVER_READ=0
     while true; do
       _try=$(( _try + 1 ))
       # Step 0: On-demand AutoTrading re-enable.
@@ -663,21 +668,29 @@ fi
             _ALGO_STATE="enabled"
           fi
         fi
+        if [ "${_ALGO_STATE}" != "unknown" ]; then
+          _ALGO_LOG_EVER_READ=1
+        fi
         # Decide whether to send Ctrl+E. Ctrl+E is a TOGGLE, so we must only
         # send it when the toggle is (or is very likely) OFF:
-        #   * journal says "disabled"                          → send
+        #   * journal says "disabled"                          → send (authoritative)
         #   * bridge requested re-enable AND journal != enabled → send
-        #     (the bridge only asks when it read trade_allowed=False)
-        #   * journal unknown (log not ready) → periodic fallback
+        #     (the bridge watchdog/order path only asks when it read
+        #      terminal_info().trade_allowed=False — a real-time truth source)
+        #   * journal unknown AND we have never managed to read it → cold-start
+        #     bootstrap only. Once the journal has EVER been readable we trust
+        #     it (and the bridge sentinel) and never blind-toggle again, so we
+        #     can't flip a healthy ON state OFF for the container's lifetime.
         _CTRL_E_REASON=""
         if [ "${_ALGO_STATE}" = "disabled" ]; then
           _CTRL_E_REASON="journal=disabled"
         elif [ "${_REENABLE_REQUESTED}" = "1" ] && [ "${_ALGO_STATE}" != "enabled" ]; then
           _CTRL_E_REASON="bridge-sentinel"
-        elif [ "${_ALGO_STATE}" = "unknown" ] && [ $(( _try % 10 )) -eq 5 ]; then
-          # Fallback: if we can't determine state (log not created yet),
-          # try at iter 5,15,25,35... (every ~50s)
-          _CTRL_E_REASON="unknown-fallback"
+        elif [ "${_ALGO_STATE}" = "unknown" ] && [ "${_ALGO_LOG_EVER_READ}" = "0" ] \
+             && [ $(( _try % 10 )) -eq 5 ]; then
+          # Cold-start bootstrap only (journal not created yet): try at
+          # iter 5,15,25,35... (every ~50s) until the journal becomes readable.
+          _CTRL_E_REASON="cold-start-fallback"
         fi
         if [ -n "${_CTRL_E_REASON}" ]; then
           _xd windowactivate --sync "${_MAIN_WID}"; sleep 0.1
