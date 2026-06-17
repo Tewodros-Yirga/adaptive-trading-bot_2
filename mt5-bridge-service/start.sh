@@ -674,9 +674,19 @@ fi
         # Decide whether to send Ctrl+E. Ctrl+E is a TOGGLE, so we must only
         # send it when the toggle is (or is very likely) OFF:
         #   * journal says "disabled"                          → send (authoritative)
-        #   * bridge requested re-enable AND journal != enabled → send
-        #     (the bridge watchdog/order path only asks when it read
-        #      terminal_info().trade_allowed=False — a real-time truth source)
+        #   * bridge requested re-enable                        → send (authoritative)
+        #     The bridge writes the sentinel ONLY when it read
+        #     terminal_info().trade_allowed=False that instant — a REAL-TIME truth
+        #     source. The MT5 journal is UTF-16, buffered, and lags the live
+        #     toggle by seconds-to-minutes, so it routinely still reads
+        #     "enabled" at the moment the toggle has actually gone OFF. Gating
+        #     the bridge sentinel on the journal therefore DEADLOCKED re-enable:
+        #     stale journal="enabled" suppressed the Ctrl+E forever while the
+        #     watchdog re-requested every 20s (the "toggle OFF … signalling
+        #     Ctrl+E" spam). Trust the real-time bridge over the stale journal.
+        #     This does not reintroduce oscillation: the bridge stops requesting
+        #     the moment trade_allowed reads True again, so a single landed
+        #     Ctrl+E converges.
         #   * journal unknown AND we have never managed to read it → cold-start
         #     bootstrap only. Once the journal has EVER been readable we trust
         #     it (and the bridge sentinel) and never blind-toggle again, so we
@@ -684,7 +694,7 @@ fi
         _CTRL_E_REASON=""
         if [ "${_ALGO_STATE}" = "disabled" ]; then
           _CTRL_E_REASON="journal=disabled"
-        elif [ "${_REENABLE_REQUESTED}" = "1" ] && [ "${_ALGO_STATE}" != "enabled" ]; then
+        elif [ "${_REENABLE_REQUESTED}" = "1" ]; then
           _CTRL_E_REASON="bridge-sentinel"
         elif [ "${_ALGO_STATE}" = "unknown" ] && [ "${_ALGO_LOG_EVER_READ}" = "0" ] \
              && [ $(( _try % 10 )) -eq 5 ]; then
