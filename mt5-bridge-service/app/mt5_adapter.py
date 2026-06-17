@@ -668,6 +668,30 @@ class MT5Adapter:
         self._next_connect_at = 0.0
         self._resolved_terminal_exe = None
 
+    def force_reconnect(self) -> bool:
+        """Tear down a stale/zombie session and rebuild from scratch.
+
+        After the terminal's "self-restart after update" the mt5linux client
+        stays alive but its IPC session is orphaned: ``initialize()`` still looks
+        connected (``self.connected`` stays True) yet ``account_info()`` /
+        ``terminal_info()`` return None and ``copy_rates_range`` is empty.
+        ``ensure_connection()`` won't rebuild because it early-returns while
+        ``connected`` is True, so the adapter serves a dead session forever.
+
+        This forces a clean teardown + fresh ``initialize()`` so we re-bind to
+        the current terminal process. Returns True if the rebuild reconnected.
+        """
+        logger.warning("force_reconnect: tearing down stale MT5 session and rebuilding")
+        # Deliberately DON'T call self._mt.shutdown(): on an orphaned session that
+        # RPyC call can block up to the RPC timeout (~90s) and stall the caller.
+        # Dropping the reference + a fresh initialize() re-establishes the IPC.
+        self.reset_connection()
+        try:
+            self.ensure_connection()
+        except Exception as exc:
+            logger.warning("force_reconnect: rebuild failed (will retry next cycle): %s", exc)
+        return self.connected
+
     # ------------------------------------------------------------------
     # Public API methods
     # ------------------------------------------------------------------

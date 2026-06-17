@@ -42,39 +42,51 @@ async def _autotrading_watchdog_loop() -> None:
     logdir = Path(os.environ.get("LOGDIR", "/home/wineuser/.mt5-bridge-logs"))
     ipc_ready_file = logdir / "mt5_ipc.ready"
     interval = float(os.environ.get("MT5_AUTOTRADING_WATCHDOG_SECONDS", "20"))
+    # Consecutive zombie reads before we force a reconnect. The terminal's
+    # self-restart leaves a brief window where account_info() is legitimately
+    # None; requiring 2 in a row (~40s) avoids resetting on that transient.
+    zombie_reset_threshold = int(os.environ.get("MT5_ZOMBIE_RESET_THRESHOLD", "2"))
+    zombie_streak = 0
     # Let startup, IPC bring-up and the dismiss loop's own cold-start settle.
     await asyncio.sleep(45)
     while True:
         try:
             if ipc_ready_file.exists() and adapter.connected:
                 diag = await asyncio.to_thread(adapter.diagnostics)
-                # Ctrl+E only fixes the AutoTrading TOGGLE. It does nothing for a
-                # broker link that is down or an account that is not logged in —
-                # and trade_allowed reads False in all three cases. So only
-                # signal the dismiss loop when the terminal is connected AND the
-                # account is logged in but the toggle is still off. Otherwise log
-                # the real blocker and back off (no point hammering Ctrl+E).
-                if not diag.get("trade_allowed"):
-                    if diag.get("terminal_connected") and diag.get("account_logged_in"):
+                logged_in = bool(diag.get("account_logged_in"))
+                terminal_up = bool(diag.get("terminal_connected"))
+
+                if logged_in and terminal_up:
+                    # Healthy session. Ctrl+E only fixes the AutoTrading TOGGLE,
+                    # so signal a re-enable only here (toggle off but link good).
+                    zombie_streak = 0
+                    if not diag.get("trade_allowed"):
                         logger.warning(
                             "AutoTrading watchdog: toggle OFF (terminal connected, "
                             "account %s logged in) — signalling Ctrl+E re-enable",
                             diag.get("account_login"),
                         )
                         await asyncio.to_thread(adapter._signal_reenable_autotrading)
-                    else:
-                        logger.error(
-                            "AutoTrading watchdog: trade_allowed=False but root "
-                            "cause is NOT the toggle — terminal_connected=%s "
-                            "account_logged_in=%s login=%s server=%s. Ctrl+E "
-                            "cannot fix this; check broker link / MT_LOGIN / "
-                            "MT_PASSWORD / MT_SERVER. diag=%s",
-                            diag.get("terminal_connected"),
-                            diag.get("account_logged_in"),
-                            diag.get("account_login"),
-                            diag.get("account_server"),
-                            diag,
+                else:
+                    # ZOMBIE: ipc_connected=True but account_info()/terminal_info()
+                    # return None — the IPC session was orphaned by the terminal's
+                    # self-restart. ensure_connection() won't rebuild on its own
+                    # (connected is still True), so force a clean reconnect.
+                    zombie_streak += 1
+                    logger.error(
+                        "MT5 watchdog: ZOMBIE session (ipc_connected=True but "
+                        "terminal_connected=%s account_logged_in=%s) streak=%d/%d. "
+                        "diag=%s",
+                        diag.get("terminal_connected"), diag.get("account_logged_in"),
+                        zombie_streak, zombie_reset_threshold, diag,
+                    )
+                    if zombie_streak >= zombie_reset_threshold:
+                        recovered = await asyncio.to_thread(adapter.force_reconnect)
+                        logger.warning(
+                            "MT5 watchdog: force_reconnect %s",
+                            "succeeded" if recovered else "did not reconnect (retrying)",
                         )
+                        zombie_streak = 0
         except Exception as exc:
             logger.debug("AutoTrading watchdog iteration failed: %s", exc)
         await asyncio.sleep(interval)
