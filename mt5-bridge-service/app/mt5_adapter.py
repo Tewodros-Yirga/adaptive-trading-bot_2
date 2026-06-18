@@ -747,6 +747,11 @@ class MT5Adapter:
             self._mark_disconnected()
             raise RuntimeError(f"mt5 account_info failed: {self._last_error_repr()}")
         return {
+            "login": getattr(info, "login", None),
+            "name": getattr(info, "name", None),
+            "server": getattr(info, "server", None),
+            "leverage": getattr(info, "leverage", None),
+            "currency": getattr(info, "currency", None),
             "balance": info.balance,
             "equity": info.equity,
             "margin": info.margin,
