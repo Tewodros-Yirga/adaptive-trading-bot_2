@@ -252,59 +252,83 @@ def _enrich_market_data_from_df(df, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Core ensemble resolution (exported for pair analysis and tests)
+# Ensemble level resolution
+# ---------------------------------------------------------------------------
+# NOTE: live no longer blends levels across strategies. SL/TP come from the
+# single DESIGNATED level strategy chosen by EnsembleVoter.get_level_strategy()
+# (Alchemist-priority, else highest-weighted agreeing strategy) — the EXACT
+# method the ensemble backtester uses to size its simulated trades. When no
+# level strategy can supply levels the trade is skipped, mirroring the
+# backtester's "if not levels: continue". This keeps live execution faithful to
+# what was backtested and promoted, so a previous weighted/"best-of" blend
+# helper was removed.
+
+
+# ---------------------------------------------------------------------------
+# TP-ladder helpers (live execution parity with the backtester)
 # ---------------------------------------------------------------------------
 
-def resolve_ensemble_levels(
-    resolved_direction: str,
-    signals: list[dict],
-    weights: dict[str, float],
-) -> dict:
+_LADDER_LOT_STEP = 0.01  # broker minimum lot / granularity
+
+
+def _setting_truthy(db: Database, key: str) -> bool:
+    return str(crud.get_setting(db, key) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ladder_schedule(lot: float, tp_levels: list) -> list[dict]:
     """
-    Compute entry/SL/TP from agreeing strategies only, using normalised weights.
-    Returns dict with keys: entry, sl, tp1, tp2, tp3, tp4.
-    Returns {} if no agreeing strategies.
+    Decide which fractions to partial-close at which TP levels, honouring the
+    broker's minimum lot granularity. The last ~25% is always RESERVED to trail
+    (never scheduled), mirroring the backtester's final fraction that rides on
+    the ATR trailing stop.
+
+      • 0.01 lot  (1 unit)   → []                      no partials, trail only
+      • 0.02 lot  (2 units)  → 50% (0.01) at TP1        rest trails
+      • 0.03 lot  (3 units)  → 0.01 at TP1, 0.01 at TP2 rest trails
+      • 0.04+ lot (4+ units) → ~25% across TP1/TP2/TP3  rest trails
     """
-    agreeing = [s for s in signals if s.get("direction") == resolved_direction]
-    if not agreeing:
-        return {}
+    units = max(1, int(round(lot / _LADDER_LOT_STEP)))
+    n_tps = len([t for t in tp_levels if t is not None])
+    if units <= 1 or n_tps == 0:
+        return []
+    reserve = max(1, round(units * 0.25))      # units kept to trail
+    to_split = units - reserve                 # units distributed across partials
+    levels = min(3, n_tps, to_split)
+    if levels <= 0:
+        return []
+    base, extra = divmod(to_split, levels)
+    sched: list[dict] = []
+    for i in range(levels):
+        u = base + (1 if i < extra else 0)
+        if u > 0:
+            sched.append({"tp_index": i, "lots": round(u * _LADDER_LOT_STEP, 2)})
+    return sched
 
-    total_w = sum(weights.get(s["strategy_name"], 0.0) for s in agreeing)
-    if total_w == 0.0:
-        total_w = float(len(agreeing))
-        norm: dict[str, float] = {s["strategy_name"]: 1.0 / total_w for s in agreeing}
-    else:
-        norm = {s["strategy_name"]: weights.get(s["strategy_name"], 0.0) / total_w for s in agreeing}
 
-    if resolved_direction == "BUY":
-        entries = [s["proposed_entry"] for s in agreeing if s.get("proposed_entry") is not None]
-        sls = [s["proposed_sl"] for s in agreeing if s.get("proposed_sl") is not None]
-        entry = min(entries) if entries else None
-        sl = min(sls) if sls else None
-    else:  # SELL
-        entries = [s["proposed_entry"] for s in agreeing if s.get("proposed_entry") is not None]
-        sls = [s["proposed_sl"] for s in agreeing if s.get("proposed_sl") is not None]
-        entry = max(entries) if entries else None
-        sl = max(sls) if sls else None
-
-    def weighted_tp(key: str) -> float | None:
-        vals = [
-            (norm[s["strategy_name"]], s[key])
-            for s in agreeing
-            if s.get(key) is not None
-        ]
-        if not vals:
-            return None
-        return sum(w * v for w, v in vals)
-
+def build_ladder_plan(direction: str, entry: float, sl: float, lot: float,
+                      tp_levels: list, atr: float) -> dict:
+    """Persisted on the trade doc; consumed by the live ladder_manager loop."""
     return {
-        "entry": entry,
-        "sl": sl,
-        "tp1": weighted_tp("proposed_tp1"),
-        "tp2": weighted_tp("proposed_tp2"),
-        "tp3": weighted_tp("proposed_tp3"),
-        "tp4": weighted_tp("proposed_tp4"),
+        "enabled":         True,
+        "direction":       direction,
+        "entry":           entry,
+        "initial_sl":      sl,
+        "original_lot":    lot,
+        "atr_at_entry":    atr,
+        "tp_levels":       list(tp_levels),               # may contain None
+        "schedule":        _ladder_schedule(lot, tp_levels),
+        "tp_hit":          [False, False, False, False],
+        "breakeven_done":  False,
+        "trailing_active": False,
     }
+
+
+def _furthest_tp(levels: dict) -> float | None:
+    """The last (furthest-in-profit) TP present — used as the broker hard-TP
+    ceiling when the ladder is active so partials/trailing can run up to it."""
+    tps = [levels.get(f"tp{i}") for i in (1, 2, 3, 4)]
+    present = [t for t in tps if t is not None]
+    return present[-1] if present else None
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +389,7 @@ def _read_ensemble_threshold(db: Database) -> float:
     raw = crud.get_setting(db, "ensemble_voting_threshold")
     try:
         val = float(raw)
-        return max(0.40, min(0.80, val))  # clamp to valid range
+        return max(0.10, min(0.80, val))  # clamp to valid range
     except (TypeError, ValueError):
         return 0.60
 
@@ -784,10 +808,28 @@ async def _process_signal_inner(
     bias_data = get_news_bias(db, symbol)
     news_bias: float = locals().get("news_bias", bias_data["bias"])  # preserve news-driven value
 
-    # ── Fallback levels ────────────────────────────────────────────────────
-    if not levels:
-        filtered = [s for s in signal_dicts if s["strategy_name"] in selected_strategies]
-        levels = resolve_ensemble_levels(final_direction, filtered, ensemble_weights)
+    # ── Levels parity guard (match the ensemble backtester) ──────────────────
+    # Live derives SL/TP from the DESIGNATED level strategy above
+    # (get_level_strategy → its compute_levels) — the exact method the ensemble
+    # backtester uses. If that produced nothing, the backtester simply does not
+    # trade that bar ("if not levels: continue"). Mirror that here rather than
+    # fabricating blended levels, so live execution stays faithful to what was
+    # backtested and promoted.
+    if final_direction and not levels:
+        logger.info(
+            "[Levels] Ensemble fired but no level strategy could supply SL/TP for "
+            "%s %s — skipping trade (parity with ensemble backtest).",
+            final_direction, symbol,
+        )
+        return {
+            "status": "NO_LEVELS",
+            "reason": (
+                "Ensemble fired but no level strategy could compute SL/TP; "
+                "skipping to match backtest behaviour"
+            ),
+            "symbol": symbol,
+            "direction": final_direction,
+        }
 
     # ── Risk check ─────────────────────────────────────────────────────────
     default_lot = 0.01
@@ -1110,6 +1152,12 @@ async def _process_signal_inner(
                 # Placement failed → fall through to a market order below.
 
     # ── Place order ────────────────────────────────────────────────────────
+    # When the TP ladder is active, the broker's hard take-profit is set to the
+    # FURTHEST target (a safety ceiling) and the ladder_manager loop handles the
+    # partial closes + trailing up to it. When disabled, behaviour is unchanged:
+    # the whole position closes at TP1.
+    _ladder_on = _setting_truthy(db, "tp_ladder_enabled")
+    broker_tp = (_furthest_tp(levels) or levels.get("tp1")) if _ladder_on else levels.get("tp1")
     try:
         order = await _to_thread(
             bridge_client.place_order,
@@ -1118,7 +1166,7 @@ async def _process_signal_inner(
                 "direction": final_direction,
                 "lot_size": lot_size,
                 "stop_loss": sl,
-                "take_profit": levels.get("tp1"),
+                "take_profit": broker_tp,
                 "price": price,
             },
         )
@@ -1177,7 +1225,7 @@ async def _process_signal_inner(
         "direction": final_direction,
         "entry_price": price,
         "stop_loss": sl,
-        "take_profit": levels.get("tp1"),
+        "take_profit": broker_tp,
         "lot_size": lot_size,
         "result": "OPEN",
         "strategy_name": selected_strategies[0] if selected_strategies else "ENSEMBLE",
@@ -1188,6 +1236,16 @@ async def _process_signal_inner(
     }
     if mt5_ticket is not None:
         trade_fields["mt5_ticket"] = mt5_ticket
+
+    # Attach the ladder plan so the live ladder_manager can execute partial
+    # closes + breakeven + ATR-trailing exactly as the backtester simulated.
+    if _ladder_on and mt5_ticket is not None:
+        _ladder_tps = [levels.get(f"tp{i}") for i in (1, 2, 3, 4)]
+        _ladder_atr = float(market_data.get("atr") or (price * 0.005))
+        trade_fields["ladder"] = build_ladder_plan(
+            direction=final_direction, entry=price, sl=sl,
+            lot=lot_size, tp_levels=_ladder_tps, atr=_ladder_atr,
+        )
 
     trade = crud.log_trade(db, trade_fields)
 

@@ -147,7 +147,10 @@ async def trailing_stop_loop() -> None:
         try:
             db = get_database()
             interval = float(crud.get_setting(db, "trailing_poll_seconds") or 15)
-            if _truthy(crud.get_setting(db, "trailing_stop_enabled")):
+            # Stand down when the TP-ladder executor is active — it owns the stop
+            # (breakeven + ATR-trail), so the two must never both modify it.
+            _ladder_on = _truthy(crud.get_setting(db, "tp_ladder_enabled"))
+            if _truthy(crud.get_setting(db, "trailing_stop_enabled")) and not _ladder_on:
                 # Run the blocking bridge calls off the event loop.
                 moved = await asyncio.to_thread(_run_once, db)
                 if moved:

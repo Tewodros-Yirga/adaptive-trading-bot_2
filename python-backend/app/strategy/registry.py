@@ -4,6 +4,7 @@ from .adx_regime_filter import ADXRegimeFilterStrategy
 from .bollinger_breakout import BollingerBreakoutStrategy
 from .dtc import DTCStrategy
 from .htf_structure import HTFStructureStrategy
+from .key_level import KeyLevelStrategy
 from .macd_momentum import MACDMomentumStrategy
 from .multi_ema_scalper import MultiEMAScalperStrategy
 from .obv_momentum import OBVMomentumStrategy
@@ -23,6 +24,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "OBV_Momentum": OBVMomentumStrategy,
     "StochRSI_Cross": StochRSICrossStrategy,
     "HTF_Structure": HTFStructureStrategy,
+    "Key_Level": KeyLevelStrategy,
 }
 
 

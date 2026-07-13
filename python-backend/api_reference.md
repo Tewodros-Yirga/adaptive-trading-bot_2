@@ -1,3 +1,4 @@
+
 # API Reference — Phase 2 Endpoints
 
 All endpoints except `/auth/login` and `/health` require JWT authentication via `Authorization: Bearer <token>`.

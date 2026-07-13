@@ -1061,3 +1061,12 @@ def seed_default_settings(db: Database) -> None:
     }
     for key, value in alchemist_overrides.items():
         _maybe_insert(key, value)
+
+    # ── Key_Level-specific overrides ──────────────────────────────────────
+    # XAUUSD round-number strategy: optimize on 15-minute candles.
+    key_level_overrides: dict[str, str] = {
+        "Key_Level_backtest_timeframes": '["15m"]',
+        "Key_Level_backtest_symbols": '["XAUUSD"]',
+    }
+    for key, value in key_level_overrides.items():
+        _maybe_insert(key, value)

@@ -27,6 +27,7 @@ _ALL_STRATEGIES = [
     "OBV_Momentum",
     "StochRSI_Cross",
     "HTF_Structure",
+    "Key_Level",
 ]
 
 COLL_ENSEMBLE_WEIGHTS = "ensemble_weights"
