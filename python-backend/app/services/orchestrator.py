@@ -1091,7 +1091,7 @@ async def _process_signal_inner(
     # they execute immediately. A fresh resolved signal also cancels any
     # opposite-direction pending (ensemble reversal / opposing news).
     from .pending_orders import (
-        get_pending_settings, decide_pending_entry, record_and_place_pending,
+        get_pending_settings, decide_pending_entry, place_or_replace_pending,
         cancel_opposite_pendings,
     )
     _pending_settings = get_pending_settings(db)
@@ -1120,8 +1120,10 @@ async def _process_signal_inner(
                     crud.get_latest_param_version(db, _strategy_for_params)
                     if _strategy_for_params else None
                 )
+                # One resting pending per symbol+direction: replace the existing
+                # order only when this signal is more confident, else keep it.
                 _pending_result = await _to_thread(
-                    record_and_place_pending, db,
+                    place_or_replace_pending, db,
                     symbol=symbol,
                     direction=final_direction,
                     limit_price=_limit_price,
@@ -1133,7 +1135,21 @@ async def _process_signal_inner(
                     params_version=(_latest.version if _latest else 1),
                     contributing_news_ids=contributing_news_ids,
                     ensemble_decision_id=None,
+                    confidence=resolved_confidence,
                 )
+                if _pending_result is not None and _pending_result.get("status") == "PENDING_KEPT":
+                    # A more (or equally) confident pending is already resting;
+                    # don't place a duplicate and don't market-fill.
+                    return {
+                        "status": "PENDING_KEPT",
+                        "signal": final_direction,
+                        "symbol": symbol,
+                        "ticket": _pending_result.get("kept_ticket"),
+                        "reason": (
+                            "A same-direction pending limit order with higher/equal "
+                            "confidence is already resting — kept it, no new order placed"
+                        ),
+                    }
                 if _pending_result is not None:
                     _log_ensemble_decision(
                         db, symbol, signal_dicts, ensemble_weights,
@@ -1141,13 +1157,20 @@ async def _process_signal_inner(
                         levels=levels, news_bias=news_bias,
                         voter_breakdown=_vote_result.get("votes_breakdown"),
                     )
+                    _replaced_n = _pending_result.get("replaced_count") or 0
+                    _reason = (
+                        "Strategy entry away from market — resting as a pending limit order"
+                        if not _replaced_n else
+                        f"Replaced {_replaced_n} lower-confidence same-direction "
+                        "pending order(s) with this higher-confidence entry"
+                    )
                     return {
-                        "status": "PENDING_PLACED",
+                        "status": _pending_result.get("status", "PENDING_PLACED"),
                         "signal": final_direction,
                         "symbol": symbol,
                         "limit_price": _limit_price,
                         "ticket": _pending_result.get("ticket"),
-                        "reason": "Strategy entry away from market — resting as a pending limit order",
+                        "reason": _reason,
                     }
                 # Placement failed → fall through to a market order below.
 

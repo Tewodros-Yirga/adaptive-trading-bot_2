@@ -22,6 +22,8 @@ surfaced in the Trades report):
   * MISSED_ENTRY_TP_PROGRESS   — price ran toward TP without filling (missed entry)
   * MAX_AGE                    — exceeded the configured max age
   * BROKER_REMOVED             — order left the broker book (manual/expiry) unfilled
+  * SUPERSEDED_HIGHER_CONFIDENCE — a fresher same-direction signal with higher
+                                   confidence replaced this resting order
 """
 import asyncio
 import logging
@@ -135,6 +137,7 @@ def record_and_place_pending(
     params_version: int | None,
     contributing_news_ids: list | None,
     ensemble_decision_id: int | None,
+    confidence: float | None = None,
 ) -> dict | None:
     """
     Place a BUY_LIMIT/SELL_LIMIT via the bridge and record it in the
@@ -177,6 +180,7 @@ def record_and_place_pending(
         "tp2": tp2,
         "mt5_ticket": ticket,
         "strategy_name": strategy_name,
+        "confidence": confidence,
         "params_version": params_version,
         "contributing_news_ids": list(contributing_news_ids or []),
         "ensemble_decision_id": ensemble_decision_id,
@@ -193,6 +197,135 @@ def record_and_place_pending(
         "ticket": ticket,
         "pending_order_id": record.id,
     }
+
+
+def _replacement_rank(
+    direction: str,
+    confidence: float | None,
+    limit_price: float | None,
+    tp1: float | None,
+    stop_loss: float | None,
+) -> tuple[float, float, float, float]:
+    """
+    Build an orientation-normalised ranking key for one pending order so that
+    a plain tuple comparison (higher is better) picks the best entry.
+
+    Components, in priority order:
+      1. confidence — ensemble-combined confidence (missing → 0.0, so any
+         confidence-tagged signal outranks an untagged legacy order).
+      2. entry — SELL prefers a higher limit, BUY a lower limit; we negate the
+         BUY price so "higher tuple" is always better.
+      3. reward — signed distance entry→tp1 in the trade's favour (bigger TP
+         target = more room to run). Missing tp1 → 0.0.
+      4. risk — negated stop distance so a TIGHTER stop ranks higher. Missing
+         stop_loss → treated as an infinitely wide stop (worst).
+    """
+    conf = confidence if confidence is not None else 0.0
+    price = limit_price if limit_price is not None else 0.0
+
+    if direction == "SELL":
+        entry_rank = price                       # higher sell price is better
+        reward = (price - tp1) if tp1 is not None else 0.0        # tp1 below entry
+        risk = (stop_loss - price) if stop_loss is not None else float("inf")  # sl above
+    else:  # BUY
+        entry_rank = -price                      # lower buy price is better
+        reward = (tp1 - price) if tp1 is not None else 0.0        # tp1 above entry
+        risk = (price - stop_loss) if stop_loss is not None else float("inf")  # sl below
+
+    return (conf, entry_rank, reward, -risk)
+
+
+def place_or_replace_pending(
+    db: Database,
+    *,
+    symbol: str,
+    direction: str,
+    limit_price: float,
+    lot_size: float,
+    stop_loss: float | None,
+    tp1: float | None,
+    tp2: float | None,
+    strategy_name: str | None,
+    params_version: int | None,
+    contributing_news_ids: list | None,
+    ensemble_decision_id: int | None,
+    confidence: float | None = None,
+) -> dict | None:
+    """
+    Enforce **at most one active pending per symbol+direction**.
+
+    On each fresh same-direction signal we rank the new signal against the
+    resting order(s) with a lexicographic key
+    `(confidence, entry, reward, risk)` where every component is oriented so
+    "higher is better":
+
+      * confidence — the ensemble-combined confidence (Σ weightᵢ·confidenceᵢ for
+        the winning direction); higher wins.
+      * entry — better fill price: for a SELL the higher limit, for a BUY the
+        lower limit.
+      * reward (TP) — larger distance from entry to tp1 (more profit room).
+      * risk (SL) — tighter stop, i.e. smaller distance from entry to the stop.
+
+    Ties fall through to the next component. If an existing same-direction
+    pending is at least as good as the new signal on this key, keep it and skip
+    placement (returns PENDING_KEPT). Otherwise cancel every existing
+    same-direction pending and place the new one (PENDING_PLACED, tagged
+    PENDING_REPLACED when it displaced an older order).
+
+    This prevents the book from stacking dozens of near-identical limit orders
+    in one direction; only the single best entry rests at any time.
+    """
+    existing = [
+        po for po in crud.get_active_pending_orders(db, symbol)
+        if po.direction == direction
+    ]
+
+    new_key = _replacement_rank(direction, confidence, limit_price, tp1, stop_loss)
+
+    # Keep a resting order if it ranks at least as high as the new signal.
+    for po in existing:
+        po_key = _replacement_rank(
+            direction, po.confidence, po.limit_price, po.tp1, po.stop_loss
+        )
+        if new_key <= po_key:  # existing is at least as good → keep it
+            logger.info(
+                "Keeping resting %s pending ticket=%s rank=%s over new rank=%s; "
+                "skipping duplicate placement",
+                po.order_type, po.mt5_ticket, po_key, new_key,
+            )
+            return {
+                "status": "PENDING_KEPT",
+                "symbol": symbol,
+                "direction": direction,
+                "kept_ticket": po.mt5_ticket,
+                "kept_confidence": po_key[0],
+            }
+
+    # New signal beats every resting one on the rank key — cancel them.
+    replaced = 0
+    for po in existing:
+        if cancel_pending(db, po, "SUPERSEDED_HIGHER_CONFIDENCE"):
+            replaced += 1
+
+    result = record_and_place_pending(
+        db,
+        symbol=symbol,
+        direction=direction,
+        limit_price=limit_price,
+        lot_size=lot_size,
+        stop_loss=stop_loss,
+        tp1=tp1,
+        tp2=tp2,
+        strategy_name=strategy_name,
+        params_version=params_version,
+        contributing_news_ids=contributing_news_ids,
+        ensemble_decision_id=ensemble_decision_id,
+        confidence=confidence,
+    )
+    if result is not None and replaced:
+        result["status"] = "PENDING_REPLACED"
+        result["replaced_count"] = replaced
+    return result
 
 
 # ---------------------------------------------------------------------------

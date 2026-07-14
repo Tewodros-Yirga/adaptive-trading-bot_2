@@ -124,6 +124,7 @@ class PendingOrder:
     mt5_ticket: int | None = None
     mt5_account: int | None = None  # MT5 account (login) this order belongs to
     strategy_name: str | None = None
+    confidence: float | None = None  # resolved signal confidence at placement
     status: str = "PENDING"        # PENDING / FILLED / CANCELLED / EXPIRED
     cancel_reason: str | None = None
     ensemble_decision_id: int | None = None
@@ -153,6 +154,7 @@ class PendingOrder:
             mt5_ticket=doc.get("mt5_ticket"),
             mt5_account=doc.get("mt5_account"),
             strategy_name=doc.get("strategy_name"),
+            confidence=doc.get("confidence"),
             status=doc.get("status", "PENDING"),
             cancel_reason=doc.get("cancel_reason"),
             ensemble_decision_id=doc.get("ensemble_decision_id"),
