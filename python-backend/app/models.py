@@ -292,6 +292,11 @@ class Strategy:
     is_live: bool = False
     params_json: str = "{}"
     live_score: float = 0.0  # EWMA of realised R-multiples from live trades (0 = neutral)
+    # Timeframe the currently-promoted params were backtested/won on. Live trading
+    # fetches signal bars on THIS timeframe so live execution matches the backtest
+    # that produced these params. None for MTF strategies (requires_mtf=True), which
+    # fetch their full timeframe set regardless.
+    live_timeframe: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     id: str = ""
@@ -312,6 +317,7 @@ class Strategy:
             is_live=doc.get("is_live", False),
             params_json=_ensure_str(doc.get("params_json", "{}")),
             live_score=float(doc.get("live_score") or 0.0),
+            live_timeframe=doc.get("live_timeframe"),
             created_at=doc.get("created_at", datetime.utcnow()),
             updated_at=doc.get("updated_at", datetime.utcnow()),
         )

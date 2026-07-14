@@ -216,6 +216,16 @@ async def start_continuous_backtest(strategy_name: str, executor, startup_delay:
                     )
                     # Update Strategy params_json
                     _crud.update_strategy_params(db, strategy_name, candidate.params)
+                    # Persist the timeframe these params won on so live trading
+                    # runs the strategy on the SAME timeframe it was backtested on.
+                    # MTF strategies fetch their full timeframe set regardless, so
+                    # we store None for them (no single governing timeframe).
+                    won_timeframe = (
+                        None
+                        if getattr(strategy_class, "requires_mtf", False)
+                        else candidate.search_context.get("timeframe")
+                    )
+                    _crud.update_strategy_live_timeframe(db, strategy_name, won_timeframe)
                     # Advance phase (max 3)
                     if phase < 3:
                         phase += 1

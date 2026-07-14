@@ -361,8 +361,13 @@ async def _live_trading_loop():
                     from_dt = (date.today() - timedelta(days=2)).isoformat()
                     to_dt = date.today().isoformat()
 
-                    # Price fetch: try bridge first (sync → executor), then
-                    # fall back to the async ohlcv chain.
+                    # Reference price fetch: try bridge first (sync → executor),
+                    # then fall back to the async ohlcv chain. This 1h series is
+                    # used for the latest price + ATR reference, and passed as a
+                    # FALLBACK _df. It is no longer the authoritative signal
+                    # timeframe — the orchestrator fetches each single-TF
+                    # strategy's own live_timeframe bars so live execution matches
+                    # how the strategy was backtested.
                     df = None
                     try:
                         candles = await loop.run_in_executor(
@@ -403,9 +408,10 @@ async def _live_trading_loop():
                         "price": price,
                         "current_price": price,
                         "atr": atr,
-                        # Raw DataFrame passed so the orchestrator can compute
-                        # per-strategy indicators (EMA, RSI, MACD, BB, VWAP)
-                        # via _enrich_market_data_from_df().  Not serialised.
+                        # Fallback raw DataFrame (1h reference series). The
+                        # orchestrator fetches each single-TF strategy's own
+                        # live_timeframe bars; this _df is only used for a
+                        # strategy that has no live_timeframe yet. Not serialised.
                         "_df": df,
                         # Open positions for this symbol (bridge or DB-sourced).
                         # Used by the DuplicateGuard and opposite-direction

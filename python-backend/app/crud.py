@@ -556,6 +556,24 @@ def update_strategy_params(db: Database, strategy_name: str, params: dict) -> St
     return Strategy.from_doc(doc) if doc else None
 
 
+def update_strategy_live_timeframe(
+    db: Database, strategy_name: str, timeframe: str | None
+) -> Strategy | None:
+    """Persist the timeframe the currently-promoted params were backtested on.
+
+    Live trading reads this so a strategy runs live on the same timeframe it was
+    optimized on. Pass None for MTF strategies (they fetch their full timeframe
+    set regardless of any single value).
+    """
+    now = datetime.utcnow()
+    doc = db[COLL_STRATEGIES].find_one_and_update(
+        {"name": strategy_name},
+        {"$set": {"live_timeframe": timeframe, "updated_at": now}},
+        return_document=True,
+    )
+    return Strategy.from_doc(doc) if doc else None
+
+
 # ---------------------------------------------------------------------------
 # BacktestResult CRUD (extended)
 # ---------------------------------------------------------------------------
@@ -1048,25 +1066,54 @@ def seed_default_settings(db: Database) -> None:
     for key, value in pending_order_defaults.items():
         _maybe_insert(key, value)
 
-    for strategy_name in STRATEGY_REGISTRY.keys():
-        for suffix, value in per_strategy_defaults.items():
-            _maybe_insert(f"{strategy_name}_{suffix}", value)
-
-    # ── Alchemist-specific overrides ──────────────────────────────────────
+    # ── Per-strategy overrides ────────────────────────────────────────────
+    # IMPORTANT: seed these BEFORE the generic per_strategy_defaults loop.
+    # `_maybe_insert` skips keys that already exist, so whichever runs first
+    # wins. Seeding overrides first means the generic loop only fills the
+    # *gaps* the override didn't set — otherwise the generic value (e.g.
+    # backtest_timeframes=["1h","4h","1d"]) would land first and silently
+    # defeat the override (e.g. Key_Level's ["15m"]).
     alchemist_overrides: dict[str, str] = {
         "Alchemist_qualify_threshold_win_rate": "45.0",
         "Alchemist_backtest_timeframes": '["1d"]',
         "Alchemist_backtest_symbols": '["XAUUSD"]',
         "Alchemist_param_step_size": "0.03",
     }
-    for key, value in alchemist_overrides.items():
-        _maybe_insert(key, value)
-
-    # ── Key_Level-specific overrides ──────────────────────────────────────
-    # XAUUSD round-number strategy: optimize on 15-minute candles.
+    # Key_Level — XAUUSD round-number strategy: optimize on 15-minute candles.
     key_level_overrides: dict[str, str] = {
         "Key_Level_backtest_timeframes": '["15m"]',
         "Key_Level_backtest_symbols": '["XAUUSD"]',
     }
-    for key, value in key_level_overrides.items():
+    for key, value in {**alchemist_overrides, **key_level_overrides}.items():
         _maybe_insert(key, value)
+
+    # Generic defaults fill any per-strategy key an override didn't set.
+    for strategy_name in STRATEGY_REGISTRY.keys():
+        for suffix, value in per_strategy_defaults.items():
+            _maybe_insert(f"{strategy_name}_{suffix}", value)
+
+    # ── Backfill Strategy.live_timeframe ──────────────────────────────────
+    # Live trading runs each single-timeframe strategy on the timeframe its
+    # promoted params were backtested on. Strategies promoted before this field
+    # existed have no live_timeframe yet, so seed it from the first configured
+    # backtest timeframe (the phase-1 search timeframe). MTF strategies fetch
+    # their full timeframe set regardless, so they stay None.
+    for strategy_name, strategy_cls in STRATEGY_REGISTRY.items():
+        strat_doc = db[COLL_STRATEGIES].find_one(
+            {"name": strategy_name}, {"live_timeframe": 1}
+        )
+        if not strat_doc or strat_doc.get("live_timeframe"):
+            continue  # not seeded yet, or already has a value — leave it
+        if getattr(strategy_cls, "requires_mtf", False):
+            continue  # MTF strategy — no single governing timeframe
+        tf_setting = get_setting(db, f"{strategy_name}_backtest_timeframes")
+        try:
+            tf_list = json.loads(tf_setting) if tf_setting else []
+            primary_tf = tf_list[0] if tf_list else None
+        except (ValueError, TypeError):
+            primary_tf = None
+        if primary_tf:
+            db[COLL_STRATEGIES].update_one(
+                {"name": strategy_name},
+                {"$set": {"live_timeframe": primary_tf, "updated_at": datetime.utcnow()}},
+            )

@@ -458,6 +458,71 @@ async def _fetch_mtf_bars(symbol: str, db: Database) -> dict:
     return bars_by_tf
 
 
+# Default timeframe for a single-TF strategy that has no persisted live_timeframe
+# yet (e.g. never promoted since the field was added). Keeps the live loop running
+# instead of skipping the strategy.
+_DEFAULT_LIVE_TIMEFRAME = "1h"
+
+
+def _is_empty_df(df) -> bool:
+    """True if df is None or an empty DataFrame (safe for non-DataFrame values)."""
+    return df is None or (hasattr(df, "empty") and df.empty)
+
+
+def select_signal_df(live_timeframe, bars_by_tf: dict, caller_df):
+    """Pick the candle DataFrame a single-TF strategy should signal on.
+
+    Precedence, so live execution matches how the strategy was backtested:
+      1. bars for the strategy's own live_timeframe (the backtested timeframe)
+      2. the caller-supplied df (e.g. webhook payload)
+      3. bars for the default fallback timeframe
+
+    Returns (df_or_None, used_fallback) where used_fallback is True when a
+    live_timeframe was requested but its bars were unavailable — the caller logs
+    that so the parity gap is visible.
+    """
+    if live_timeframe and not _is_empty_df(bars_by_tf.get(live_timeframe)):
+        return bars_by_tf.get(live_timeframe), False
+    if not _is_empty_df(caller_df):
+        return caller_df, bool(live_timeframe)
+    fallback = bars_by_tf.get(_DEFAULT_LIVE_TIMEFRAME)
+    if _is_empty_df(fallback):
+        return None, bool(live_timeframe)
+    return fallback, bool(live_timeframe)
+
+
+async def _fetch_bars_by_timeframe(
+    symbol: str, timeframes: set[str], db: Database
+) -> dict:
+    """Fetch a recent bar window for each requested timeframe (deduped).
+
+    Used to build per-strategy signal data for single-TF strategies so each runs
+    live on the timeframe its promoted params were backtested on. Returns
+    {timeframe: DataFrame}; a failed fetch yields an empty DataFrame so callers
+    degrade gracefully rather than crash the live loop.
+    """
+    from .ohlcv import fetch_ohlcv_with_fallback
+    import pandas as pd
+
+    # Lookback per timeframe — generous enough for indicator warmup; strategies
+    # slice internally. Mirrors _fetch_mtf_bars sizing.
+    lookback_days_by_tf = {"1d": 200, "4h": 60, "1h": 14, "15m": 5, "5m": 3, "1m": 2}
+    to_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    bars_by_tf: dict = {}
+    for tf in timeframes:
+        lookback_days = lookback_days_by_tf.get(tf, 14)
+        from_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        try:
+            df, _source = await fetch_ohlcv_with_fallback(symbol, from_date, to_date, tf, db)
+            bars_by_tf[tf] = df
+        except Exception as exc:
+            logger.warning("Per-TF fetch failed for %s %s: %s", symbol, tf, exc)
+            bars_by_tf[tf] = pd.DataFrame()
+
+    return bars_by_tf
+
+
 # ---------------------------------------------------------------------------
 # Main orchestrator entry point
 # ---------------------------------------------------------------------------
@@ -531,6 +596,36 @@ async def _process_signal_inner(
         except Exception as exc:
             logger.warning("MTF batch fetch failed for %s: %s", symbol, exc)
 
+    # ── Fetch per-strategy signal bars for single-TF strategies ───────────
+    # Each single-TF strategy trades live on the timeframe its promoted params
+    # were backtested on (Strategy.live_timeframe). Collect the distinct set so
+    # strategies sharing a timeframe fetch it only once per loop. A caller that
+    # already supplied "_df" (e.g. a webhook) still works: strategies with no
+    # live_timeframe fall back to that df, then to a default-TF fetch.
+    _caller_df = market_data.get("_df")
+    needed_tfs: set[str] = {
+        s.live_timeframe
+        for s in active_strategies
+        if not getattr(get_strategy(s.name), "requires_mtf", False)
+        and s.live_timeframe
+    }
+    # If any single-TF strategy lacks a live_timeframe AND the caller gave no
+    # df, we need the default timeframe to run it.
+    _needs_default_tf = _caller_df is None and any(
+        not getattr(get_strategy(s.name), "requires_mtf", False)
+        and not s.live_timeframe
+        for s in active_strategies
+    )
+    if _needs_default_tf:
+        needed_tfs.add(_DEFAULT_LIVE_TIMEFRAME)
+
+    bars_by_tf: dict = {}
+    if needed_tfs:
+        try:
+            bars_by_tf = await _fetch_bars_by_timeframe(symbol, needed_tfs, db)
+        except Exception as exc:
+            logger.warning("Per-TF batch fetch failed for %s: %s", symbol, exc)
+
     # ── Collect raw signals from all active strategies ────────────────────
     signal_dicts: list[dict] = []
     for strategy_row in active_strategies:
@@ -556,15 +651,28 @@ async def _process_signal_inner(
             else:
                 # Compute technical indicators from the raw candle DataFrame
                 # so non-MTF strategies (DTC, RSI_Reversal, MACD_Momentum,
-                # Bollinger_Breakout, Multi_EMA_Scalper, VWAP_Reversion) can
-                # generate real signals instead of always returning None.
-                _df = market_data.get("_df")
+                # Bollinger_Breakout, Multi_EMA_Scalper, VWAP_Reversion, Key_Level)
+                # can generate real signals instead of always returning None.
+                #
+                # Select the candle series for THIS strategy's live_timeframe so
+                # live execution matches the timeframe the params were backtested
+                # on. Precedence: strategy's own live_timeframe bars → caller's
+                # supplied _df → default-timeframe bars.
+                _tf = strategy_row.live_timeframe
+                _df, _used_fallback = select_signal_df(_tf, bars_by_tf, _caller_df)
+                if _used_fallback:
+                    logger.warning(
+                        "Strategy %s: no bars for live_timeframe %s — falling back",
+                        strategy_row.name, _tf,
+                    )
                 _indicator_data = (
                     _enrich_market_data_from_df(_df, params)
                     if _df is not None
                     else {}
                 )
                 effective_md = {**market_data, "price": price, **_indicator_data}
+                if _tf:
+                    effective_md["timeframe"] = _tf
 
             raw_sig = strat.signal(effective_md)
 
