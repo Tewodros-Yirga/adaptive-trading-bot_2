@@ -76,11 +76,14 @@ MTF_MIN_BARS: dict[str, int] = {
 
 
 def _normalize_symbol(symbol: str) -> str:
-    """Strip broker-specific suffixes."""
+    """Strip broker-specific suffixes and map cent-account variants to base symbols."""
     s = symbol.upper().rstrip("M").rstrip(".")
     for suffix in (".PRO", ".RAW", ".STD", ".ECN"):
         if s.endswith(suffix):
             s = s[: -len(suffix)]
+    # Cent-account aliases: XAUUSDc → XAUUSD (identical price data)
+    if s == "XAUUSDC":
+        s = "XAUUSD"
     return s
 
 

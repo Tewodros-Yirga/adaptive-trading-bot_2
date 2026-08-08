@@ -445,6 +445,17 @@ def run_retrospective_learning(db: Database) -> int:
             update_fields["impact_learning_weight"] = round(0.8 * old_w + 0.2 * accuracy, 4)
         db[COLL_NEWS].update_one({"_id": item["_id"]}, {"$set": update_fields})
         updated += 1
+
+    # Keep per-source credibility scores fresh so get_news_bias weights are accurate.
+    if updated > 0:
+        try:
+            update_source_credibility(db)
+        except Exception as _cred_exc:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "run_retrospective_learning: source credibility update failed: %s", _cred_exc
+            )
+
     return updated
 
 

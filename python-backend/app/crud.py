@@ -976,6 +976,16 @@ def seed_default_settings(db: Database) -> None:
         "position_reconciliation_interval_seconds": "60",
     }
 
+    # ── Global SL / RR guardrails ─────────────────────────────────────────
+    # max_sl_pips: hard cap on stop distance regardless of what strategy computes.
+    #              0 = off.  Default 150 pips so XAUUSD trades stay ≤ $15 risk/lot.
+    # min_rr_ratio_global: minimum reward-to-risk for TP1 after the SL cap is applied.
+    #              Default 3.0 (1:3).
+    sl_rr_defaults: dict[str, str] = {
+        "max_sl_pips": "150",
+        "min_rr_ratio_global": "3.0",
+    }
+
     # ── Position stacking / reversal ──────────────────────────────────────
     position_mgmt_defaults: dict[str, str] = {
         # Opposite-direction reversal thresholds
@@ -1058,6 +1068,9 @@ def seed_default_settings(db: Database) -> None:
         _maybe_insert(key, value)
 
     for key, value in live_trading_defaults.items():
+        _maybe_insert(key, value)
+
+    for key, value in sl_rr_defaults.items():
         _maybe_insert(key, value)
 
     for key, value in position_mgmt_defaults.items():

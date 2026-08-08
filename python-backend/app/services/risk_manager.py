@@ -97,7 +97,7 @@ def update_risk_settings(db: Database, payload: dict) -> dict:
     validated = {
         "account_balance": max(0.0, float(merged["account_balance"])),
         "leverage": min(max(int(merged["leverage"]), 1), 2000),
-        "risk_per_trade_pct": min(max(float(merged["risk_per_trade_pct"]), 0.01), 10.0),
+        "risk_per_trade_pct": min(max(float(merged["risk_per_trade_pct"]), 0.01), 100.0),
         "max_open_trades": min(max(int(merged["max_open_trades"]), 1), 100),
         "max_daily_loss_pct": min(max(float(merged["max_daily_loss_pct"]), 0.1), 50.0),
         "max_drawdown_pct": min(max(float(merged["max_drawdown_pct"]), 1.0), 100.0),

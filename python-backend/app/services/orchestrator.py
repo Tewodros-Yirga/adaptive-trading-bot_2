@@ -39,7 +39,7 @@ from ..services.bridge_client import (
     BridgeUnavailableError,
 )
 from ..services.news_intelligence import get_news_bias
-from ..services.risk_manager import check_and_compute_lot_size
+from ..services.risk_manager import check_and_compute_lot_size, pip_value as _pip_value_fn
 from ..strategy.registry import get_strategy
 
 logger = logging.getLogger(__name__)
@@ -915,6 +915,52 @@ async def _process_signal_inner(
     # ── News bias ──────────────────────────────────────────────────────────
     bias_data = get_news_bias(db, symbol)
     news_bias: float = locals().get("news_bias", bias_data["bias"])  # preserve news-driven value
+
+    # ── Global SL cap + minimum RR enforcement ───────────────────────────────
+    # max_sl_pips (default 150) caps how wide a stop can be — prevents the
+    # 500-pip stops that were observed.  min_rr_ratio_global (default 3.0)
+    # ensures TP1 is at least 3× the SL distance so every trade has a
+    # favourable reward/risk profile.  Both settings are configurable from
+    # the frontend.  Applied AFTER the level strategy computes its levels so
+    # we never override the SL to something nonsensical — we only tighten it.
+    if final_direction and levels and levels.get("sl"):
+        _pip_v = _pip_value_fn(symbol)
+        _pip_v = _pip_v if _pip_v > 0 else 0.0001
+        _max_sl_pips = float(crud.get_setting(db, "max_sl_pips") or 150)
+        _min_rr_global = float(crud.get_setting(db, "min_rr_ratio_global") or 3.0)
+
+        _sl = float(levels["sl"])
+        _sl_dist = abs(price - _sl)
+        _sl_pips = _sl_dist / _pip_v
+
+        # 1. If SL is wider than max_sl_pips, clamp it
+        if _max_sl_pips > 0 and _sl_pips > _max_sl_pips:
+            _new_sl_dist = _max_sl_pips * _pip_v
+            if final_direction == "BUY":
+                _sl = round(price - _new_sl_dist, 5)
+            else:
+                _sl = round(price + _new_sl_dist, 5)
+            levels = {**levels, "sl": _sl}
+            _sl_dist = _new_sl_dist
+            logger.info(
+                "[SL cap] %s %s: SL clamped from %.1f pips to %.1f pips (sl=%.5f)",
+                final_direction, symbol, _sl_pips, _max_sl_pips, _sl,
+            )
+
+        # 2. Enforce minimum RR on TP1
+        if _sl_dist > 0 and _min_rr_global > 0 and levels.get("tp1") is not None:
+            _tp1 = float(levels["tp1"])
+            _rr1 = abs(_tp1 - price) / _sl_dist
+            if _rr1 < _min_rr_global:
+                if final_direction == "BUY":
+                    _tp1_new = round(price + _sl_dist * _min_rr_global, 5)
+                else:
+                    _tp1_new = round(price - _sl_dist * _min_rr_global, 5)
+                levels = {**levels, "tp1": _tp1_new}
+                logger.info(
+                    "[RR enforce] %s %s: TP1 adjusted from %.5f (RR %.2f) to %.5f (RR %.1f)",
+                    final_direction, symbol, _tp1, _rr1, _tp1_new, _min_rr_global,
+                )
 
     # ── Levels parity guard (match the ensemble backtester) ──────────────────
     # Live derives SL/TP from the DESIGNATED level strategy above
