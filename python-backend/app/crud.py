@@ -1028,6 +1028,8 @@ def seed_default_settings(db: Database) -> None:
         "score_weight_roi": "0.4",
         "backtest_interval_seconds": "300",
         "backtest_timeframes": '["1h","4h","1d"]',
+        # backtest_symbols: If not set per-strategy, backtester will use live_trading_symbols.
+        # Override this for strategies that require specific symbols (e.g., Key_Level for XAUUSD).
         "backtest_symbols": '["XAUUSD"]',
         "param_step_size": "0.05",
         "range_expansion_months": "6",
@@ -1086,16 +1088,19 @@ def seed_default_settings(db: Database) -> None:
     # *gaps* the override didn't set — otherwise the generic value (e.g.
     # backtest_timeframes=["1h","4h","1d"]) would land first and silently
     # defeat the override (e.g. Key_Level's ["15m"]).
+    
+    # Alchemist — Multi-timeframe strategy optimized for daily timeframe
     alchemist_overrides: dict[str, str] = {
         "Alchemist_qualify_threshold_win_rate": "45.0",
         "Alchemist_backtest_timeframes": '["1d"]',
-        "Alchemist_backtest_symbols": '["XAUUSD"]',
+        "Alchemist_backtest_symbols": '["XAUUSD"]',  # Override to always use XAUUSD
         "Alchemist_param_step_size": "0.03",
     }
-    # Key_Level — XAUUSD round-number strategy: optimize on 15-minute candles.
+    # Key_Level — XAUUSD-specific round-number strategy: optimize on 15-minute candles.
+    # This strategy is designed specifically for XAUUSD and should not use other symbols.
     key_level_overrides: dict[str, str] = {
         "Key_Level_backtest_timeframes": '["15m"]',
-        "Key_Level_backtest_symbols": '["XAUUSD"]',
+        "Key_Level_backtest_symbols": '["XAUUSD"]',  # Override to always use XAUUSD
     }
     for key, value in {**alchemist_overrides, **key_level_overrides}.items():
         _maybe_insert(key, value)
