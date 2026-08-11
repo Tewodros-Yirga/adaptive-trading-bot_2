@@ -561,6 +561,11 @@ def create_app() -> FastAPI:
     app.include_router(ensemble_router, dependencies=jwt_deps)
     app.include_router(news_veto_router, dependencies=jwt_deps)
     app.include_router(system_router, dependencies=jwt_deps)
+    
+    # ── Diagnostics router (requires JWT) ─────────────────────────────────
+    from .routers.diagnostics import router as diagnostics_router
+    app.include_router(diagnostics_router, dependencies=jwt_deps)
+    
     # /health/db is public — no jwt_deps
     app.include_router(health_router)
 

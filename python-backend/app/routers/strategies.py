@@ -121,6 +121,7 @@ def list_all(db: Database = Depends(get_db)):
             "is_active": row.is_active,
             "is_live": row.is_live,
             "params": json.loads(row.params_json or "{}"),
+            "live_score": row.live_score,  # R-EWMA score for frontend display
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             **stats,
@@ -144,6 +145,7 @@ def get_one(name: str, db: Database = Depends(get_db)):
         "is_active": row.is_active,
         "is_live": row.is_live,
         "params": json.loads(row.params_json or "{}"),
+        "live_score": row.live_score,  # R-EWMA score for frontend display
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         **stats,
