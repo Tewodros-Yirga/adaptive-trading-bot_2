@@ -71,6 +71,10 @@ class Trade:
     # open so trade-close learning updates exactly the items that influenced the
     # trade, instead of re-deriving correlation by a fuzzy time/symbol window.
     contributing_news_ids: list[int] = field(default_factory=list)
+    # Strategy voting breakdown captured at trade open (for score feedback at close).
+    # Copied from EnsembleDecision.strategy_votes_json so score feedback works even
+    # after the EnsembleDecision is deleted by TTL. None on legacy trades.
+    strategy_votes_json: list[dict] | None = None
     id: str = ""
 
     def to_dict(self) -> dict:
@@ -102,6 +106,7 @@ class Trade:
             opened_at=doc.get("opened_at", datetime.utcnow()),
             closed_at=doc.get("closed_at"),
             contributing_news_ids=list(doc.get("contributing_news_ids") or []),
+            strategy_votes_json=doc.get("strategy_votes_json"),
         )
         obj.id = _doc_id(doc)
         return obj

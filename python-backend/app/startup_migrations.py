@@ -13,9 +13,10 @@ logger = logging.getLogger(__name__)
 
 # How long decision audit records live before MongoDB's TTL monitor deletes
 # them. Decisions are only useful for short-term debugging / score feedback;
-# keeping them forever bloats the DB. Default ≈ 2 days ("a day or so" + buffer).
-# Override with DECISION_TTL_SECONDS (e.g. 86400 for exactly one day).
-DECISION_TTL_SECONDS = int(os.environ.get("DECISION_TTL_SECONDS", 7 * 24 * 60 * 60))
+# keeping them forever bloats the DB. Default 90 days to ensure trades can close
+# and score feedback can access the decision. Override with DECISION_TTL_SECONDS.
+# NOTE: EnsembleDecisions must live longer than the longest trade duration!
+DECISION_TTL_SECONDS = int(os.environ.get("DECISION_TTL_SECONDS", 90 * 24 * 60 * 60))
 
 
 def _get_client() -> MongoClient:

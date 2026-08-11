@@ -78,16 +78,21 @@ def apply_score_feedback(db: Database, trade: Trade) -> dict:
     if trade is None or trade.result not in ("WIN", "LOSS") or not trade.direction:
         return {}
 
-    try:
-        trade_id = int(trade.id)
-    except (TypeError, ValueError):
-        logger.debug("score_feedback: trade has no integer id; skipping")
-        return {}
-
-    decision = crud.get_ensemble_decision_by_trade_id(db, trade_id)
-    if not decision or not decision.strategy_votes_json:
-        logger.debug("score_feedback: no ensemble decision/votes for trade #%s", trade_id)
-        return {}
+    # Read voting data from the trade itself (stored at open, survives TTL deletion).
+    # For legacy trades without strategy_votes_json, fall back to EnsembleDecision lookup.
+    strategy_votes = trade.strategy_votes_json
+    if not strategy_votes:
+        try:
+            trade_id = int(trade.id)
+        except (TypeError, ValueError):
+            logger.debug("score_feedback: trade has no integer id; skipping")
+            return {}
+        
+        decision = crud.get_ensemble_decision_by_trade_id(db, trade_id)
+        if not decision or not decision.strategy_votes_json:
+            logger.debug("score_feedback: no strategy votes for trade #%s (decision missing or deleted by TTL)", trade_id)
+            return {}
+        strategy_votes = decision.strategy_votes_json
 
     # EWMA smoothing factor and a clamp on the accumulated score.
     alpha = float(crud.get_setting(db, "score_feedback_alpha") or 0.2)
@@ -97,7 +102,7 @@ def apply_score_feedback(db: Database, trade: Trade) -> dict:
     trade_dir = trade.direction
 
     adjustments: dict[str, dict] = {}
-    for vote in decision.strategy_votes_json:
+    for vote in strategy_votes:
         name = vote.get("strategy_name")
         vote_dir = vote.get("direction")
         if not name or not vote_dir:

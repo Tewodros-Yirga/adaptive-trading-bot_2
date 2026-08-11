@@ -1409,6 +1409,8 @@ async def _process_signal_inner(
         "params_version": version,
         "opened_at": datetime.utcnow(),
         "contributing_news_ids": contributing_news_ids,
+        # Store voting breakdown on trade for score feedback (survives TTL deletion)
+        "strategy_votes_json": _vote_result.get("votes_breakdown"),
         **(extra_trade_fields or {}),
     }
     if mt5_ticket is not None:
