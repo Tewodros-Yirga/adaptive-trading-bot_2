@@ -7,7 +7,8 @@ laddered trade it:
 
   • partial-closes the scheduled fraction at each TP level (TP1..TP4),
   • moves the stop to break-even once TP1 is reached,
-  • activates an ATR trailing stop (1.5×ATR) once TP2 is reached, only ever
+  • activates an ATR trailing stop (1.5×ATR) once the stop reaches break-even
+    (TP1 hit, or the %-trailing manager already moved it there), only ever
     moving the stop in the loss-reducing direction,
 
 exactly as `_run_backtest_sync` simulates. The per-trade `ladder` plan
@@ -15,9 +16,14 @@ exactly as `_run_backtest_sync` simulates. The per-trade `ladder` plan
 is fully IDEMPOTENT — a missed, repeated, or post-restart poll cannot
 double-close or move a stop backwards.
 
-Inert unless the `tp_ladder_enabled` setting is truthy. Mutually exclusive with
-the percentage-based `trailing_manager` (which stands down while this is on) so
-the two never fight over the stop.
+A ladder plan is attached at order placement (orchestrator) whenever the trade
+opens with lot > 0.01 or `tp_ladder_enabled` is set, so this loop simply
+processes every open trade that carries a `ladder` plan.
+
+Handoff with the %-based trailing manager (trailing_manager): trailing owns the
+stop until it reaches break-even; once the ladder has moved the stop to
+break-even (or the stop is already there) the ladder owns it — the trailing
+manager skips such trades via `_ladder_owns_stop`.
 
 Lot tiers (broker min lot 0.01) are decided at plan-build time in
 orchestrator._ladder_schedule:
@@ -38,10 +44,6 @@ logger = logging.getLogger(__name__)
 _TRAILING_ATR_MULT = 1.5
 _LOT_STEP = 0.01
 _POLL_DEFAULT = 10.0
-
-
-def _truthy(v) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _hit(direction: str, price: float, level: float | None) -> bool:
@@ -135,9 +137,17 @@ def _process_trade(db, trade: dict, by_ticket: dict) -> int:
             # Stop is already at/beyond break-even (e.g. trailing got there first).
             updates["ladder.breakeven_done"] = True
 
-    # ── ATR trailing after TP2 ───────────────────────────────────────────────
+    # ── ATR trailing after break-even ─────────────────────────────────────────
+    # Handoff with the %-trailing manager: %-trailing owns the stop until it
+    # reaches break-even; from break-even (TP1 hit, or the stop already at/
+    # beyond entry) the ladder's ATR trail takes over so the remaining position
+    # stays protected between TP levels — including small lots (0.02) whose
+    # schedule has no TP2 partial. Monotonic: the trail only ever tightens.
     trailing_active = bool(L.get("trailing_active"))
-    if tp_hit[1] and not trailing_active:
+    stop_at_breakeven = cur_sl is not None and (
+        cur_sl >= entry if direction == "BUY" else cur_sl <= entry
+    )
+    if (tp_hit[0] or stop_at_breakeven) and not trailing_active:
         trailing_active = True
         updates["ladder.trailing_active"] = True
 
@@ -187,19 +197,20 @@ def _run_once(db) -> int:
 
 
 async def ladder_manager_loop() -> None:
-    """Background loop. Inert until tp_ladder_enabled is truthy."""
-    logger.info("Ladder manager loop started (inert until tp_ladder_enabled=true).")
+    """Background loop. Processes open trades that carry an attached ladder plan
+    (attached when lot > 0.01 or tp_ladder_enabled is set). No-op when no
+    laddered trades are open."""
+    logger.info("Ladder manager loop started (processes open laddered trades).")
     await asyncio.sleep(20)  # let startup settle
     while True:
         interval = _POLL_DEFAULT
         try:
             db = get_database()
             interval = float(crud.get_setting(db, "ladder_poll_seconds") or _POLL_DEFAULT)
-            if _truthy(crud.get_setting(db, "tp_ladder_enabled")):
-                loop = asyncio.get_event_loop()
-                moved = await loop.run_in_executor(None, functools.partial(_run_once, db))
-                if moved:
-                    logger.info("ladder_manager: %d action(s) executed.", moved)
+            loop = asyncio.get_event_loop()
+            moved = await loop.run_in_executor(None, functools.partial(_run_once, db))
+            if moved:
+                logger.info("ladder_manager: %d action(s) executed.", moved)
         except Exception as exc:  # noqa: BLE001
             logger.debug("ladder_manager loop iteration error: %s", exc)
         await asyncio.sleep(interval)

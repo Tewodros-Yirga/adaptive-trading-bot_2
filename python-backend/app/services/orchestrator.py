@@ -1333,7 +1333,10 @@ async def _process_signal_inner(
     # FURTHEST target (a safety ceiling) and the ladder_manager loop handles the
     # partial closes + trailing up to it. When disabled, behaviour is unchanged:
     # the whole position closes at TP1.
-    _ladder_on = _setting_truthy(db, "tp_ladder_enabled")
+    # The ladder is active when tp_ladder_enabled is set OR whenever the lot is
+    # bigger than the 0.01 minimum (multi-TP partial closes only make sense for
+    # lots that can be split — 0.02+ — so larger sizes always get the ladder).
+    _ladder_on = _setting_truthy(db, "tp_ladder_enabled") or lot_size > 0.01
     broker_tp = (_furthest_tp(levels) or levels.get("tp1")) if _ladder_on else levels.get("tp1")
     try:
         order = await _to_thread(

@@ -136,14 +136,15 @@ async def lifespan(app: FastAPI):
     bg_tasks.append(asyncio.create_task(trailing_stop_loop()))
     logger.info("Started trailing-stop manager (opt-in via trailing_stop_enabled).")
 
-    # ── 12b. Start TP-ladder executor (inert unless tp_ladder_enabled) ────────
+    # ── 12b. Start TP-ladder executor ────────────────────────────────────────
     #   Mirrors the backtester's partial-TP + breakeven + ATR-trailing exit on
-    #   live positions. Mutually exclusive with the %-based trailing manager
-    #   above (which stands down while the ladder is on) so they never both move
-    #   the stop.
+    #   live positions. Processes any open trade that carries a ladder plan
+    #   (attached when lot > 0.01 or tp_ladder_enabled). Hand-off with the
+    #   %-trailing manager: trailing owns the stop until break-even, then the
+    #   ladder takes over — see trailing_manager._ladder_owns_stop.
     from .services.ladder_manager import ladder_manager_loop
     bg_tasks.append(asyncio.create_task(ladder_manager_loop()))
-    logger.info("Started TP-ladder executor (opt-in via tp_ladder_enabled).")
+    logger.info("Started TP-ladder executor.")
 
     # ── 13b. Start pending-order monitor (inert unless pending_orders_enabled) ─
     from .services.pending_orders import pending_order_monitor_loop

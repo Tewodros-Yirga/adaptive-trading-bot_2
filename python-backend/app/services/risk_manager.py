@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -6,7 +7,6 @@ from pymongo.database import Database
 from .. import crud
 
 RISK_KEYS = [
-    "account_balance",
     "leverage",
     "risk_per_trade_pct",
     "max_open_trades",
@@ -18,7 +18,6 @@ RISK_KEYS = [
 ]
 
 RISK_DEFAULTS: dict[str, Any] = {
-    "account_balance": 10.0,
     "leverage": 100,
     "risk_per_trade_pct": 1.0,
     "max_open_trades": 5,
@@ -39,38 +38,66 @@ def _alert(db: Database, level: str, event: str, message: str, context: dict | N
         pass
 
 
+def _parse_balance(value) -> float | None:
+    """Parse an account balance into a plain USD-equivalent float.
+
+    The account currency (USD, USDC, USDT, ...) is deliberately IGNORED — a
+    USDC-denominated account is sized exactly like a USD account (1:1), so
+    195 USDC and 195 USD produce identical lot sizes. Handles brokers that
+    return the balance as a number, a numeric string, or a string carrying a
+    currency label (e.g. ``"195.00 USDC"`` or ``"$195.00"``). Returns None
+    when the value cannot be parsed.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    # Keep digits, separators, minus/plus and exponent markers; drop currency
+    # labels (USD, USDC, $, ...) so any account currency sizes like the dollar.
+    cleaned = re.sub(r"[^\d.,eE+\-]", "", text).replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def get_live_balance() -> tuple[float | None, float | None]:
     """
     Fetch (balance, equity) from the MT5 account via the bridge.
-    Returns (None, None) when the bridge is unavailable so callers can fall
-    back to the stored setting. Never raises.
+
+    The account currency (USD/USDC/USDT/...) is treated as USD-equivalent 1:1
+    for sizing — a 195 USDC account behaves exactly like a 195 USD account.
+    Returns (None, None) when the bridge is unavailable or the balance cannot
+    be parsed, so callers can fall back to the stored setting. Never raises.
     """
     try:
         from .bridge_client import bridge_client
         acct = bridge_client.get_account()
         if acct and acct.get("balance") is not None:
-            balance = float(acct["balance"])
-            equity = float(acct.get("equity", balance))
-            return balance, equity
+            balance = _parse_balance(acct.get("balance"))
+            equity = _parse_balance(acct.get("equity"))
+            if balance is not None:
+                return balance, (equity if equity is not None else balance)
     except Exception:
         pass
     return None, None
 
 
-def get_effective_balance(db: Database, settings: dict | None = None) -> float:
+def get_effective_balance(db: Database) -> float:
     """
-    The account balance to use for all risk/sizing math.
+    The account balance used for ALL risk/sizing math — always the live MT5
+    balance from the bridge (USDC treated as USD 1:1; see get_live_balance).
 
-    The MT5 account is the source of truth — always prefer the live balance
-    from the bridge. The stored ``account_balance`` setting is only a fallback
-    for when the bridge is unreachable (it is NOT a user-authoritative value).
+    There is intentionally NO stored-balance fallback: the MT5 account is the
+    only source of truth. Returns 0.0 when the bridge is unreachable and no
+    cached account is available, which safely degrades all risk math (the
+    dynamic lot formula then floors at the 0.01 minimum).
     """
     live, _ = get_live_balance()
-    if live is not None:
-        return live
-    if settings is None:
-        settings = get_risk_settings(db)
-    return float(settings["account_balance"])
+    return live if live is not None else 0.0
 
 
 def get_risk_settings(db: Database) -> dict:
@@ -95,7 +122,6 @@ def update_risk_settings(db: Database, payload: dict) -> dict:
     current = get_risk_settings(db)
     merged = {**current, **payload}
     validated = {
-        "account_balance": max(0.0, float(merged["account_balance"])),
         "leverage": min(max(int(merged["leverage"]), 1), 2000),
         "risk_per_trade_pct": min(max(float(merged["risk_per_trade_pct"]), 0.01), 100.0),
         "max_open_trades": min(max(int(merged["max_open_trades"]), 1), 100),
@@ -110,28 +136,44 @@ def update_risk_settings(db: Database, payload: dict) -> dict:
     return validated
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize broker symbol names for pip classification.
+
+    MT5 often appends a contract/CFD suffix to the base instrument
+    (e.g. ``XAUUSDc``, ``US30.c``). Stripping a trailing ``c`` / ``.c`` lets
+    the pip math classify the symbol correctly — otherwise ``XAUUSDc`` would
+    fall through to the 0.0001 forex pip and mis-size stops and lots.
+    """
+    s = (symbol or "").upper().strip()
+    if s.endswith(".C"):
+        s = s[:-2]
+    elif s.endswith("C"):
+        s = s[:-1]
+    return s
+
+
 def pip_value(symbol: str) -> float:
-    """Returns pip value for common symbols."""
-    symbol = symbol.upper()
-    if "JPY" in symbol:
+    """Returns pip value for common symbols (handles CFD suffixes like ``XAUUSDc``)."""
+    s = _normalize_symbol(symbol)
+    if "JPY" in s:
         return 0.01
-    if symbol in ("XAUUSD", "GOLD"):
+    if s in ("XAUUSD", "GOLD") or s.startswith("XAU"):
         return 0.1
-    if symbol in ("XAGUSD", "SILVER"):
+    if s in ("XAGUSD", "SILVER") or s.startswith("XAG"):
         return 0.001
-    if symbol in ("US30", "NAS100", "SPX500"):
+    if s in ("US30", "NAS100", "SPX500", "US500", "DJ30", "NDX100"):
         return 1.0
     return 0.0001
 
 
 def pip_cost_per_lot(symbol: str) -> float:
-    """Returns approximate USD cost per pip per standard lot."""
-    symbol = symbol.upper()
-    if "JPY" in symbol:
+    """Returns approximate USD cost per pip per standard lot (handles CFD suffixes)."""
+    s = _normalize_symbol(symbol)
+    if "JPY" in s:
         return 10.0
-    if symbol in ("XAUUSD", "GOLD"):
+    if s in ("XAUUSD", "GOLD") or s.startswith("XAU"):
         return 10.0
-    if symbol in ("XAGUSD", "SILVER"):
+    if s in ("XAGUSD", "SILVER") or s.startswith("XAG"):
         return 50.0
     return 10.0
 
@@ -144,17 +186,34 @@ def compute_dynamic_lot_size(
     symbol: str,
     leverage: int = 100,
 ) -> float:
-    risk_amount = account_balance * (risk_per_trade_pct / 100.0)
-    pv = pip_value(symbol)
-    if pv == 0:
-        pv = 0.0001
-    sl_pips = abs(entry_price - stop_loss) / pv
-    if sl_pips == 0:
+    """DYNAMIC position sizing.
+
+    User-selected formula:  lot = (balance * risk% * 0.1) / (6 * stop distance)
+    where the stop distance is in DOLLARS (price units). The 6 divisor keeps
+    positions small (risk%/100 * 0.1 / 6 = risk% * 0.0167% of balance), so the
+    lot grows proportionally with the account balance while staying low for
+    small accounts.
+
+    Example: $100 balance, 20% risk, $15 stop (150-pip cap on gold) →
+             (100 * 0.2 * 0.1) / (6 * 15) = 0.02 lots.
+
+    Hard rules:
+      - Accounts under $50 always trade the 0.01 broker-minimum lot.
+      - 0.01 is the absolute floor (broker minimum lot).
+
+    The previous margin-based ceiling ``(balance*leverage)/(entry*100000)`` is
+    deliberately NOT applied — it forced every sub-$2,200 account to 0.01 lots.
+    An optional hard ceiling can be enforced via the ``max_lot_size`` setting
+    (applied in ``check_and_compute_lot_size``).
+    """
+    if account_balance < 50.0:
         return 0.01
-    cost = pip_cost_per_lot(symbol)
-    lot_size = risk_amount / (sl_pips * cost)
-    max_lot = (account_balance * leverage) / (entry_price * 100000) if entry_price > 0 else 10.0
-    return round(max(0.01, min(lot_size, max_lot)), 2)
+    risk_amount = account_balance * (risk_per_trade_pct / 100.0) * 0.1
+    sl_distance = abs(entry_price - stop_loss)  # stop distance in dollars (price units)
+    if sl_distance == 0:
+        return 0.01
+    lot_size = risk_amount / (6.0 * sl_distance)
+    return round(max(0.01, lot_size), 2)
 
 
 def check_and_compute_lot_size(
@@ -228,7 +287,7 @@ def check_and_compute_lot_size(
         (t.pnl or 0) for t in closed_trades
         if t.closed_at and (t.closed_at if t.closed_at.tzinfo else t.closed_at.replace(tzinfo=timezone.utc)) >= today_start
     )
-    balance = get_effective_balance(db, settings)
+    balance = get_effective_balance(db)
     if balance > 0:
         daily_loss_pct = (-today_pnl / balance) * 100
         if daily_loss_pct >= settings["max_daily_loss_pct"]:
@@ -254,6 +313,13 @@ def check_and_compute_lot_size(
             symbol=symbol,
             leverage=int(settings["leverage"]),
         )
+        # Optional hard ceiling — user-set max_lot_size wins over DYNAMIC sizing.
+        try:
+            _max_lot = float(crud.get_setting(db, "max_lot_size") or 0) or 0.0
+        except (TypeError, ValueError):
+            _max_lot = 0.0
+        if _max_lot > 0:
+            lot_size = min(lot_size, _max_lot)
     else:
         lot_size = default_lot_size
 
@@ -273,15 +339,14 @@ def get_risk_status(db: Database) -> dict:
     )
     stats = crud.get_stats(db)
 
-    # ── Live balance from MT5 bridge (the authoritative source) ───────────
-    # Fall back to the stored setting only when the bridge is unreachable.
+    # ── Live balance from MT5 bridge (the ONLY source — no stored fallback) ─
     live_balance, live_equity = get_live_balance()
-    balance = live_balance if live_balance is not None else settings["account_balance"]
+    balance = live_balance if live_balance is not None else 0.0
 
     return {
-        "account_balance": live_balance if live_balance is not None else settings["account_balance"],
+        "account_balance": live_balance,
         "account_equity": live_equity,
-        "balance_source": "mt5_bridge" if live_balance is not None else "settings",
+        "balance_source": "mt5_bridge" if live_balance is not None else "unavailable",
         "open_trades_count": open_count,
         "daily_pnl": round(today_pnl, 4),
         "daily_loss_pct": round((-today_pnl / balance * 100) if balance > 0 else 0.0, 2),

@@ -914,8 +914,9 @@ def seed_default_settings(db: Database) -> None:
     from .strategy.registry import STRATEGY_REGISTRY
 
     # ── Risk management ───────────────────────────────────────────────────
+    # NOTE: no account_balance default — the live MT5 balance (from the bridge)
+    # is the only source of truth for sizing.
     risk_defaults: dict[str, str] = {
-        "account_balance": "10.0",
         "leverage": "2000",
         "risk_per_trade_pct": "1.0",
         "max_open_trades": "5",

@@ -22,6 +22,14 @@ Settings (AppSettings keys):
   breakeven_trigger_pct        e.g. 0.3 (= 0.3%) (default 0.3)
   breakeven_buffer_pct         e.g. 0.02         (default 0.02)
   trailing_distance_pct        e.g. 0.4 (= 0.4%) (default 0.4)
+
+TP-ladder handoff:
+  This manager runs alongside the TP-ladder executor (ladder_manager). A trade
+  with an attached ladder plan is handled by the %-trailing here ONLY until its
+  stop reaches break-even — once the ladder owns the stop (stop at/beyond
+  entry, or the ladder has already done its break-even/trailing steps) this
+  loop leaves the trade alone and the ladder's partial closes + ATR-trail take
+  over.
 """
 from __future__ import annotations
 
@@ -30,7 +38,7 @@ import logging
 
 from .bridge_client import bridge_client
 from .. import crud
-from ..db import get_database
+from ..db import COLL_TRADES, get_database
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +56,29 @@ def _num(md: dict, *keys: str) -> float | None:
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def _ladder_owns_stop(pos: dict, plan: dict | None) -> bool:
+    """
+    True once the TP-ladder has taken over this position's stop, so the
+    %-trailing manager must leave it alone:
+      - the ladder explicitly finished its break-even / ATR-trailing steps, or
+      - the current stop is already at/beyond break-even (entry) — the user's
+        requested handoff point: trail until the SL is at break-even, then the
+        ladder takes off.
+    """
+    if not plan:
+        return False
+    if plan.get("breakeven_done") or plan.get("trailing_active"):
+        return True
+    side = str(pos.get("type") or pos.get("direction") or "").upper()
+    if side not in ("BUY", "SELL"):
+        return False
+    entry = _num(pos, "openPrice", "open_price", "price_open")
+    cur_sl = _num(pos, "sl", "stopLoss", "stop_loss")
+    if entry is None or entry <= 0 or cur_sl is None or cur_sl <= 0:
+        return False
+    return cur_sl >= entry if side == "BUY" else cur_sl <= entry
 
 
 def _desired_stop(pos: dict, settings: dict) -> float | None:
@@ -106,14 +137,36 @@ def _run_once(db) -> int:
         logger.debug("trailing_manager: get_positions failed: %s", exc)
         return 0
 
+    # Map MT5 ticket → ladder plan so the %-trailing can hand off to the TP
+    # ladder once a trade's stop reaches break-even.
+    ladder_by_ticket: dict[int, dict] = {}
+    try:
+        cursor = db[COLL_TRADES].find(
+            {"ladder.enabled": True, "mt5_ticket": {"$exists": True}, "closed_at": {"$exists": False}},
+            {"ladder": 1, "mt5_ticket": 1},
+        )
+        for _t in cursor:
+            try:
+                ladder_by_ticket[int(_t.get("mt5_ticket"))] = _t.get("ladder") or {}
+            except (TypeError, ValueError):
+                continue
+    except Exception as exc:
+        logger.debug("trailing_manager: ladder plan lookup failed: %s", exc)
+
     moved = 0
     for pos in positions:
         try:
-            new_sl = _desired_stop(pos, settings)
-            if new_sl is None:
-                continue
             ticket = pos.get("ticket") or pos.get("orderId")
             if ticket is None:
+                continue
+            try:
+                _ladder_plan = ladder_by_ticket.get(int(ticket))
+            except (TypeError, ValueError):
+                _ladder_plan = None
+            if _ladder_owns_stop(pos, _ladder_plan):
+                continue  # the TP ladder owns this stop now
+            new_sl = _desired_stop(pos, settings)
+            if new_sl is None:
                 continue
             tp = _num(pos, "tp", "takeProfit", "take_profit")
             bridge_client.modify_position(int(ticket), stop_loss=new_sl, take_profit=tp)
@@ -147,10 +200,10 @@ async def trailing_stop_loop() -> None:
         try:
             db = get_database()
             interval = float(crud.get_setting(db, "trailing_poll_seconds") or 15)
-            # Stand down when the TP-ladder executor is active — it owns the stop
-            # (breakeven + ATR-trail), so the two must never both modify it.
-            _ladder_on = _truthy(crud.get_setting(db, "tp_ladder_enabled"))
-            if _truthy(crud.get_setting(db, "trailing_stop_enabled")) and not _ladder_on:
+            # Runs alongside the TP-ladder executor: per-trade handoff inside
+            # _run_once (via _ladder_owns_stop) decides who owns each stop —
+            # %-trailing until the SL reaches break-even, ladder after that.
+            if _truthy(crud.get_setting(db, "trailing_stop_enabled")):
                 # Run the blocking bridge calls off the event loop.
                 moved = await asyncio.to_thread(_run_once, db)
                 if moved:

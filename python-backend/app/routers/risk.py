@@ -3,6 +3,7 @@ from ..auth_deps import require_write_access
 from pymongo.database import Database
 from typing import Optional
 
+from .. import crud
 from ..db import get_db
 from ..services.risk_manager import get_risk_settings, get_risk_status, update_risk_settings
 
@@ -47,21 +48,40 @@ def lot_size_preview(
 ):
     """
     Returns what lot sizes would be computed for a given entry+SL without placing any order.
+    Mirrors check_and_compute_lot_size (risk_manager) so the preview always matches live sizing.
     """
+    from ..services.risk_manager import pip_value as _pip_value
+
     settings = get_risk_settings(db)
     status = get_risk_status(db)
 
-    sl_pips = abs(round((entry - stop_loss) * 10000, 1))
+    sl_distance = abs(entry - stop_loss)
+    sl_pips = round(sl_distance / _pip_value(symbol), 1) if sl_distance > 0 else 0
 
     fixed_lot = settings.get("fixed_lot_size", 0.01)
 
-    balance = status.get("account_balance") or 10.0
+    # Balance always comes from the live MT5 account (no stored fallback).
+    balance = status.get("account_balance") or 0.0
     risk_pct = settings.get("risk_per_trade_pct", 1.0)
-    pip_value = settings.get("pip_value_per_lot", 10.0)
 
-    risk_amount_usd = balance * (risk_pct / 100.0)
-    dynamic_lot = round(risk_amount_usd / (sl_pips * pip_value), 2) if sl_pips > 0 else fixed_lot
-    dynamic_lot = max(0.01, min(dynamic_lot, settings.get("max_lot_size", 10.0)))
+    # Same DYNAMIC sizing as risk_manager.compute_dynamic_lot_size:
+    #   lot = (balance * risk% * 0.1) / (6 * stop distance), floored at 0.01,
+    #   with accounts under $50 pinned to the 0.01 minimum.
+    if balance < 50.0:
+        dynamic_lot = 0.01
+    elif sl_distance > 0:
+        dynamic_lot = round(max(0.01, (balance * (risk_pct / 100.0) * 0.1) / (6.0 * sl_distance)), 2)
+    else:
+        dynamic_lot = fixed_lot
+    try:
+        _max_lot = float(crud.get_setting(db, "max_lot_size") or 0) or 0.0
+    except (TypeError, ValueError):
+        _max_lot = 0.0
+    if _max_lot > 0:
+        dynamic_lot = min(dynamic_lot, _max_lot)
+
+    # Dollar amount risked per trade (matches the DYNAMIC formula numerator).
+    risk_amount_usd = round(balance * (risk_pct / 100.0) * 0.1, 2)
 
     lot_size_mode = settings.get("lot_size_mode", "FIXED")
     chosen_lot = dynamic_lot if lot_size_mode == "DYNAMIC" else fixed_lot
@@ -82,7 +102,7 @@ def lot_size_preview(
     return {
         "fixed_lot": fixed_lot,
         "dynamic_lot": dynamic_lot,
-        "risk_amount_usd": round(risk_amount_usd, 2),
+        "risk_amount_usd": risk_amount_usd,
         "sl_pips": sl_pips,
         "lot_size_mode": lot_size_mode,
         "chosen_lot": chosen_lot,
