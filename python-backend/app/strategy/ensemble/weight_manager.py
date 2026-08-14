@@ -28,6 +28,9 @@ _ALL_STRATEGIES = [
     "StochRSI_Cross",
     "HTF_Structure",
     "Key_Level",
+    "Pullback_Sniper",
+    "SK_Unified",
+    "Ten_AM",
 ]
 
 COLL_ENSEMBLE_WEIGHTS = "ensemble_weights"

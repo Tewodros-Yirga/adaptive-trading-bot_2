@@ -11,6 +11,9 @@ from .obv_momentum import OBVMomentumStrategy
 from .rsi_reversal import RSIReversalStrategy
 from .stoch_rsi_cross import StochRSICrossStrategy
 from .vwap_reversion import VWAPReversionStrategy
+from .pullback_sniper import PullbackSniperStrategy
+from .sk_unified import SKUnifiedStrategy
+from .ten_am_strategy import TenAMStrategy
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "DTC": DTCStrategy,
@@ -25,6 +28,9 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "StochRSI_Cross": StochRSICrossStrategy,
     "HTF_Structure": HTFStructureStrategy,
     "Key_Level": KeyLevelStrategy,
+    "Pullback_Sniper": PullbackSniperStrategy,
+    "SK_Unified": SKUnifiedStrategy,
+    "Ten_AM": TenAMStrategy,
 }
 
 
