@@ -107,8 +107,8 @@ class SKUnifiedStrategy(BaseStrategy):
         # BLASH context filter
         "blash_enabled": 1,
         "blash_lookback": 250,
-        "blash_cheap_pct": 35.0,
-        "blash_expensive_pct": 65.0,
+        "blash_cheap_pct": 45.0,
+        "blash_expensive_pct": 55.0,
         # Structure-shift confirmation trigger
         "confirmation_lookback": 3,
         # Candlestick reversal-quality boost (from sk_strategy.py)
@@ -121,7 +121,7 @@ class SKUnifiedStrategy(BaseStrategy):
         "tp2_extension": 1.0,
         "tp3_extension": 1.272,
         "tp4_extension": 1.618,
-        "min_confidence_threshold": 0.45,
+        "min_confidence_threshold": 0.40,
     }
 
     PARAM_BOUNDS: dict[str, tuple[float, float]] = {
@@ -133,9 +133,10 @@ class SKUnifiedStrategy(BaseStrategy):
         "max_sequence_age_bars": (20, 150),
         "htf_ema_fast": (10, 40),
         "htf_ema_slow": (30, 100),
+        "blash_enabled": (0, 1),
         "blash_lookback": (100, 500),
-        "blash_cheap_pct": (15.0, 45.0),
-        "blash_expensive_pct": (55.0, 85.0),
+        "blash_cheap_pct": (15.0, 60.0),
+        "blash_expensive_pct": (40.0, 85.0),
         "confirmation_lookback": (1, 6),
         "reversal_boost_weight": (0.0, 0.20),
         "reversal_min_wick_ratio": (0.10, 0.50),
@@ -153,7 +154,14 @@ class SKUnifiedStrategy(BaseStrategy):
         "max_retracement_pct": (0.70, 0.82),
         "turning_area_lookback": (25, 60),
         "max_sequence_age_bars": (40, 90),
-        "min_confidence_threshold": (0.3, 0.5),
+        "min_confidence_threshold": (0.30, 0.45),
+        # Trade-frequency knobs: keep restarts in trade-producing regions and
+        # let the optimizer sample BLASH on/off (and a relaxed band) rather
+        # than always re-landing in the starved always-on default.
+        "blash_enabled": (0, 1),
+        "blash_cheap_pct": (35.0, 55.0),
+        "blash_expensive_pct": (45.0, 65.0),
+        "confirmation_lookback": (1, 3),
     }
 
     def __init__(self, params: dict[str, Any] | None = None):
@@ -264,14 +272,23 @@ class SKUnifiedStrategy(BaseStrategy):
         if self._last_signal_b_date == b_date:
             return None, 0.0
 
-        # ── Timeframe puzzle: HTF bias must agree ─────────────────────────
+        # ── Timeframe puzzle: HTF bias as a graded confidence factor ──────
+        # Previously a hard veto on any counter-HTF trade; conjuncted with the
+        # BLASH filter it starved the strategy of setups (near-zero trades,
+        # frozen below the optimizer's qualify floor and unable to improve).
+        # HTF disagreement is now a strong confidence penalty rather than a
+        # veto, so a high-quality counter-trend ABC sequence can still trade
+        # while trend-aligned setups stay strongly preferred.
         htf_bias = self._htf_bias(market_data, ohlcv)
-        if htf_bias == "BULLISH" and direction == "SELL":
-            return None, 0.0
-        if htf_bias == "BEARISH" and direction == "BUY":
-            return None, 0.0
+        if htf_bias == "NEUTRAL":
+            htf_quality = 0.5
+        elif (htf_bias == "BULLISH" and direction == "BUY") or \
+                (htf_bias == "BEARISH" and direction == "SELL"):
+            htf_quality = 1.0
+        else:
+            htf_quality = 0.15
 
-        # ── BLASH context filter ───────────────────────────────────────
+        # ── BLASH context filter (optional; optimizer may disable) ────────
         if float(p.get("blash_enabled", 1)) >= 0.5:
             if not self._blash_allows(closes, direction):
                 return None, 0.0
@@ -281,7 +298,6 @@ class SKUnifiedStrategy(BaseStrategy):
         band_half = max((max_retr - min_retr) / 2.0, 1e-9)
         retr_quality = max(0.0, 1.0 - abs(retracement_pct - sweet_center) / band_half)
         turning_quality = min(1.0, (p0_idx - window_start) / max(lookback, 1))
-        htf_quality = 1.0 if htf_bias != "NEUTRAL" else 0.5
 
         confidence = 0.15 + 0.45 * retr_quality + 0.20 * turning_quality + 0.20 * htf_quality
 

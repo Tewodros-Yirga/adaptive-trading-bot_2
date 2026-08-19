@@ -1174,7 +1174,16 @@ def seed_default_settings(db: Database) -> None:
         "Key_Level_backtest_timeframes": '["15m"]',
         "Key_Level_backtest_symbols": '["XAUUSD"]',  # Override to always use XAUUSD
     }
-    for key, value in {**alchemist_overrides, **key_level_overrides}.items():
+    # Ten_AM — opening-range breakout. Needs a low, intraday timeframe so the
+    # 09:00-10:00 ET session range and its first breakout resolve within the
+    # rolling bar window; 1h/4h/1d bars are far too coarse to express an
+    # opening range. (Existing DBs keep whatever value was already seeded —
+    # _maybe_insert only fills gaps — so flip Ten_AM_backtest_timeframes in
+    # Strategy Manager to apply this to a running system.)
+    ten_am_overrides: dict[str, str] = {
+        "Ten_AM_backtest_timeframes": '["5m"]',
+    }
+    for key, value in {**alchemist_overrides, **key_level_overrides, **ten_am_overrides}.items():
         _maybe_insert(key, value)
 
     # Generic defaults fill any per-strategy key an override didn't set.

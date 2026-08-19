@@ -600,7 +600,7 @@ def fetch_ohlcv_sync(
 
     # ── Source 1: MT5 Bridge ──────────────────────────────────────────────
     _BRIDGE_CHUNK_DAYS: dict[str, int] = {
-        "15m": 20, "1h": 60, "4h": 90, "1d": 365, "1w": 730,
+        "1m": 2, "5m": 7, "15m": 20, "1h": 60, "4h": 90, "1d": 365, "1w": 730,
     }
     try:
         from datetime import datetime as _dt, timedelta as _td
