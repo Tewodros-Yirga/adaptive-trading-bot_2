@@ -49,8 +49,21 @@ class BaseStrategy(ABC):
     @staticmethod
     def _sort_tp_multipliers(params: dict) -> dict:
         """
-        Ensure tp1 <= tp2 <= tp3 <= tp4 multipliers.
-        Returns a copy of params with the four TP multipliers sorted ascending.
+        Ensure tp1 <= tp2 <= tp3 <= tp4 multipliers via a CUMULATIVE CLAMP, not a
+        full sort.
+
+        Why not sort: the optimizer tunes one TP multiplier at a time and assumes
+        the value it sets for, say, tp3_multiplier stays attached to TP3. A full
+        ascending sort reassigns values across slots (e.g. [2,3,1,4] -> [1,2,3,4]),
+        so nudging tp3 could land in the tp2 slot and produce no change in the
+        computed levels — a flat/scrambled gradient that the coordinate-ascent
+        search cannot climb.
+
+        Cumulative clamp keeps each multiplier in its own slot and only raises it
+        to at least the previous level: [2,3,1,4] -> [2,3,3,4]. tp1 keeps the value
+        the engine set, and increasing any tp_k monotonically increases its own
+        level, so the gradient stays intact while monotonicity is preserved.
+
         Only modifies keys that are present in the dict.
         """
         tp_keys = ["tp1_multiplier", "tp2_multiplier", "tp3_multiplier", "tp4_multiplier"]
@@ -58,7 +71,8 @@ class BaseStrategy(ABC):
         if len(present) < 2:
             return params.copy()
         result = params.copy()
-        values = sorted(result[k] for k in present)
-        for k, v in zip(present, values):
-            result[k] = v
+        running = result[present[0]]
+        for k in present[1:]:
+            running = max(result[k], running)
+            result[k] = running
         return result

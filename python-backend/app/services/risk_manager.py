@@ -205,6 +205,10 @@ def compute_dynamic_lot_size(
     deliberately NOT applied — it forced every sub-$2,200 account to 0.01 lots.
     An optional hard ceiling can be enforced via the ``max_lot_size`` setting
     (applied in ``check_and_compute_lot_size``).
+
+    NOTE (Fix 3 parity): this is the ORIGINAL formula, preserved by user choice —
+    the live account's DYNAMIC sizing is intentionally unchanged. The backtester's
+    _position_lots DYNAMIC branch mirrors this exact formula so backtest == live.
     """
     if account_balance < 50.0:
         return 0.01

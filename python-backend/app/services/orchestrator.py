@@ -635,7 +635,7 @@ async def _process_signal_inner(
 
             # Build market_data for this strategy
             if getattr(strat, "requires_mtf", False) and mtf_bars:
-                from .ohlcv import build_mtf_market_data, _compute_atr_simple
+                from .ohlcv import build_mtf_market_data, _compute_atr_simple, df_to_ohlcv_list
                 import pandas as pd
 
                 atr_1h = _compute_atr_simple(mtf_bars.get("1h", pd.DataFrame()))
@@ -648,6 +648,18 @@ async def _process_signal_inner(
                 # Merge caller-supplied extras (e.g. correlated_bars)
                 effective_md.update({k: v for k, v in market_data.items() if k not in effective_md})
                 effective_md["current_price"] = price
+                # build_mtf_market_data does not supply `ohlcv_window`, but MTF
+                # strategies read it as their intraday execution series and some
+                # (e.g. SK_Unified) hard-veto when it is missing — so without this
+                # they would never trade live even though the backtester always
+                # injects the window. Build a <=200-bar window from the strategy's
+                # own live_timeframe (matching the timeframe its params were
+                # backtested on), falling back to 1h — the intraday layer beneath
+                # the 4h/1d HTF-bias frames these strategies already consume.
+                _win_tf = strategy_row.live_timeframe
+                _win_src = mtf_bars.get(_win_tf) if _win_tf in mtf_bars else mtf_bars.get("1h")
+                if _win_src is not None and not _win_src.empty:
+                    effective_md["ohlcv_window"] = df_to_ohlcv_list(_win_src)[-200:]
             else:
                 # Compute technical indicators from the raw candle DataFrame
                 # so non-MTF strategies (DTC, RSI_Reversal, MACD_Momentum,
