@@ -1011,12 +1011,22 @@ async def _process_signal_inner(
             break
 
     if news_conf > 0.4 and abs(news_bias) > 0.2:
-        default_lot = round(default_lot * news_caution_factor, 2)
+        # Clamp to the broker minimum. News caution scales the lot DOWN, and for
+        # a 0.01 base any factor < 0.5 rounds to 0.00 (verified) — which would
+        # otherwise pass straight through FIXED sizing and open a phantom
+        # zero-lot trade. Never let caution drive the lot below 0.01.
+        default_lot = max(0.01, round(default_lot * news_caution_factor, 2))
 
     sl = levels.get("sl") or levels.get("stop_loss")
     lot_size, block_reason = check_and_compute_lot_size(
         db, symbol=symbol, entry_price=price, stop_loss=sl, default_lot_size=default_lot
     )
+
+    # Defense-in-depth: never let a sub-minimum lot reach place_order. Any lot
+    # below the broker's 0.01 minimum is routed through the BLOCKED path below
+    # instead of being "placed" and recorded as a phantom zero-lot OPEN trade.
+    if not block_reason and lot_size < 0.01:
+        block_reason = f"Lot size {lot_size:.4f} below broker minimum (0.01)"
 
     if block_reason:
         decision = _log_ensemble_decision(

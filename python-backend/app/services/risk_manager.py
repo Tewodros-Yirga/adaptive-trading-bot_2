@@ -327,6 +327,18 @@ def check_and_compute_lot_size(
     else:
         lot_size = default_lot_size
 
+    # ── Broker-minimum floor (guards against phantom zero-lot OPEN trades) ──
+    # A lot below the 0.01 broker minimum can never fill. FIXED mode used to
+    # return it UNBLOCKED, so the orchestrator would "place" a 0-lot order the
+    # broker silently rejects yet still record an OPEN trade — a phantom
+    # zero-lot position that clutters Live Trades and never reconciles (it has
+    # no real ticket). Treat any sub-minimum lot as a hard block so no such row
+    # is ever written. DYNAMIC already floors at 0.01; this covers FIXED, a
+    # per-strategy param lot_size of 0, the news-caution rounding, and a
+    # max_lot_size set below the broker minimum.
+    if lot_size < 0.01:
+        return 0.0, f"Lot size {lot_size:.4f} below broker minimum (0.01)"
+
     return lot_size, None
 
 

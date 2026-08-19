@@ -504,18 +504,59 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     return api_key
 
 
+# ── Interactive API docs guard ────────────────────────────────────────────────
+def _docs_enabled() -> bool:
+    """Whether to expose the interactive API docs (/docs, /redoc, /openapi.json).
+
+    Those endpoints publish the ENTIRE API surface — every route, request/response
+    schema, and which auth each path requires — to anonymous callers, which is
+    exactly the reconnaissance aid you don't want reachable on a live trading box.
+    They are therefore OFF by default and must be explicitly enabled for local dev:
+
+      • ENABLE_API_DOCS=1|true|yes|on            → force docs on, or
+      • APP_ENV / ENV = dev|development|local     → dev environments
+
+    When disabled, FastAPI serves no schema route and returns 404 for all three.
+    """
+    if os.environ.get("ENABLE_API_DOCS", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    env = (os.environ.get("APP_ENV") or os.environ.get("ENV") or "").strip().lower()
+    return env in ("dev", "development", "local")
+
+
 # ── App factory ────────────────────────────────────────────────────────────────
 def create_app() -> FastAPI:
+    _docs_on = _docs_enabled()
     app = FastAPI(
         title="AlgoTrade Pro",
         version="2.0.0",
         lifespan=lifespan,
+        # Hardened: interactive docs + OpenAPI schema are disabled unless
+        # explicitly enabled (see _docs_enabled). Prevents anonymous API-surface
+        # disclosure in production.
+        docs_url="/docs" if _docs_on else None,
+        redoc_url="/redoc" if _docs_on else None,
+        openapi_url="/openapi.json" if _docs_on else None,
     )
 
+    # ── CORS ───────────────────────────────────────────────────────────────
+    # The frontend authenticates with a Bearer token from localStorage (see
+    # frontend/src/api/index.ts) and the WebSocket uses a ?token= query param —
+    # NOTHING relies on cookies. So allow_credentials is False, which also
+    # removes the unsafe "allow_origins=* + allow_credentials=True" combination
+    # (Starlette would otherwise echo any Origin back and permit credentialed
+    # cross-site calls). Origins are locked down in production via the
+    # CORS_ALLOW_ORIGINS env var (comma-separated); it defaults to "*", which is
+    # safe here precisely because no credentials are accepted. In production the
+    # SPA is same-origin (API base "/api"), so CORS does not apply to it at all.
+    _cors_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+    _cors_origins = (
+        [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else ["*"]
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
