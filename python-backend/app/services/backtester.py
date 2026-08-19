@@ -841,8 +841,15 @@ def _contract_size(symbol: str) -> float:
     Crypto (BTCUSD, ETHUSD, …)  :       1  (1 lot = 1 coin)
 
     Add rows here as you add new symbols.
+
+    Cent-account variants (XAUUSDc → XAUUSD, EURUSDc → EURUSD, ...) denote the
+    same instrument quoted in cents, so the trailing C is stripped before the
+    lookups below.
     """
     sym = symbol.upper().replace("/", "").replace("_", "").replace("-", "").replace(" ", "")
+    # Cent-account variant: same instrument, quoted in cents — map to base symbol.
+    if len(sym) > 1 and sym.endswith("C"):
+        sym = sym[:-1]
     # Metals
     if sym in ("XAUUSD", "GOLD"):
         return 100.0

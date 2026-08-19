@@ -1052,7 +1052,37 @@ async def _process_signal_inner(
             and p.get("type", "").upper() == final_direction.upper()
         ]
     except Exception as _dup_exc:
-        logger.warning("Could not fetch live positions for duplicate check: %s", _dup_exc)
+        # FAIL-CLOSED fallback: a failed bridge position read must NEVER silently
+        # disable the duplicate guard (that would let the same symbol+direction
+        # double-fill). Use the caller-supplied snapshot instead — the live loop
+        # always passes "_existing_positions" (bridge-sourced, or DB-sourced when
+        # the bridge is down) already filtered to this symbol. If even that is
+        # missing, skip the entry rather than risk a duplicate position.
+        logger.warning(
+            "Could not fetch live positions for duplicate check (%s) — "
+            "falling back to caller-supplied position snapshot",
+            _dup_exc,
+        )
+        _fallback_snapshot = market_data.get("_existing_positions") or []
+        existing_same_dir = [
+            p for p in _fallback_snapshot
+            if p.get("type", "").upper() == final_direction.upper()
+        ]
+        if not _fallback_snapshot:
+            logger.warning(
+                "[DuplicateGuard] No position snapshot available for %s — "
+                "skipping %s entry to avoid a duplicate fill",
+                symbol, final_direction,
+            )
+            return {
+                "status": "DUPLICATE_CHECK_UNAVAILABLE",
+                "reason": (
+                    "Bridge position read failed and no position snapshot was "
+                    "supplied — skipping entry to avoid a duplicate fill"
+                ),
+                "symbol": symbol,
+                "direction": final_direction,
+            }
 
     if existing_same_dir:
         dup_min_conf        = float(crud.get_setting(db, "duplicate_min_confidence")         or 0.75)

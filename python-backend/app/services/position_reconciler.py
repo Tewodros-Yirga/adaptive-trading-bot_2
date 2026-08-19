@@ -137,6 +137,180 @@ def _trigger_trade_close_hooks(db: Database, trade_id: int, trade_result: str) -
         )
 
 
+def _num(v):
+    """Coerce a broker numeric field to float, or None if not parseable."""
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _setting_float(db: Database, key: str, default: float) -> float:
+    """Read a float AppSetting via crud, falling back to ``default``."""
+    from .. import crud
+    try:
+        raw = crud.get_setting(db, key)
+        if raw is not None and str(raw).strip() != "":
+            return float(raw)
+    except Exception:
+        pass
+    return default
+
+
+def _parse_position_open_dt(pos: dict) -> datetime | None:
+    """Parse an MT5 position's open time to naive UTC, or None if unavailable."""
+    raw = pos.get("openTime") or pos.get("time")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            return datetime.utcfromtimestamp(float(raw))
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+    except Exception:
+        return None
+
+
+def _open_ticket_set(db: Database) -> set[int]:
+    """Tickets of all currently-open DB trades — used to detect orphan positions
+    (live positions with no backing trade record)."""
+    tickets: set[int] = set()
+    for t in _get_open_trades_with_tickets(db):
+        try:
+            tickets.add(int(t["mt5_ticket"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return tickets
+
+
+def adopt_orphan_position(
+    db: Database, pos: dict, protective_sl_pct: float, summary: dict
+) -> bool:
+    """
+    Adopt a single live MT5 position that has no open DB trade backing it and put
+    it under full bot management, so *every* position on the connected account is
+    the bot's responsibility:
+
+      1. Record it as an ``ADOPTED`` open trade (idempotent — see
+         ``crud.adopt_orphan_trade``).
+      2. If it has no stop-loss, set a protective SL at ``protective_sl_pct`` on
+         the safe side and push it to the broker.
+      3. Attach a ladder plan (R-multiple TPs synthesised from ``R = |entry-sl|``
+         when the position has none) so the existing ladder_manager partial-
+         closes, moves to break-even, and ATR-trails it exactly like a
+         bot-opened trade.
+
+    Human-set SL/TP are respected — they are only ever set when missing.
+
+    Returns True when a new adoption record was created.
+    """
+    from ..services.bridge_client import bridge_client
+    from ..services.orchestrator import build_ladder_plan
+    from .. import crud
+
+    ticket = pos.get("ticket")
+    if ticket is None:
+        return False
+    ticket = int(ticket)
+
+    direction = (pos.get("type") or "").upper()
+    symbol = pos.get("symbol")
+    entry = _num(pos.get("openPrice")) or _num(pos.get("price"))
+    lot = _num(pos.get("volume")) or _num(pos.get("lots")) or 0.0
+    sl = _num(pos.get("sl")) or 0.0   # 0.0 == no stop set
+    tp = _num(pos.get("tp")) or 0.0   # 0.0 == no target set
+
+    if direction not in ("BUY", "SELL") or not symbol or not entry or entry <= 0 or lot <= 0:
+        logger.warning(
+            "Position reconciler: cannot adopt ticket=%s — incomplete/invalid "
+            "position data (symbol=%s dir=%s entry=%s lot=%s)",
+            ticket, symbol, direction, entry, lot,
+        )
+        summary["errors"] += 1
+        return False
+
+    sign = 1 if direction == "BUY" else -1
+
+    # ── Protective SL when the position has none ─────────────────────────
+    protected = False
+    if sl <= 0:
+        sl = round(entry * (1 - sign * protective_sl_pct), 5)
+        try:
+            bridge_client.modify_position(ticket, stop_loss=sl)
+            protected = True
+            summary["adopt_protected"] += 1
+            logger.info(
+                "Position reconciler: set protective SL on orphan ticket=%d "
+                "%s %s entry=%.5f sl=%.5f (%.2f%%)",
+                ticket, direction, symbol, entry, sl, protective_sl_pct * 100,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Position reconciler: protective SL modify failed ticket=%d: %s",
+                ticket, exc,
+            )
+            # Fall through — still adopt/track it even if the broker modify failed.
+
+    # ── R-multiple targets + ladder plan ─────────────────────────────────
+    r = abs(entry - sl)
+    if r <= 0:
+        r = entry * protective_sl_pct  # degenerate guard (SL ~= entry)
+    atr = r / 1.5  # ATR proxy so the ladder trail has a sane step (no candle fetch)
+
+    if tp > 0:
+        tp_levels = [tp, None, None, None]  # respect the human's single TP
+        hard_tp = tp
+    else:
+        tp_levels = [round(entry + sign * k * r, 5) for k in (1, 2, 3, 4)]
+        hard_tp = tp_levels[-1]
+        try:
+            bridge_client.modify_position(ticket, take_profit=hard_tp)
+            logger.info(
+                "Position reconciler: set hard-TP on orphan ticket=%d tp=%.5f (4R)",
+                ticket, hard_tp,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Position reconciler: hard-TP modify failed ticket=%d: %s",
+                ticket, exc,
+            )
+
+    ladder = build_ladder_plan(direction, entry, sl, lot, tp_levels, atr)
+    opened_at = _parse_position_open_dt(pos) or datetime.utcnow()
+
+    fields = {
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": entry,
+        "lot_size": lot,
+        "stop_loss": sl,
+        "take_profit": hard_tp,
+        "mt5_ticket": ticket,
+        "atr_at_entry": atr,
+        "opened_at": opened_at,
+        "ladder": ladder,
+    }
+
+    try:
+        _trade, created = crud.adopt_orphan_trade(db, fields)
+    except Exception as exc:
+        logger.error(
+            "Position reconciler: adopt_orphan_trade failed ticket=%d: %s",
+            ticket, exc, exc_info=True,
+        )
+        summary["errors"] += 1
+        return False
+
+    if created:
+        summary["adopted"] += 1
+        logger.warning(
+            "Position reconciler: ADOPTED orphan position ticket=%d %s %s "
+            "lot=%.2f entry=%.5f sl=%.5f tp=%.5f protective_sl=%s — now bot-managed",
+            ticket, direction, symbol, lot, entry, sl, hard_tp, protected,
+        )
+    return created
+
+
 def reconcile_positions(db: Database) -> dict[str, int]:
     """
     Main reconciliation function. Call from the async loop via run_in_executor
@@ -149,6 +323,8 @@ def reconcile_positions(db: Database) -> dict[str, int]:
             "closed": int,           # successfully marked closed
             "no_deal_data": int,     # ghost but no deal history available
             "ticket_matched": int,   # secondary-pass trades matched and ticket written back
+            "adopted": int,          # orphan positions adopted into management
+            "adopt_protected": int,  # orphans that were given a protective SL
             "errors": int,           # unexpected errors
         }
     """
@@ -162,6 +338,8 @@ def reconcile_positions(db: Database) -> dict[str, int]:
         "closed": 0,
         "no_deal_data": 0,
         "ticket_matched": 0,
+        "adopted": 0,
+        "adopt_protected": 0,
         "errors": 0,
     }
 
@@ -252,6 +430,38 @@ def reconcile_positions(db: Database) -> dict[str, int]:
 
     except Exception as exc:
         logger.warning("Position reconciler: secondary pass failed: %s", exc)
+
+    # ── ORPHAN ADOPTION PASS — every account position is the bot's job ───
+    # Any live position with no open DB trade backing it (a manual order, an
+    # un-recorded duplicate, or a failed post-order insert) is adopted and put
+    # under full management. Runs AFTER the secondary pass so a position that
+    # was just matched to a ticketless trade is not mistaken for an orphan.
+    try:
+        min_age = _setting_float(db, "orphan_adopt_min_age_secs", 45.0)
+        sl_pct = _setting_float(db, "orphan_protective_sl_pct", 0.01)
+        tracked = _open_ticket_set(db)
+        now = datetime.utcnow()
+        for pos in live_positions:
+            tkt = pos.get("ticket")
+            if tkt is None:
+                continue
+            try:
+                if int(tkt) in tracked:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            # Min-age guard: don't race the orchestrator's own just-placed order
+            # whose DB insert may still be in flight.
+            opened = _parse_position_open_dt(pos)
+            if opened is not None and (now - opened).total_seconds() < min_age:
+                logger.debug(
+                    "Position reconciler: skipping young orphan ticket=%s (age < %.0fs)",
+                    tkt, min_age,
+                )
+                continue
+            adopt_orphan_position(db, pos, sl_pct, summary)
+    except Exception as exc:
+        logger.warning("Position reconciler: orphan adoption pass failed: %s", exc)
 
     # ── 2. Fetch open DB trades WITH tickets ────────────────────────────
     try:
@@ -347,13 +557,15 @@ def reconcile_positions(db: Database) -> dict[str, int]:
                 trade_doc.get("_id"), exc, exc_info=True,
             )
 
-    if summary["ghost_found"] > 0 or summary["errors"] > 0 or summary["ticket_matched"] > 0:
+    if (summary["ghost_found"] > 0 or summary["errors"] > 0
+            or summary["ticket_matched"] > 0 or summary["adopted"] > 0):
         logger.info(
             "Position reconciler: checked=%d ghost=%d closed=%d "
-            "no_data=%d ticket_matched=%d errors=%d",
+            "no_data=%d ticket_matched=%d adopted=%d adopt_protected=%d errors=%d",
             summary["checked"], summary["ghost_found"],
             summary["closed"], summary["no_deal_data"],
-            summary["ticket_matched"], summary["errors"],
+            summary["ticket_matched"], summary["adopted"],
+            summary["adopt_protected"], summary["errors"],
         )
 
     return summary

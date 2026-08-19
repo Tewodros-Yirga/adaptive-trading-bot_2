@@ -150,6 +150,77 @@ def log_trade(db: Database, fields: dict) -> Trade:
     return Trade.from_doc(fields)
 
 
+def adopt_orphan_trade(db: Database, fields: dict) -> tuple[Trade, bool]:
+    """
+    Idempotently adopt a broker position that has no tracking trade record.
+
+    Used by the position reconciler when it finds a live MT5 position whose
+    ticket is not backed by any open trade — a manual order, an un-recorded
+    duplicate, or a trade whose post-order insert failed. Every position on the
+    connected account must be the bot's responsibility, so we create a trade
+    record for it and (elsewhere) attach protective SL + a ladder plan.
+
+    The insert is an atomic upsert keyed on ``{mt5_ticket, closed_at $exists
+    false}`` so a concurrent reconciler / stream pass cannot create a second
+    record for the same ticket. A pre-check short-circuits the common
+    already-tracked case (and avoids burning a trade-id counter tick).
+
+    The record is tagged ``strategy_name="ADOPTED"``, ``adopted=True``,
+    ``source="orphan_adoption"`` so it is clearly bot-managed yet distinct from a
+    strategy-originated trade.
+
+    Returns ``(trade, created)`` — ``created`` is False when the ticket was
+    already tracked (no-op) or a concurrent pass adopted it first.
+    """
+    fields = dict(fields)
+    ticket = fields.get("mt5_ticket")
+    if ticket is None:
+        # No ticket to key the upsert on — fall back to a plain insert.
+        return log_trade(db, fields), True
+
+    fields.setdefault("opened_at", datetime.utcnow())
+    fields.setdefault("result", "OPEN")
+    fields.setdefault("strategy_name", "ADOPTED")
+    fields["adopted"] = True
+    fields.setdefault("source", "orphan_adoption")
+    acct = get_active_account(db)
+    if acct is not None:
+        fields.setdefault("mt5_account", acct)
+    fields.pop("closed_at", None)  # open trade — never persist closed_at
+
+    filt = {"mt5_ticket": ticket, "closed_at": {"$exists": False}}
+
+    # Fast path: already tracked → no-op (also avoids consuming an id counter).
+    existing = db[COLL_TRADES].find_one(filt)
+    if existing is not None:
+        return Trade.from_doc(existing), False
+
+    insert_fields = dict(fields)
+    insert_fields.pop("mt5_ticket", None)  # supplied by the filter equality on insert
+    insert_fields["_id"] = next_id(db, COLL_TRADES)
+
+    result = db[COLL_TRADES].update_one(
+        filt, {"$setOnInsert": insert_fields}, upsert=True
+    )
+    created = result.upserted_id is not None
+
+    doc = db[COLL_TRADES].find_one(filt) or {**fields, "_id": insert_fields["_id"]}
+
+    if created:
+        _notify_trade_op(
+            db, "open",
+            symbol=doc.get("symbol"),
+            direction=doc.get("direction"),
+            lot_size=doc.get("lot_size"),
+            price=doc.get("entry_price"),
+            stop_loss=doc.get("stop_loss"),
+            take_profit=doc.get("take_profit"),
+            ticket=doc.get("mt5_ticket"),
+            trade_id=doc.get("_id"),
+        )
+    return Trade.from_doc(doc), created
+
+
 def close_trade(
     db: Database,
     trade_id: int,

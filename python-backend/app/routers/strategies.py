@@ -15,6 +15,12 @@ from ..models import Strategy, Trade
 from ..schemas import BacktestCandidateOut, SearchStatusOut, SearchSettingsIn
 from ..services.orchestrator import set_strategy_live
 from ..strategy.registry import STRATEGY_REGISTRY, list_strategies
+from ..strategy.ensemble.weight_manager import (
+    WeightManager, _ALL_STRATEGIES,
+    get_force_active, get_force_suspended,
+    set_force_active, set_force_suspended,
+    remove_from_suspended_snapshot,
+)
 from pymongo import DESCENDING as _DESC
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
@@ -127,6 +133,107 @@ def list_all(db: Database = Depends(get_db)):
             **stats,
         })
     return result
+
+
+# ── Ensemble suspension: storage inspection + manual overrides ─────────────
+# IMPORTANT: GET /suspension is declared BEFORE GET /{name} so the path-param
+# route does not shadow it.
+#
+# Where suspension lives (all in the app_settings collection):
+#   • ensemble_suspension_state       — cooldown/probation clock {name:{since,…}}
+#   • ensemble_force_active           — manual "never auto-suspend" list
+#   • ensemble_force_suspended        — manual kill-switch list
+#   • ensemble_suspended_strategies   — snapshot the backtester reads
+# The live suspended set is *derived* by WeightManager.get_suspended_strategies.
+
+@router.get("/suspension")
+def get_suspension_state(db: Database = Depends(get_db)):
+    """
+    Report ensemble-suspension state for every strategy: the current derived
+    suspended set, the manual override lists, and per-strategy diagnostics (live
+    win-rate, best qualified backtest profit factor, recovery eligibility) so the
+    UI can show *why* each strategy is suspended and how it can escape.
+    """
+    wm = WeightManager()
+    suspended = wm.get_suspended_strategies(db)
+    force_active = set(get_force_active(db))
+    force_suspended = set(get_force_suspended(db))
+
+    strategies = []
+    for name in _ALL_STRATEGIES:
+        recent = list(
+            db[COLL_TRADES]
+            .find({"strategy_name": name, "result": {"$in": ["WIN", "LOSS"]}}, {"result": 1})
+            .sort("opened_at", -1)
+            .limit(WeightManager.SUSPENSION_LOOKBACK)
+        )
+        n = len(recent)
+        wins = sum(1 for t in recent if t.get("result") == "WIN")
+        win_rate = round(wins / n * 100, 2) if n else None
+
+        best = db[COLL_BACKTEST_CANDIDATES].find_one(
+            {"strategy_name": name, "qualified": True},
+            sort=[("composite_score", _DESC)],
+        )
+        best_pf = float(best.get("profit_factor") or 0.0) if best else None
+
+        strategies.append({
+            "name": name,
+            "suspended": name in suspended,
+            "force_active": name in force_active,
+            "force_suspended": name in force_suspended,
+            "live_win_rate": win_rate,
+            "live_trades": n,
+            "best_qualified_profit_factor": best_pf,
+            "recovery_eligible": bool(
+                best_pf is not None and best_pf >= WeightManager.SUSPENSION_RECOVERY_PROFIT_FACTOR
+            ),
+        })
+
+    return {
+        "suspended": sorted(suspended),
+        "force_active": sorted(force_active),
+        "force_suspended": sorted(force_suspended),
+        "recovery_profit_factor_threshold": WeightManager.SUSPENSION_RECOVERY_PROFIT_FACTOR,
+        "win_rate_threshold_pct": WeightManager.SUSPENSION_WIN_RATE_THRESHOLD * 100,
+        "min_trades": WeightManager.SUSPENSION_MIN_TRADES,
+        "strategies": strategies,
+    }
+
+
+@router.post("/{name}/unsuspend")
+def unsuspend_strategy(name: str, db: Database = Depends(get_db), _w=Depends(require_write_access)):
+    """Manually lift a suspension: pin the strategy ACTIVE (never auto-suspended),
+    clear any force-suspend, and immediately drop it from the backtester's
+    suspended snapshot so live voting and backtesting both resume at once."""
+    if name not in _ALL_STRATEGIES:
+        raise HTTPException(404, f"Strategy {name} not found")
+    fa = set(get_force_active(db)); fa.add(name); set_force_active(db, list(fa))
+    fs = set(get_force_suspended(db)); fs.discard(name); set_force_suspended(db, list(fs))
+    remove_from_suspended_snapshot(db, name)
+    return {"status": "unsuspended", "name": name, "force_active": sorted(fa)}
+
+
+@router.post("/{name}/suspend")
+def suspend_strategy(name: str, db: Database = Depends(get_db), _w=Depends(require_write_access)):
+    """Manual kill switch: pin the strategy SUSPENDED (excluded from live voting)
+    and clear any force-active override so the suspension actually takes effect."""
+    if name not in _ALL_STRATEGIES:
+        raise HTTPException(404, f"Strategy {name} not found")
+    fs = set(get_force_suspended(db)); fs.add(name); set_force_suspended(db, list(fs))
+    fa = set(get_force_active(db)); fa.discard(name); set_force_active(db, list(fa))
+    return {"status": "suspended", "name": name, "force_suspended": sorted(fs)}
+
+
+@router.post("/{name}/clear-suspension-override")
+def clear_suspension_override(name: str, db: Database = Depends(get_db), _w=Depends(require_write_access)):
+    """Remove both manual overrides — revert to fully automatic suspension
+    (live win-rate + backtest recovery + cooldown probation)."""
+    if name not in _ALL_STRATEGIES:
+        raise HTTPException(404, f"Strategy {name} not found")
+    fa = set(get_force_active(db)); fa.discard(name); set_force_active(db, list(fa))
+    fs = set(get_force_suspended(db)); fs.discard(name); set_force_suspended(db, list(fs))
+    return {"status": "cleared", "name": name}
 
 
 # ── Single strategy by name ───────────────────────────────────────────────
