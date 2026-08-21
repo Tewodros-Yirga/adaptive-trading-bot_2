@@ -149,6 +149,13 @@ def run_startup_migrations() -> None:
             background=True,
             name="ix_backtest_candidates_strategy_qualified",
         )
+        # Serves the recency-ranked "latest deployed candidate" reads
+        # (promoted/qualified filter + sort by evaluated_at DESC).
+        db["backtest_candidates"].create_index(
+            [("strategy_name", ASCENDING), ("evaluated_at", DESCENDING)],
+            background=True,
+            name="ix_backtest_candidates_strategy_recent",
+        )
 
         # ── ensemble_decisions ────────────────────────────────────────────
         # TTL on timestamp auto-deletes stale decisions (also serves the

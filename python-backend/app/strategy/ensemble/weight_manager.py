@@ -16,6 +16,30 @@ from .voter import ALCHEMIST_MIN_WEIGHT
 
 logger = logging.getLogger(__name__)
 
+
+def _latest_backtest_candidate(db, strategy_name: str) -> dict | None:
+    """Most recent *deployed* backtest candidate for a strategy.
+
+    Ranked by recency, NOT by absolute ``composite_score``. After a scoring-model
+    change (the baseline rescore) the newest promotions sit on a lower scale than
+    pre-rescore candidates still in the collection, so ``sort composite_score DESC``
+    would return a stale, inflated pre-rescore row instead of what is live now.
+    Prefer the latest promoted config (what is actually deployed); fall back to the
+    latest merely-qualified candidate when nothing has promoted yet.
+    """
+    coll = db["backtest_candidates"]
+    return (
+        coll.find_one(
+            {"strategy_name": strategy_name, "promoted": True},
+            sort=[("evaluated_at", -1)],
+        )
+        or coll.find_one(
+            {"strategy_name": strategy_name, "qualified": True},
+            sort=[("evaluated_at", -1)],
+        )
+    )
+
+
 _ALL_STRATEGIES = [
     "DTC",
     "RSI_Reversal",
@@ -198,10 +222,7 @@ class WeightManager:
 
             # --- Profit factor from best backtest candidate ---
             try:
-                best = db["backtest_candidates"].find_one(
-                    {"strategy_name": strategy_name, "qualified": True},
-                    sort=[("composite_score", -1)],
-                )
+                best = _latest_backtest_candidate(db, strategy_name)
                 if best:
                     pf = float(best.get("profit_factor") or 0.0)
                     pf_norm = min(pf / 3.0, 1.0)
@@ -347,10 +368,7 @@ class WeightManager:
         minimum-trades / win-rate / drawdown gates, so we only add a profit-factor
         bar (well above the qualification floor) on top."""
         try:
-            best = db["backtest_candidates"].find_one(
-                {"strategy_name": strategy_name, "qualified": True},
-                sort=[("composite_score", -1)],
-            )
+            best = _latest_backtest_candidate(db, strategy_name)
             if not best:
                 return False
             pf = float(best.get("profit_factor") or 0.0)

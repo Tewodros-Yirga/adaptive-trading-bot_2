@@ -969,9 +969,13 @@ def _resolve_params(db: Database, strategy_name: str, override_params: dict) -> 
     # 1. Best promoted candidate from the backtester microservice
     try:
         from ..db import COLL_BACKTEST_CANDIDATES
+        # Most recently *promoted* candidate = what the optimizer last deployed.
+        # Rank by recency, not composite_score: a post-rescore promotion scores
+        # lower than stale pre-rescore candidates, so DESC-by-score would pin us
+        # to out-of-date params.
         best_candidate = db[COLL_BACKTEST_CANDIDATES].find_one(
             {"strategy_name": strategy_name, "qualified": True, "promoted": True},
-            sort=[("composite_score", -1)],
+            sort=[("evaluated_at", -1)],
         )
         if best_candidate:
             raw = best_candidate.get("params_json")

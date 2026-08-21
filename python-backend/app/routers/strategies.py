@@ -172,8 +172,11 @@ def get_suspension_state(db: Database = Depends(get_db)):
         win_rate = round(wins / n * 100, 2) if n else None
 
         best = db[COLL_BACKTEST_CANDIDATES].find_one(
+            {"strategy_name": name, "promoted": True},
+            sort=[("evaluated_at", _DESC)],
+        ) or db[COLL_BACKTEST_CANDIDATES].find_one(
             {"strategy_name": name, "qualified": True},
-            sort=[("composite_score", _DESC)],
+            sort=[("evaluated_at", _DESC)],
         )
         best_pf = float(best.get("profit_factor") or 0.0) if best else None
 
@@ -627,10 +630,16 @@ def search_status(strategy_name: str, db: Database = Depends(get_db)):
     # Count total iterations from audit log
     total_iters = db[COLL_BACKTESTER_RUNS].count_documents({"strategy_name": strategy_name})
 
-    # Find the best-ever qualified candidate for best_params
+    # Deployed (most recently promoted) candidate for best_params. Rank by
+    # recency, not composite_score: a post-rescore promotion scores lower than
+    # stale pre-rescore candidates, so DESC-by-score would show out-of-date
+    # params next to a fresh score. Fall back to the latest qualified candidate.
     best_candidate = db[COLL_BACKTEST_CANDIDATES].find_one(
+        {"strategy_name": strategy_name, "promoted": True},
+        sort=[("evaluated_at", _DESC)],
+    ) or db[COLL_BACKTEST_CANDIDATES].find_one(
         {"strategy_name": strategy_name, "qualified": True},
-        sort=[("composite_score", _DESC)],
+        sort=[("evaluated_at", _DESC)],
     )
     best_params = best_candidate.get("params_json", {}) if best_candidate else {}
 

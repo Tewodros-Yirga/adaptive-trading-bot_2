@@ -692,9 +692,20 @@ def get_backtest_candidates(
 
 
 def get_best_backtest_candidate(db: Database, strategy_name: str) -> BacktestCandidate | None:
-    doc = db[COLL_BACKTEST_CANDIDATES].find_one(
+    """Most recent *deployed* candidate (promoted-first, else latest qualified).
+
+    Ranked by recency, NOT by absolute ``composite_score``: after a scoring-model
+    change (baseline rescore) the newest promotions score lower than stale
+    pre-rescore candidates still in the collection, so ``sort composite_score DESC``
+    would return an inflated, out-of-date row instead of what is deployed now.
+    """
+    coll = db[COLL_BACKTEST_CANDIDATES]
+    doc = coll.find_one(
+        {"strategy_name": strategy_name, "promoted": True},
+        sort=[("evaluated_at", -1)],
+    ) or coll.find_one(
         {"strategy_name": strategy_name, "qualified": True},
-        sort=[("composite_score", -1)],
+        sort=[("evaluated_at", -1)],
     )
     return BacktestCandidate.from_doc(doc) if doc else None
 
