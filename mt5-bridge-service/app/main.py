@@ -12,7 +12,26 @@ from .config import settings, validate_required_settings
 from .mt5_adapter import AutoTradingDisabledError, TooManyRequestsError, adapter
 from .schemas import CancelRequest, CandlesRequest, CloseRequest, LimitOrderRequest, ModifyRequest, OrderRequest
 
-app = FastAPI(title="Adaptive MT5 Bridge")
+
+def _docs_enabled() -> bool:
+    """Interactive docs (/docs, /redoc, /openapi.json) expose the full API
+    surface to anonymous callers. On the order-placing bridge that is especially
+    sensitive, so they are OFF by default — enable in dev with ENABLE_API_DOCS=1
+    (or APP_ENV/ENV = dev|development|local)."""
+    if os.environ.get("ENABLE_API_DOCS", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return (os.environ.get("APP_ENV") or os.environ.get("ENV") or "").strip().lower() in (
+        "dev", "development", "local",
+    )
+
+
+_DOCS_ON = _docs_enabled()
+app = FastAPI(
+    title="Adaptive MT5 Bridge",
+    docs_url="/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/openapi.json" if _DOCS_ON else None,
+)
 logger = logging.getLogger(__name__)
 
 
