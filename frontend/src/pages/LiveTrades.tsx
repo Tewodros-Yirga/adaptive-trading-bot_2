@@ -5,8 +5,22 @@ import {
 } from 'recharts'
 import { X, Filter } from 'lucide-react'
 import clsx from 'clsx'
-import { getTrades, getClosedTrades } from '../api'
+import { getTrades, getClosedTrades, getPendingOrders, getPendingOrderHistory } from '../api'
 import { Card, SectionHeader, Spinner, Pnl, Badge, Select, Input } from '../components'
+
+const CANCEL_REASON_LABEL: Record<string, string> = {
+  ENSEMBLE_REVERSAL: 'Opposite ensemble signal',
+  NEWS_OPPOSED: 'Opposing news signal',
+  MISSED_ENTRY_TP_PROGRESS: 'Missed entry (price ran to TP)',
+  MAX_AGE: 'Max age reached',
+  BROKER_REMOVED: 'Removed at broker',
+}
+const PENDING_STATUS_COLOR: Record<string, string> = {
+  CANCELLED: 'bg-warn/20 text-warn',
+  EXPIRED: 'bg-muted/20 text-muted',
+  FILLED: 'bg-success/20 text-success',
+  PENDING: 'bg-accent/20 text-accent',
+}
 
 const DIR_COLOR: Record<string, string> = {
   BUY: 'bg-success/20 text-success',
@@ -59,7 +73,7 @@ function TradeDetailModal({ trade, onClose }: { trade: any; onClose: () => void 
 }
 
 export default function LiveTrades() {
-  const [tab, setTab] = useState<'open' | 'closed' | 'chart'>('open')
+  const [tab, setTab] = useState<'open' | 'pending' | 'closed' | 'chart'>('open')
   const [selectedTrade, setSelectedTrade] = useState<any>(null)
   const [filterSymbol, setFilterSymbol] = useState('')
   const [filterResult, setFilterResult] = useState('')
@@ -74,6 +88,18 @@ export default function LiveTrades() {
   const { data: closedTrades, isLoading: closedLoading } = useQuery({
     queryKey: ['closedTrades'],
     queryFn: () => getClosedTrades(200),
+    refetchInterval: 30000,
+  })
+
+  const { data: pendingOrders, isLoading: pendingLoading } = useQuery({
+    queryKey: ['pendingOrders'],
+    queryFn: getPendingOrders,
+    refetchInterval: 10000,
+  })
+
+  const { data: pendingHistory } = useQuery({
+    queryKey: ['pendingHistory'],
+    queryFn: () => getPendingOrderHistory(200),
     refetchInterval: 30000,
   })
 
@@ -102,7 +128,7 @@ export default function LiveTrades() {
       <SectionHeader title="Live Trades" sub="Monitor open positions and review trade history" />
 
       <div className="flex gap-1 border-b border-border pb-0">
-        {(['open', 'closed', 'chart'] as const).map((t) => (
+        {(['open', 'pending', 'closed', 'chart'] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -110,7 +136,9 @@ export default function LiveTrades() {
               'px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px capitalize',
               tab === t ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-white',
             )}
-          >{t === 'open' ? `Open (${openTrades?.length ?? 0})` : t === 'closed' ? 'Closed History' : 'PnL Chart'}</button>
+          >{t === 'open' ? `Open (${openTrades?.length ?? 0})`
+            : t === 'pending' ? `Pending (${pendingOrders?.length ?? 0})`
+            : t === 'closed' ? 'Closed History' : 'PnL Chart'}</button>
         ))}
       </div>
 
@@ -152,6 +180,80 @@ export default function LiveTrades() {
               </table>
             </div>
           )}
+        </div>
+      )}
+
+      {tab === 'pending' && (
+        <div className="space-y-6">
+          {/* Active pending limit orders */}
+          <div>
+            <p className="text-sm font-medium mb-2">Resting Limit Orders</p>
+            {pendingLoading ? (
+              <div className="flex justify-center py-12"><Spinner size={28} /></div>
+            ) : !pendingOrders?.length ? (
+              <Card className="text-center py-10 text-muted text-sm">No resting pending orders.</Card>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-left">
+                      {['Symbol', 'Type', 'Limit', 'SL', 'TP1', 'Lot', 'Strategy', 'Ticket', 'Placed At'].map((h) => (
+                        <th key={h} className="text-xs text-muted font-medium py-2 pr-4">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pendingOrders.map((p: any) => (
+                      <tr key={p.id} className="border-b border-border/50">
+                        <td className="py-2 pr-4 font-medium">{p.symbol}</td>
+                        <td className="py-2 pr-4"><Badge label={p.order_type} color={DIR_COLOR[p.direction] ?? 'bg-muted/20 text-muted'} /></td>
+                        <td className="py-2 pr-4 mono text-xs">{p.limit_price?.toFixed(5)}</td>
+                        <td className="py-2 pr-4 mono text-xs">{p.stop_loss?.toFixed(5) ?? '—'}</td>
+                        <td className="py-2 pr-4 mono text-xs">{p.tp1?.toFixed(5) ?? '—'}</td>
+                        <td className="py-2 pr-4 mono text-xs">{p.lot_size}</td>
+                        <td className="py-2 pr-4 text-xs text-muted">{p.strategy_name ?? '—'}</td>
+                        <td className="py-2 pr-4 text-xs text-muted">{p.mt5_ticket ?? '—'}</td>
+                        <td className="py-2 pr-4 text-xs text-muted">{p.created_at ? new Date(p.created_at).toLocaleString() : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Cancellation report */}
+          <div>
+            <p className="text-sm font-medium mb-2">Cancellation Report</p>
+            {!pendingHistory?.length ? (
+              <Card className="text-center py-10 text-muted text-sm">No cancelled or expired pending orders yet.</Card>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-left">
+                      {['Symbol', 'Type', 'Limit', 'Status', 'Reason', 'Strategy', 'Resolved At'].map((h) => (
+                        <th key={h} className="text-xs text-muted font-medium py-2 pr-4">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pendingHistory.map((p: any) => (
+                      <tr key={p.id} className="border-b border-border/50">
+                        <td className="py-2 pr-4 font-medium">{p.symbol}</td>
+                        <td className="py-2 pr-4"><Badge label={p.order_type} color={DIR_COLOR[p.direction] ?? 'bg-muted/20 text-muted'} /></td>
+                        <td className="py-2 pr-4 mono text-xs">{p.limit_price?.toFixed(5)}</td>
+                        <td className="py-2 pr-4"><Badge label={p.status} color={PENDING_STATUS_COLOR[p.status] ?? 'bg-muted/20 text-muted'} /></td>
+                        <td className="py-2 pr-4 text-xs">{CANCEL_REASON_LABEL[p.cancel_reason] ?? p.cancel_reason ?? '—'}</td>
+                        <td className="py-2 pr-4 text-xs text-muted">{p.strategy_name ?? '—'}</td>
+                        <td className="py-2 pr-4 text-xs text-muted">{p.resolved_at ? new Date(p.resolved_at).toLocaleString() : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

@@ -167,6 +167,13 @@ git push --force "https://loriloha:${HF_TOKEN}@huggingface.co/spaces/loriloha/mt
 git branch -D hf-bridge-deploy
 ```
 
+> **⚠️ HuggingFace rejects ALL binary files** (any size). If push fails with "contains binary files", strip the offending file from history:
+> ```powershell
+> python -m git_filter_repo --path mt5-bridge-service/<path-to-binary> --invert-paths --force
+> git remote add origin <github-url>   # filter-repo removes remotes
+> ```
+> Then re-run the subtree split + push. The `config/servers.dat` binary has already been stripped; only `config/servers.dat.b64` (text) remains.
+
 ### Verify Health
 
 ```powershell
@@ -316,6 +323,14 @@ Events that trigger alerts:
 - Bridge circuit breaker opened
 - Adaptation rollback
 - Build mismatch detected
+- **Trade/order operations** (`trade_operations`) — every open, close, partial close,
+  SL/TP modify (incl. trailing stop) and pending-order cancel. Opt-in: add
+  `trade_operations` to the `alerts_enabled_events` allow-list. This is an
+  `info`-level event, but **any event explicitly named in `alerts_enabled_events`
+  bypasses the `alerts_min_level` floor**, so you do not need to lower `min_level`
+  to receive it (other, non-listed `info` events stay suppressed). Notifications are
+  throttled per operation+ticket, so trailing-stop modifies on one ticket are
+  coalesced to at most one per `alerts_throttle_seconds`.
 
 ### What to Monitor Before Real Money
 

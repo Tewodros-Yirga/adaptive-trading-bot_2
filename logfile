@@ -1,0 +1,41 @@
+2026-06-22 09:50:49.813 EAT [9756] LOG:  starting PostgreSQL 17.7 on x86_64-windows, compiled by msvc-19.44.35221, 64-bit
+2026-06-22 09:50:49.818 EAT [9756] LOG:  listening on IPv6 address "::1", port 5433
+2026-06-22 09:50:49.818 EAT [9756] LOG:  listening on IPv4 address "127.0.0.1", port 5433
+2026-06-22 09:50:49.887 EAT [20816] LOG:  database system was interrupted; last known up at 2026-06-20 12:26:26 EAT
+2026-06-22 09:50:50.639 EAT [20816] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-06-22 09:50:50.646 EAT [20816] LOG:  redo starts at 0/2AEC3B8
+2026-06-22 09:50:50.646 EAT [20816] LOG:  invalid record length at 0/2AEC4C0: expected at least 24, got 0
+2026-06-22 09:50:50.647 EAT [20816] LOG:  redo done at 0/2AEC488 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+2026-06-22 09:50:50.653 EAT [24144] LOG:  checkpoint starting: end-of-recovery immediate wait
+2026-06-22 09:50:50.663 EAT [24144] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.002 s, total=0.015 s; sync files=2, longest=0.002 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/2AEC4C0, redo lsn=0/2AEC4C0
+2026-06-22 09:50:50.688 EAT [9756] LOG:  database system is ready to accept connections
+2026-06-22 09:55:50.667 EAT [24144] LOG:  checkpoint starting: time
+2026-06-22 09:55:50.785 EAT [24144] LOG:  checkpoint complete: wrote 1 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.105 s, sync=0.002 s, total=0.122 s; sync files=1, longest=0.002 s, average=0.002 s; distance=5 kB, estimate=5 kB; lsn=0/2AEDC68, redo lsn=0/2AEDC10
+2026-06-22 10:06:01.518 EAT [23400] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:06:01.518 EAT [26320] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:06:01.518 EAT [16660] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:06:13.415 EAT [2092] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:06:13.415 EAT [26972] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:06:13.415 EAT [9972] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:07:07.561 EAT [20536] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:07:07.561 EAT [24664] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:07:07.561 EAT [24556] LOG:  could not receive data from client: An existing connection was forcibly closed by the remote host.
+	
+2026-06-22 10:12:48.875 EAT [28644] ERROR:  column "last_used_transaction_jti" does not exist at character 378
+2026-06-22 10:12:48.875 EAT [28644] STATEMENT:  SELECT "sender_id" AS "senderId", "phone_number" AS "phoneNumber", "email", "is_verified" AS "isVerified", "is_active" AS "isActive", "first_name" AS "firstName", "last_name" AS "lastName", "username", "password_hash" AS "passwordHash", "last_login" AS "lastLogin", "deleted", "created_by" AS "createdBy", "updated_by" AS "updatedBy", "otp_blocked_until" AS "otpBlockedUntil", "last_used_transaction_jti" AS "lastUsedTransactionJti", "created_at" AS "createdAt", "updated_at" AS "updatedAt" FROM "sender" AS "Sender" WHERE (("Sender"."email" = '+2511234567891' OR "Sender"."phone_number" = '+2511234567891') AND "Sender"."deleted" = false) LIMIT 1;
+2026-06-22 10:13:08.787 EAT [26364] ERROR:  column "last_used_transaction_jti" does not exist at character 378
+2026-06-22 10:13:08.787 EAT [26364] STATEMENT:  SELECT "sender_id" AS "senderId", "phone_number" AS "phoneNumber", "email", "is_verified" AS "isVerified", "is_active" AS "isActive", "first_name" AS "firstName", "last_name" AS "lastName", "username", "password_hash" AS "passwordHash", "last_login" AS "lastLogin", "deleted", "created_by" AS "createdBy", "updated_by" AS "updatedBy", "otp_blocked_until" AS "otpBlockedUntil", "last_used_transaction_jti" AS "lastUsedTransactionJti", "created_at" AS "createdAt", "updated_at" AS "updatedAt" FROM "sender" AS "Sender" WHERE (("Sender"."email" = '+2511234567891' OR "Sender"."phone_number" = '+2511234567891') AND "Sender"."deleted" = false) LIMIT 1;
+2026-06-22 10:14:44.262 EAT [24624] ERROR:  column "last_used_transaction_jti" does not exist at character 378
+2026-06-22 10:14:44.262 EAT [24624] STATEMENT:  SELECT "sender_id" AS "senderId", "phone_number" AS "phoneNumber", "email", "is_verified" AS "isVerified", "is_active" AS "isActive", "first_name" AS "firstName", "last_name" AS "lastName", "username", "password_hash" AS "passwordHash", "last_login" AS "lastLogin", "deleted", "created_by" AS "createdBy", "updated_by" AS "updatedBy", "otp_blocked_until" AS "otpBlockedUntil", "last_used_transaction_jti" AS "lastUsedTransactionJti", "created_at" AS "createdAt", "updated_at" AS "updatedAt" FROM "sender" AS "Sender" WHERE (("Sender"."email" = '+2511234567891' OR "Sender"."phone_number" = '+2511234567891') AND "Sender"."deleted" = false) LIMIT 1;
+2026-06-22 10:16:37.808 EAT [9756] LOG:  background worker "logical replication launcher" (PID 23684) was terminated by exception 0xC000013A
+2026-06-22 10:16:37.808 EAT [9756] HINT:  See C include file "ntstatus.h" for a description of the hexadecimal value.
+2026-06-22 10:16:37.808 EAT [9756] LOG:  terminating any other active server processes
+2026-06-22 10:16:37.829 EAT [9756] LOG:  all server processes terminated; reinitializing
